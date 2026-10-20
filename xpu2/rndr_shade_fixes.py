@@ -13,6 +13,14 @@ with the same light-set assignment, to the end of the call, though only the
 first shadingWorkloadChunkSize entries are used; the scan stops there. The
 chunk size it yields is the same.
 
+XPU2_SHADE_MERGE_LIGHTSETS=1 (off by default; NOT exact): the run also continues
+across entries of other layer assignments whose light list, light filters and
+light accelerator are the same objects. Modo exports give every mesh part its own
+assignment, so runs are a few entries long; merging fills the SIMD lanes, but an
+8-lane block's active light set and sample counts (and so its random sample
+numbers) depend on its members, so images differ from XPU's in the noise.
+XPU2_SHADE_FIX_REPORT also records chunk and entry counts (average run length).
+
 XPU2_SHADE_FIX_CHECK=1 still computes the original answer at every shortcut and
 counts disagreements; XPU2_SHADE_FIX_REPORT names a CSV written at exit.
 
@@ -37,19 +45,23 @@ bool xpu2ShadeSwitch(const char* name, bool fallback)
 const bool xpu2PresenceSkip = xpu2ShadeSwitch("XPU2_SHADE_PRESENCE_SKIP", true);
 const bool xpu2ChunkScan = xpu2ShadeSwitch("XPU2_SHADE_CHUNK_SCAN", true);
 const bool xpu2FixCheck = xpu2ShadeSwitch("XPU2_SHADE_FIX_CHECK", false);
+const bool xpu2MergeLightSets = xpu2ShadeSwitch("XPU2_SHADE_MERGE_LIGHTSETS", false);
+const bool xpu2ChunkStats = std::getenv("XPU2_SHADE_FIX_REPORT") != nullptr;
 struct Xpu2ShadeFixReport {
     std::atomic<unsigned long long> presenceShort{0}, presenceSampled{0}, presenceDiff{0},
-                                    chunks{0}, chunkShort{0}, chunkDiff{0};
+                                    chunks{0}, chunkShort{0}, chunkDiff{0}, statChunks{0}, statEntries{0};
     ~Xpu2ShadeFixReport()
     {
         const char* path = std::getenv("XPU2_SHADE_FIX_REPORT");
         if (!path) return;
         if (FILE* f = std::fopen(path, "w")) {
             std::fprintf(f, "presence_skip,chunk_scan,check,presence_short,presence_sampled,presence_diff,"
-                            "chunks,chunk_short,chunk_diff\n%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                            "chunks,chunk_short,chunk_diff,merge_lightsets,stat_chunks,stat_entries\n"
+                            "%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%d,%llu,%llu\n",
                          int(xpu2PresenceSkip), int(xpu2ChunkScan), int(xpu2FixCheck),
                          presenceShort.load(), presenceSampled.load(), presenceDiff.load(),
-                         chunks.load(), chunkShort.load(), chunkDiff.load());
+                         chunks.load(), chunkShort.load(), chunkDiff.load(),
+                         int(xpu2MergeLightSets), statChunks.load(), statEntries.load());
             std::fclose(f);
         }
     }
@@ -97,12 +109,24 @@ SCAN_NEW = '''        SortedEntry *currEntry = sortedEntries + 1;
         // Only the first shadingWorkloadChunkSize entries of the run are used.
         const SortedEntry *xpu2ScanEnd = xpu2ChunkScan && unsigned(endEntry - sortedEntries) > shadingWorkloadChunkSize
                                        ? sortedEntries + shadingWorkloadChunkSize : endEntry;
-        while (currEntry != xpu2ScanEnd && currLayerAssnId == currEntry->mLayerAssignmentId) {
+        // XPU2_SHADE_MERGE_LIGHTSETS (off by default, not exact): also continue the run across
+        // entries of other layer assignments that use the same light objects.
+        auto xpu2SameRun = [&](const SortedEntry *e) {
+            return currLayerAssnId == e->mLayerAssignmentId ||
+                   (xpu2MergeLightSets && scene->getLightPtrList(e->mLayerAssignmentId) == lightList &&
+                    scene->getLightFilterLists(e->mLayerAssignmentId) == lightFilterLists &&
+                    scene->getLightAccelerator(e->mLayerAssignmentId) == lightAcc);
+        };
+        while (currEntry != xpu2ScanEnd && xpu2SameRun(currEntry)) {
             ++currEntry;
+        }
+        if (xpu2ChunkStats) {
+            ++xpu2ShadeFixReport().statChunks;
+            xpu2ShadeFixReport().statEntries += scene_rdl2::math::min(unsigned(currEntry - sortedEntries), shadingWorkloadChunkSize);
         }
         if (xpu2FixCheck) {
             const SortedEntry *full = sortedEntries + 1;
-            while (full != endEntry && currLayerAssnId == full->mLayerAssignmentId) {
+            while (full != endEntry && xpu2SameRun(full)) {
                 ++full;
             }
             ++xpu2ShadeFixReport().chunks;
