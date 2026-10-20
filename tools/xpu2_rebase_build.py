@@ -60,9 +60,13 @@ def main():
         base_rsp = (base / 'link.rsp').read_text().splitlines()
         for f in module.FILES:
             stem = Path(f).stem
-            own = [Path(l.strip().strip('"')) for l in base_rsp if l.strip().strip('"').endswith('/' + stem + '.obj')]
-            if f not in candidate_copies and len(own) == 1 and own[0].with_suffix('.cc').exists():
-                candidate_copies[f] = own[0].with_suffix('.cc')
+            ispc = f.endswith('.ispc')
+            suffix = '-ispc.obj' if ispc else '.obj'
+            own = [Path(l.strip().strip('"')) for l in base_rsp if l.strip().strip('"').endswith('/' + stem + suffix)]
+            if f not in candidate_copies and len(own) == 1:
+                src = own[0].parent / (stem + ('.ispc' if ispc else '.cc'))
+                if src.exists():
+                    candidate_copies[f] = src
         texts, hashes = {}, {}
         for f in module.FILES:
             path = candidate_copies.get(f, lib / f)
@@ -82,11 +86,39 @@ def main():
         lines = rsp.splitlines()
         env = environment(runtime, out); env['PATH'] = str(toolbin) + os.pathsep + env['PATH']
         replaced = {}
+        ninja_text = None
         for f in module.FILES:
             name = Path(f).name
             copy = out / name
             copy.write_text(patched[f], encoding='utf-8')
-            target = 'moonray/lib/rendering/pbr/CMakeFiles/rendering_pbr_objects.dir/' + f[len('pbr/'):] + '.obj'
+            if f.endswith('.ispc'):
+                # The build tree's ISPC flags (as xpu2/native_build.py), with the patched copy's
+                # folder, the candidate copy's folder, the upstream folder and xpu2/ searched.
+                if ninja_text is None:
+                    ninja_text = (build / 'build.ninja').read_text()
+                stanza = next(s for s in ninja_text.split('\n\n') if s.startswith('build ')
+                              and name + '.obj' in s.splitlines()[0] and 'ISPC_COMPILER' in s.splitlines()[0])
+                variables = dict(l.strip().split(' = ', 1) for l in stanza.splitlines()[1:] if ' = ' in l)
+                iflags = shlex.split(' '.join(variables[k] for k in ('DEFINES', 'INCLUDES', 'FLAGS')))
+                if '--opt=force-aligned-memory' in iflags:
+                    iflags.remove('--opt=force-aligned-memory')
+                extra = [out] + ([candidate_copies[f].parent] if f in candidate_copies else []) + [(lib / f).parent, ROOT / 'xpu2']
+                iflags = ['-I' + str(p) for p in extra] + iflags
+                obj = out / (Path(f).stem + '-ispc.obj')
+                with (out / ('compile-' + name + '.log')).open('w') as log:
+                    r = subprocess.run([str(toolbin / 'ispc.exe'), *iflags, str(copy), '--emit-obj', '-o', str(obj)],
+                                       cwd=out, env=env, stdout=log, stderr=log, timeout=900,
+                                       creationflags=subprocess.CREATE_NO_WINDOW)
+                if r.returncode:
+                    raise ValueError('Compile failed: ' + f)
+                old = [i for i, l in enumerate(lines) if l.strip().strip('"').endswith('/' + Path(f).stem + '-ispc.obj')
+                       or l.strip().strip('"').endswith('-' + name + '.obj')]
+                if len(old) != 1:
+                    raise ValueError('No unique link input for ' + f + ': ' + str(old))
+                replaced[lines[old[0]]] = str(obj)
+                lines[old[0]] = '"' + str(obj).replace('\\', '/') + '"'
+                continue
+            target ='moonray/lib/rendering/pbr/CMakeFiles/rendering_pbr_objects.dir/' + f[len('pbr/'):] + '.obj'
             command = subprocess.run([str(toolbin / 'ninja.exe'), '-t', 'commands', target], cwd=build,
                                      capture_output=True, text=True, check=True).stdout.splitlines()[-1]
             flags = shlex.split(command)
