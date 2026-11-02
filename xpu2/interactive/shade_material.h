@@ -755,7 +755,7 @@ template <class Tex>
 X2_CALL U32 extraAovValues(const MaterialRecord& m, const float* pool, const State& st, const Tex& tex, Bsdf& bsdf) {
     const U32* w = reinterpret_cast<const U32*>(pool + m.extras);
     const U32 program = w[0], count = w[1] < Bsdf::MaxExtraAovs ? w[1] : Bsdf::MaxExtraAovs;
-    Color regs[MapMaxRegisters];
+    X2_MAP_REGISTERS(regs, tex, 0);
     if (program != NoMapProgram) {
         const U32 status = runMaps(pool, program, st, tex, regs);
         if (status != tex::Ready) return status;
@@ -789,7 +789,7 @@ X2_CALL U32 materialPresence(const MaterialRecord& m0, const float* pool, const 
         m = resolveSwitch(m0, pool, st, cutout);
         if (!m) return tex::Ready;
     }
-    Color regs[MapMaxRegisters];
+    X2_MAP_REGISTERS(regs, tex, 0);
     if (m->maps != NoMapProgram) {
         if (!mapRequirementsMet(pool, m->maps, st)) return tex::Ready;
         const U32 status = runMaps(pool, m->maps, st, tex, regs);
@@ -829,7 +829,7 @@ X2_HD inline bool createDwaLobesCall(const DwaParams& p, const DwaUniformParams&
 template <class Tex>
 X2_CALL U32 shadeChosenMaterial(const MaterialRecord& m, const float* pool, const State& st, const Tex& tex, Bsdf& bsdf, float& presence,
                                 DwaParams* slots, GlitterScratch* glitter, bool cutout) {
-    Color regs[MapMaxRegisters];
+    X2_MAP_REGISTERS(regs, tex, 0);
     // A hit without an attribute its maps require: the fatal colour, and the path ends (hasAllRequiredAttributes).
     if (m.maps != NoMapProgram && !mapRequirementsMet(pool, m.maps, st)) {
         Builder fatal(bsdf, st);

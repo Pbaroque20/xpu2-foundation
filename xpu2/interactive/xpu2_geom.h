@@ -84,6 +84,10 @@ typedef struct X2SubdInput {
     int reference;
     // In displace's place where given: displace with the primitive attributes (X2SubdDisplaceAttrFn).
     X2SubdDisplaceAttrFn displaceWith;
+    // A mesh that deforms over the shutter (x2SubdTessellate only): its time steps, the first in vertices, the rest
+    // here in the same space; tessellated once, every step on the one topology, as OpenSubdivMesh does under motion.
+    unsigned stepCount;         // 0 or 1 for a still mesh
+    const float* stepVertices;  // (stepCount - 1) * vertexCount * 3
 } X2SubdInput;
 
 // The tessellated mesh: quads (four indices each) over its vertices, each vertex's limit surface normal, texture
@@ -100,6 +104,12 @@ typedef struct X2SubdOutput {
     int* controlFace;
     X2SubdAttributeOut* attributes;  // one an input attribute
     unsigned attributeCount;
+    // The later time steps of a deforming mesh (X2SubdInput's stepCount): (stepCount - 1) * vertexCount * 3 each.
+    unsigned stepCount;
+    float* stepVertices;
+    float* stepNormals;
+    float* stepDpds;
+    float* stepDpdt;
 } X2SubdOutput;
 
 // An OpenVDB grid as MoonRay's VdbVolume reads it (findNthGridByName; a float grid, or a Vec3 grid for emission and

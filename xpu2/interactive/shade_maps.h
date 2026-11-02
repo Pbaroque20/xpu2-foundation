@@ -17,6 +17,14 @@
 #endif
 namespace xpu2 { namespace interactive { namespace shade {
 
+// The registers of a running map program. On the GPU in the launch thread's scratch, as many as the scene's largest
+// program has (which 0: the program's; 1: a bump map's shifted run): OptiX reserves a program's stack for every hardware
+// thread, so that 3 KB on the stack is some 400 MB of the card, whatever the scene.
+#if defined(__CUDACC__)
+#define X2_MAP_REGISTERS(name, tex, which) Color* const name = (tex).registers + (which) * (tex).registerCount
+#else
+#define X2_MAP_REGISTERS(name, tex, which) Color name[MapMaxRegisters]
+#endif
 // A material's map results, one register a map: room for the map trees Modo's shader trees make (a layer is a few
 // maps). The register file is indexed by value, so it sits in local memory however large it is; only what a material
 // uses is touched.

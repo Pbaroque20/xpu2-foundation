@@ -313,11 +313,15 @@ extern "C" __declspec(dllexport) int x2SubdTessellate(const X2SubdInput* in, X2S
             for (unsigned f = 0; f < in->faceCount; ++f) faceToPart[f] = in->faceToPart[f];
         const geom::RateCounts rates{partCount, in->faceCount, in->vertexCount, in->vertexCount, in->indexCount};
 
-        // getVertexData: the static case (motion blur is the caller's, not yet admitted), uvs and normals.
+        // getVertexData: the time steps' vertices (one for a still mesh), uvs and normals.
         shading::PrimitiveAttributeTable table;
-        geom::SubdivisionMesh::VertexBuffer vertices(in->vertexCount, 1);
-        for (unsigned i = 0; i < in->vertexCount; ++i)
-            vertices(i, 0) = Vec3fa(in->vertices[3 * i], in->vertices[3 * i + 1], in->vertices[3 * i + 2], 0.f);
+        const unsigned steps = in->stepCount > 1 && in->stepVertices ? in->stepCount : 1u;
+        geom::SubdivisionMesh::VertexBuffer vertices(in->vertexCount, steps);
+        for (unsigned t = 0; t < steps; ++t)
+            for (unsigned i = 0; i < in->vertexCount; ++i) {
+                const float* p = t == 0 ? in->vertices + 3 * size_t(i) : in->stepVertices + (size_t(t - 1) * in->vertexCount + i) * 3;
+                vertices(i, t) = Vec3fa(p[0], p[1], p[2], 0.f);
+            }
         if (in->uvCount) {
             const shading::AttributeRate rate(geom::pickRate(rdlGeometry, "uv_list", in->uvCount, rates));
             std::vector<Vec2f> uv(in->uvCount);
@@ -375,10 +379,16 @@ extern "C" __declspec(dllexport) int x2SubdTessellate(const X2SubdInput* in, X2S
 
         // Procedural::addPrimitive's transform into render space: the vertices are there already.
         stage = "transformPrimitive";
-        const geom::MotionBlurParams motion(std::vector<float>{0.0f}, 0.0f, 0.0f, false, 24.0f);
-        const shading::XformSamples prim2render{scene_rdl2::math::Xform3f(scene_rdl2::math::one)};
-        geom::internal::PrimitivePrivateAccess::transformPrimitive(mesh.get(), motion, prim2render);
         auto* impl = static_cast<geom::internal::OpenSubdivMesh*>(geom::internal::PrimitivePrivateAccess::getPrimitiveImpl(mesh.get()));
+        if (steps == 1) {
+            const geom::MotionBlurParams motion(std::vector<float>{0.0f}, 0.0f, 0.0f, false, 24.0f);
+            const shading::XformSamples prim2render{scene_rdl2::math::Xform3f(scene_rdl2::math::one)};
+            geom::internal::PrimitivePrivateAccess::transformPrimitive(mesh.get(), motion, prim2render);
+        } else {
+            // SubdivisionMesh::transformPrimitive's setTransform alone: the steps are in render space already, and its
+            // transformVertexBuffer without motion blur would keep the first.
+            impl->setTransform(shading::XformSamples(steps, scene_rdl2::math::Xform3f(scene_rdl2::math::one)), 0.0f, 0.0f);
+        }
         impl->setRdlGeometry(rdlGeometry);
         if (in->reference) impl->setIsReference(true);
 
@@ -451,6 +461,31 @@ extern "C" __declspec(dllexport) int x2SubdTessellate(const X2SubdInput* in, X2S
             out->st[2 * i] = s.x, out->st[2 * i + 1] = s.y;
             out->dpds[3 * i] = ds.x, out->dpds[3 * i + 1] = ds.y, out->dpds[3 * i + 2] = ds.z;
             out->dpdt[3 * i] = dt.x, out->dpdt[3 * i + 1] = dt.y, out->dpdt[3 * i + 2] = dt.z;
+        }
+        // The later time steps on the same tessellation.
+        const unsigned outSteps = unsigned(impl->mTessellatedVertices.get_time_steps());
+        if (steps > 1 && outSteps > 1) {
+            out->stepCount = outSteps;
+            const size_t later = size_t(outSteps - 1) * vertexCount * 3;
+            out->stepVertices = new float[later];
+            out->stepNormals = new float[later];
+            out->stepDpds = new float[later];
+            out->stepDpdt = new float[later];
+            const bool stepNormals = hasNormals && impl->mSurfaceNormal.get_time_steps() >= outSteps,
+                       stepDpds = hasDpds && impl->mSurfaceDpds.get_time_steps() >= outSteps,
+                       stepDpdt = hasDpdt && impl->mSurfaceDpdt.get_time_steps() >= outSteps;
+            for (unsigned t = 1; t < outSteps; ++t)
+                for (size_t i = 0; i < vertexCount; ++i) {
+                    const size_t at = 3 * (size_t(t - 1) * vertexCount + i);
+                    const Vec3fa p = impl->mTessellatedVertices(i, t);
+                    const Vec3f n = stepNormals ? impl->mSurfaceNormal(i, t) : Vec3f(out->normals[3 * i], out->normals[3 * i + 1], out->normals[3 * i + 2]);
+                    const Vec3f ds = stepDpds ? impl->mSurfaceDpds(i, t) : Vec3f(out->dpds[3 * i], out->dpds[3 * i + 1], out->dpds[3 * i + 2]);
+                    const Vec3f dt = stepDpdt ? impl->mSurfaceDpdt(i, t) : Vec3f(out->dpdt[3 * i], out->dpdt[3 * i + 1], out->dpdt[3 * i + 2]);
+                    out->stepVertices[at] = p.x, out->stepVertices[at + 1] = p.y, out->stepVertices[at + 2] = p.z;
+                    out->stepNormals[at] = n.x, out->stepNormals[at + 1] = n.y, out->stepNormals[at + 2] = n.z;
+                    out->stepDpds[at] = ds.x, out->stepDpds[at + 1] = ds.y, out->stepDpds[at + 2] = ds.z;
+                    out->stepDpdt[at] = dt.x, out->stepDpdt[at + 1] = dt.y, out->stepDpdt[at + 2] = dt.z;
+                }
         }
         for (size_t i = 0; i < indexCount; ++i) out->indices[i] = impl->mTessellatedIndices[i];
         for (unsigned q = 0; q < out->quadCount; ++q)
@@ -1200,5 +1235,9 @@ extern "C" __declspec(dllexport) void x2SubdFree(X2SubdOutput* out) {
     delete[] out->controlFace;
     for (unsigned k = 0; k < out->attributeCount; ++k) delete[] out->attributes[k].values;
     delete[] out->attributes;
+    delete[] out->stepVertices;
+    delete[] out->stepNormals;
+    delete[] out->stepDpds;
+    delete[] out->stepDpdt;
     std::memset(out, 0, sizeof(*out));
 }

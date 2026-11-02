@@ -30,6 +30,12 @@ The mantra for XPU2 is: "Use your silicon!"
 - **Motion on both devices.** Moving meshes, subdivision surfaces, instances, curves, points, volume bounds and any
   number of moving lights render on the GPU as on the CPU, traced at each sample's time. Test scenes that used to send
   those samples to the CPU finished 2.6 to 8.5 times sooner; a scene with nothing moving costs the GPU about 2 to 3%.
+  A deforming subdivision surface is tessellated once over its time steps, so adaptive tessellation and instanced
+  deforming prototypes render too.
+- **Lean card memory.** The GPU's stack is sized from the program's real call chains and from what the scene contains,
+  and each thread's scratch from what the scene uses. A launch is as wide as the card's cores can hold at once, and
+  narrower only when the card is short of memory. On an RTX 3090 a simple scene went from 10.9 GB of the card to 4.5 GB
+  at the same speed and with the same picture, so smaller cards can render.
 - **Tiered texture memory.** Host RAM holds the coarse mip levels and the fine tiles read so far, which are decoded on
   demand and let go under memory pressure. VRAM holds the coarse levels and a cache of fine tiles. A GPU sample that
   misses a fine tile shades from a coarser level and is re-rendered in full before the frame ends. A scene that does

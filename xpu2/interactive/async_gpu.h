@@ -127,12 +127,25 @@ public:
             for (auto& r : readbacks_) r.state = pinned(sizeof(DeviceState));
             ring_ = device(size_t(options_.ringChunks) * sizeof(Chunk));
             state_ = device(sizeof(DeviceState));
-            const size_t maxItems = size_t(options_.maxChunksPerLaunch) * 64 * 64;  // up to 64 samples a chunk
-            parkedCapacity_ = U32(std::min<size_t>(4 * maxItems + 1024, 1u << 26));
-            parked_ = device(size_t(parkedCapacity_) * sizeof(Parked));
             for (auto& s : staging_) s = pinned(size_t(options_.maxChunksPerLaunch) * sizeof(Chunk));
             // Partial shading: each launch thread's mark, the provisional samples' ring (pinned: the host reads it
             // after a launch) and each launch slot's provisional samples to render again (pinned: the device reads them).
+            // The launch width by the card: a power of two under the threads its multiprocessors hold at once (2^16 on
+            // a 3090), never more than options_.launchThreads, so a card as large or larger launches as before and a
+            // smaller one is as full. prepare narrows it further where the card has no room for its scratch.
+            {
+                CUdevice dev;
+                gpu::Driver::check(driver.cuDeviceGet_p(&dev, 0));
+                int sms = 0, perSm = 0;
+                if (driver.cuDeviceGetAttribute_p(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) == CUDA_SUCCESS &&
+                    driver.cuDeviceGetAttribute_p(&perSm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev) == CUDA_SUCCESS &&
+                    sms > 0 && perSm > 0) {
+                    U32 width = std::min(MinLaunchThreads, options_.launchThreads);
+                    while (width < options_.launchThreads && U64(width) * 2 < U64(sms) * U64(perSm)) width *= 2;
+                    options_.launchThreads = width;
+                }
+                cardThreads_ = options_.launchThreads;
+            }
             lowFlags_ = device(size_t(options_.launchThreads) * sizeof(U32));
             refines_ = pinned(size_t(refineCapacity_) * sizeof(Refine));
             for (auto& r : refineIn_) r = pinned(size_t(RefineInCapacity) * sizeof(Refine));
@@ -172,6 +185,8 @@ public:
     // A launch thread's records of lights in motion at the sample's time (GpuBackend::movedLight): however many move, the
     // card holds this many a thread.
     static constexpr size_t MovedLightSlots = 16;
+    // The narrowest launch prepare makes for a card short of memory.
+    static constexpr U32 MinLaunchThreads = 8192;
     // XPU2_GPU_MOTION_OFF: points, geometry and lights in motion left to the CPU lane, as before the GPU rendered them, to compare.
     static bool motionOnGpu() {
         static const bool on = std::getenv("XPU2_GPU_MOTION_OFF") == nullptr;
@@ -1090,7 +1105,20 @@ public:
             movedLightSlots_ = U32(std::min(plan->lightMotion.size(), MovedLightSlots));
             movedLightsScratch_ = (movedLightSlots_ * sizeof(lights::Light) + (movedLightSlots_ + 1) * sizeof(U32) + 15) & ~size_t(15);
             if (!movedLightSlots_) movedLightsScratch_ = 0;
-            scene_.scratch = device(size_t(options_.launchThreads) * (scratchStride(plan->dwaSlots, plan->glitter) + aovScratch_ + cryptoScratch_ + movedLightsScratch_));
+            registersScratch_ = (size_t(2 * plan->mapRegisters) * sizeof(shade::Color) + 15) & ~size_t(15);
+            const size_t threadScratch = scratchStride(plan->dwaSlots, plan->glitter) + aovScratch_ + cryptoScratch_ + movedLightsScratch_ + registersScratch_;
+            // The launch the card has room for: the scratch at most a quarter of what is free, halved until it is.
+            options_.launchThreads = cardThreads_;
+            {
+                size_t freeNow = 0, totalNow = 0;
+                if (memoryInfo(freeNow, totalNow))
+                    while (options_.launchThreads > MinLaunchThreads && size_t(options_.launchThreads) * threadScratch > freeNow / 4)
+                        options_.launchThreads /= 2;
+            }
+            if (std::getenv("XPU2_ASYNC_STACKS"))
+                std::fprintf(stderr, "scratch: threads %u (card %u) of %zu bytes: %zu MB\n", options_.launchThreads, cardThreads_, threadScratch,
+                             (size_t(options_.launchThreads) * threadScratch) >> 20);
+            scene_.scratch = device(size_t(options_.launchThreads) * threadScratch);
         }
         lap("lights, volumes, materials, outputs");
         uploadConfig(plan);
@@ -1177,6 +1205,8 @@ public:
         program_ = &programs_[adaptive && !single_ ? 1 : 0];
         itemsPerChunk_ = samplesPerChunk * TilePixels;
         adaptive_ = adaptive;
+        sizeParked();
+        program_->fitStack(!plan_->volumes.empty(), plan_->dwaSlots > 0);
         const size_t pixels = size_t(plan_->width) * plan_->height;
         memset32(scene_.sums->pointer, 0, pixels * 8);
         memset32(scene_.odd->pointer, 0, pixels * 8);
@@ -1234,7 +1264,7 @@ public:
         // The bounded queue: whatever this launch runs could park again, on top of
         // every launch still in flight (the host sizes launches, MEM-05).
         const U64 items = U64(count) * itemsPerChunk_ + (parkedEnd - parkedBegin);
-        cpu::need(parkedBound() - parkedBegin + items <= parkedCapacity_, "Parked-sample queue would overflow");
+        cpu::need(!mayPark_ || parkedBound() - parkedBegin + items <= parkedCapacity_, "Parked-sample queue would overflow");
         // The ring may not overwrite chunks a queued launch still reads.
         cpu::need(published_ + count - oldestChunk() <= options_.ringChunks, "Mailbox ring full");
         const unsigned s = U32(launches_ % Slots);
@@ -1646,7 +1676,7 @@ public:
         commitTiles();  // tiles asked for so far land first
         U64 most = 0;  // the most samples one step could park; a stall stops the chain after it
         for (const auto& s : steps) most = std::max<U64>(most, U64(s.size) * TilePixels * chain_.args.tiles);
-        cpu::need(parkedBound() - parkedIssued_ + most <= parkedCapacity_, "Parked-sample queue would overflow");
+        cpu::need(!mayPark_ || parkedBound() - parkedIssued_ + most <= parkedCapacity_, "Parked-sample queue would overflow");
         memset32(state_->pointer + offsetof(DeviceState, chainStall), 0, 1);
         auto* staged = static_cast<LaunchParams*>(chain_.params_staging->host());
         for (size_t k = 0; k < steps.size(); ++k) {
@@ -1929,6 +1959,10 @@ private:
         OptixProgramGroup groups[32]{};  // five, and the callables (async_gpu_device.h's MaterialCall)
         OptixPipeline pipeline = nullptr;
         B records;
+        // The stack sizes (create) and the continuation stack's parts: the raygen's and a trace's, the volume module's
+        // volume callables', its subsurface callable's; stackC as set (fitStack).
+        unsigned stackA = 0, stackB = 0, stackC = 0, stackBase = 0, ccVolume = 0, ccSubsurface = 0;
+        bool fitted = false;
         OptixShaderBindingTable sbt{};
 
         // Takes the compiled modules (compileModules) and makes their programs and pipeline.
@@ -1998,9 +2032,46 @@ private:
             if (std::getenv("XPU2_ASYNC_STACKS"))  // a diagnostic: the raygen's stack shows state spilled across traces
                 std::fprintf(stderr, "stacks: cssRG %u cssMS %u cssCH %u dssDC %u\n", stacks.cssRG, stacks.cssMS, stacks.cssCH, stacks.dssDC);
             unsigned a, b, c;
-            // The raygen calls the material, light and lobe callables (the material callables the map callable: two
-            // levels) and the volume module's continuation callables (one level), which call the direct ones.
-            ox(optixUtilComputeStackSizes(&stacks, 1, split ? 1 : 0, split ? 2 : 0, &a, &b, &c));
+            ox(optixUtilComputeStackSizes(&stacks, 1, 0, 0, &a, &b, &c));
+            if (split) {
+                // The driver reserves a stack for every hardware thread, some 126 KB of the card a byte, and the utility's
+                // worst case asks for the largest callable twice and a continuation callable below a closest hit. By the
+                // real calls: the raygen calls the callables and the volume module's continuation callables, one level,
+                // which call the direct ones; of the direct ones only shade and presence call others; closest hit, miss and
+                // intersection call none. OptiX reports 24 bytes for the map callable, whose PTX frames add to some 1.1 KB
+                // (mapsAtLeast keeps more than twice that), so what it reports is not taken alone.
+                const auto own = [&](unsigned k) {
+                    OptixStackSizes one{};
+                    ox(optixUtilAccumulateStackSizes(groups[5 + k], &one));
+                    return one.dssDC;
+                };
+                constexpr unsigned mapsAtLeast = 4096, traceAtLeast = 512;
+                const unsigned maps = std::max(own(2), mapsAtLeast);
+                const auto ownCC = [&](unsigned k) {
+                    OptixStackSizes one{};
+                    ox(optixUtilAccumulateStackSizes(groups[5 + k], &one));
+                    return one.cssCC;
+                };
+                a = 0;
+                b = std::max({own(0) + std::max({maps, own(12), own(13)}), own(1) + maps, stacks.dssDC});
+                c = stacks.cssRG + stacks.cssCC + std::max({stacks.cssCH, stacks.cssMS, stacks.cssIS + stacks.cssAH, traceAtLeast});
+                stackBase = c - stacks.cssCC;
+                ccVolume = std::max(ownCC(9), ownCC(11));
+                ccSubsurface = ownCC(10);
+                fitted = stacks.cssCC == std::max(ccVolume, ccSubsurface);
+            }
+            stackA = a;
+            stackB = b;
+            stackC = c;
+            if (std::getenv("XPU2_ASYNC_STACKS")) {
+                for (unsigned i = 0; i < count; ++i) {
+                    OptixStackSizes one{};
+                    ox(optixUtilAccumulateStackSizes(groups[i], &one));
+                    const char* name = i >= 5 && i - 5 < sizeof(callables) / sizeof(callables[0]) ? callables[i - 5].entry : "";
+                    std::fprintf(stderr, "stack of %u %s: rg %u ms %u ch %u dc %u cc %u is %u ah %u\n", i, name, one.cssRG, one.cssMS, one.cssCH, one.dssDC, one.cssCC, one.cssIS, one.cssAH);
+                }
+                std::fprintf(stderr, "stacks asked: from traversal %u, from state %u, continuation %u\n", a, b, c);
+            }
             ox(optixPipelineSetStackSize(pipeline, a, b, c, 2));
             auto host = lane.pinned(sizeof(Record) * count);
             for (unsigned i = 0; i < count; ++i) ox(optixSbtRecordPackHeader(groups[i], static_cast<Record*>(host->host()) + i));
@@ -2020,6 +2091,18 @@ private:
                 sbt.callablesRecordCount = callableCount;
             }
             if (exceptions()) sbt.exceptionRecord = records->pointer + (count - 1) * sizeof(Record);
+        }
+        // The continuation stack a scene needs: the volume module's callables only where the scene can call them, the
+        // volume ones where it has volumes, the subsurface one where it has a DwaBase-family material (the only ones with
+        // subsurface). The driver keeps a stack for every hardware thread, so the frame left out is saved on each.
+        // Between frames only (begin): no launch in flight.
+        void fitStack(bool volumes, bool subsurface) {
+            if (!fitted) return;
+            const unsigned c = stackBase + std::max(volumes ? ccVolume : 0u, subsurface ? ccSubsurface : 0u);
+            if (c == stackC) return;
+            ox(optixPipelineSetStackSize(pipeline, stackA, stackB, c, 2));
+            if (std::getenv("XPU2_ASYNC_STACKS")) std::fprintf(stderr, "continuation stack %u for the scene (volumes %d, subsurface %d)\n", c, int(volumes), int(subsurface));
+            stackC = c;
         }
         void destroy() noexcept {
             if (pipeline) optixPipelineDestroy(pipeline);
@@ -2596,6 +2679,9 @@ private:
         p.secondsPerTick = secondsPerTick_;
         p.movedLightsOffset = p.scratchStride + cryptoScratch_;
         p.scratchStride += cryptoScratch_ + movedLightsScratch_;
+        p.registersOffset = p.scratchStride;
+        p.mapRegisters = plan_->mapRegisters;
+        p.scratchStride += registersScratch_;
         if (cryptoEvents_) {
             p.cryptoOffset = scratchStride(plan_->dwaSlots, plan_->glitter) + aovScratch_;
             p.cryptoEvents = cryptoEvents_;
@@ -2668,6 +2754,18 @@ private:
                 return slot;
             }
         throw std::runtime_error("No free launch parameter slot");
+    }
+    // The parked queue for this frame. Only a texture's missing tile parks a sample, so a scene without textures holds no
+    // real queue; with them, each of the frame's samples may wait on the queue and run again, twice over at most, up to
+    // 2^26 (1 GB of the card).
+    void sizeParked() {
+        mayPark_ = !plan_->textures.empty();
+        const U64 tiles = U64((plan_->width + 7) / 8) * ((plan_->height + 7) / 8);
+        const U32 wanted = mayPark_ ? U32(std::min<U64>(2 * tiles * TilePixels * plan_->spp + 1024, 1ull << 26)) : 1024u;
+        if (parked_ && parkedCapacity_ >= wanted) return;
+        parked_.reset();
+        parkedCapacity_ = wanted;
+        parked_ = device(size_t(parkedCapacity_) * sizeof(Parked));
     }
     // The highest the parked queue can have reached: the last readback plus
     // everything the launches still in flight could park.
@@ -2752,12 +2850,15 @@ private:
     Scene scene_;
     Fine fine_;
     U32 itemsPerChunk_ = 0, parkedCapacity_ = 0;
+    bool mayPark_ = false;  // the scene has textures (sizeParked)
     bool adaptive_ = false;
     // The AOV film's channels and closest depths a pixel, a sample's scratch for them, and the clock's seconds a tick.
     U32 aovChannels_ = 0, aovClosest_ = 0, aovClosestChannels_ = 0;
     std::vector<aov::Entry> aovEntries_;  // the tables' entries, for reading the closest filter's words
     mutable bool closestLanded_ = true;   // the downloaded words read into the AOV film and its depths
     size_t aovScratch_ = 0;
+    U32 cardThreads_ = 0;  // the launch width by the card (constructor); prepare's is at most this
+    size_t registersScratch_ = 0;  // a sample's map registers (X2_MAP_REGISTERS)
     // Cryptomatte: events a thread and their scratch, categories, multi presence, extras, node size and pool.
     U32 cryptoEvents_ = 0, cryptoCategories_ = 1, cryptoMultiPresence_ = 0, cryptoExtras_ = 0, cryptoNodeWords_ = 5, cryptoNodeCapacity_ = 0;
     size_t cryptoScratch_ = 0;

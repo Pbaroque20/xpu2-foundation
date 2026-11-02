@@ -252,6 +252,7 @@ struct TextureContext {
     fs::path assetRoot;
     std::shared_ptr<OIIO::TextureSystem>* system = nullptr;
     std::vector<std::shared_ptr<texture::File>>* textures = nullptr;
+    unsigned* registers = nullptr;  // the most registers a map program has (the GPU's scratch for them)
     const std::vector<std::shared_ptr<texture::File>>* previous = nullptr;  // the previous plan's, for reuse
 };
 
@@ -1179,6 +1180,7 @@ struct MapProgramBuilder {
         };
         word(unsigned(nodes.size()));
         for (unsigned n : nodes) word(n);
+        if (textures.registers) *textures.registers = std::max(*textures.registers, unsigned(nodes.size()));
         std::sort(required.begin(), required.end());
         required.erase(std::unique(required.begin(), required.end()), required.end());
         word(unsigned(required.size()));

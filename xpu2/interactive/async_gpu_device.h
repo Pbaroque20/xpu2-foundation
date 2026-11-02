@@ -43,6 +43,8 @@ struct RequestSink {
 struct DeviceTextures {
     const tex::Image* const* images;
     U32 count;
+    shade::Color* registers;  // the launch thread's map registers (X2_MAP_REGISTERS)
+    U32 registerCount;
     U32* mark;  // partial shading: the launch thread's mark (null: off), taken where the thread is known
     __device__ __noinline__ U32 lookup(U32 texture, tex::Binding b, const tex::Footprint& f, surface::V3& out) const {
         if (texture >= count || !images[texture]) return tex::Invalid;
@@ -387,7 +389,7 @@ struct GpuBackend {
         st.geom = h.geom;
         st.worldToRender = c.worldToRender;
         st.worldToObject = params.meshAttributes[h.geom].worldToObject;
-        const DeviceTextures textures{params.textures, params.textureCount, threadMark()};
+        const DeviceTextures textures{params.textures, params.textureCount, threadRegisters(), params.mapRegisters, threadMark()};
         const unsigned status = materialPresence(params.meshMaterials[h.geom], st, textures, presence);
         if (status == tex::Miss) missed = true;
         return status;
@@ -404,7 +406,7 @@ struct GpuBackend {
             st.worldToRender = c.worldToRender;
             st.worldToObject = params.meshAttributes[h.geom].worldToObject;
             shade::curveDifferentials(attributes, ray, st.pixelSamples ? st.pixelSamples : c.spp, st);
-            const DeviceTextures textures{params.textures, params.textureCount, threadMark()};
+            const DeviceTextures textures{params.textures, params.textureCount, threadRegisters(), params.mapRegisters, threadMark()};
             return shadeMaterial(params.meshMaterials[h.geom], st, textures, bsdf, presence);
         }
         if (pointRadii(h.geom)) {
@@ -412,7 +414,7 @@ struct GpuBackend {
             st.geom = h.geom;
             st.worldToRender = c.worldToRender;
             st.worldToObject = params.meshAttributes[h.geom].worldToObject;
-            const DeviceTextures textures{params.textures, params.textureCount, threadMark()};
+            const DeviceTextures textures{params.textures, params.textureCount, threadRegisters(), params.mapRegisters, threadMark()};
             return shadeMaterial(params.meshMaterials[h.geom], st, textures, bsdf, presence);
         }
         const auto m = params.geometry[h.geom];
@@ -427,7 +429,7 @@ struct GpuBackend {
         const shade::MaterialRecord& record = params.meshMaterials[h.geom];
         shade::hitDifferentials(attributes, h.prim, t.a, t.b, t.c, a, b, cc, ray, st.pixelSamples ? st.pixelSamples : c.spp,
                                 st);
-        const DeviceTextures textures{params.textures, params.textureCount, threadMark()};
+        const DeviceTextures textures{params.textures, params.textureCount, threadRegisters(), params.mapRegisters, threadMark()};
         return shadeMaterial(record, st, textures, bsdf, presence);
     }
     // A material's Bsdf and its presence: the material module's callables (async_material.cu), or here when the
@@ -480,6 +482,9 @@ struct GpuBackend {
     __device__ paths::Pending* pending() {
         return reinterpret_cast<paths::Pending*>(params.scratch + U64L(optixGetLaunchIndex().x) * params.scratchStride +
                                                  ((sizeof(shade::Bsdf) + 15) & ~size_t(15)));
+    }
+    __device__ shade::Color* threadRegisters() {
+        return reinterpret_cast<shade::Color*>(params.scratch + U64L(optixGetLaunchIndex().x) * params.scratchStride + params.registersOffset);
     }
     __device__ shade::DwaParams* dwaSlots() {
         return reinterpret_cast<shade::DwaParams*>(params.scratch + U64L(optixGetLaunchIndex().x) * params.scratchStride +

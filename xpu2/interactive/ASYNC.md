@@ -13,7 +13,7 @@ build: exact shared triangle arithmetic, fixed ownership and byte-repeatable ima
 - **CPU lane** (`async_cpu.h`, §11). Persistent, pinned workers claim their own chunks by the cellular rules (§8):
   finish the cell they are in, step to the same-owner neighbour with the most unclaimed work, steal from the hottest
   opposite-owner neighbour, then drift to the hottest cell anywhere. Embree traverses native triangles in robust mode.
-- **GPU lane** (`async_gpu.h`, `async_gpu.cu`, §10). Fixed-size OptiX launches (65,536 threads) over hardware
+- **GPU lane** (`async_gpu.h`, `async_gpu.cu`, §10). OptiX launches as wide as the card holds (65,536 threads on an RTX 3090) over hardware
   triangles. Every thread claims one sample at a time from its launch's range with one atomic; neighbouring claims
   are neighbouring pixels of the same sample, so warps trace coherent rays. Results accumulate in a device film in
   double precision. The program is built twice, for uniform and for adaptive frames: OptiX links a pipeline's programs
@@ -155,6 +155,11 @@ one substitute texture, through the session harness; a re-cut in Modo also costs
   holds one light at a time, so any number of them can move. Large moving meshes against the card's budget have not been tested.
 - **A card that fills up.** The fine-detail cache is sized from the card's free memory when the scene is prepared, and made
   again to fit where, as a frame starts, the card has come to hold much less (`GpuLane::fineCacheTooBig`).
+- **A small card.** The launch is as wide as the card's multiprocessors hold, and halved down to 8,192 threads while their
+  scratch would take more than a quarter of the free memory; the stack and scratch follow what the scene contains
+  (engineer manual, section 6, "Card memory"). A simple scene takes 4.5 GB of an RTX 3090 (10.9 GB before 2 November).
+  A smaller card reserves less stack, having fewer hardware threads; none has been tested yet. A card made to say it has
+  4 GB free (`XPU2_SESSION_CARD_FREE_MB`) launched 16,384 wide and rendered 9 Spheres in 92 s, against 64 s at full width.
 
 ## Decided, 30 October 2026
 

@@ -201,6 +201,7 @@ struct Plan {
     // The DwaBase parameter slots the deepest material tree needs (shade_dwalayer.h); whether a material has glitter
     // (the shading threads then need a glitter scratch, shade_glitter.h).
     unsigned dwaSlots=0;bool glitter=false;
+    unsigned mapRegisters=0;  // the most registers a map program has
     // A random-walk subsurface material, and then MoonRay's integrator sequences its walk draws from (walkSequences).
     bool randomWalk=false;std::shared_ptr<const std::vector<float>> walkSequences;
     // The textures the path tracer's maps read (shade_mapnodes.h): each file once, and its host mip pyramid.
@@ -663,7 +664,9 @@ inline const SubdLibrary& subdLibrary(){
 // quad's, 3 a vertex's, 4 a quad corner's) and values.
 struct SubdAttribute{unsigned key=0,components=1;int kind=1;std::vector<float> values;};
 struct SubdSurface{std::vector<V3> positions,normals,dpds,dpdt;std::vector<float> st;std::vector<unsigned> quads;std::vector<int> controlFace;
- std::vector<SubdAttribute> attributes;};
+ std::vector<SubdAttribute> attributes;
+ // A deforming mesh's later time steps on the same tessellation (tessellateSubdivision's laterSteps).
+ std::vector<std::vector<V3>> steps,stepNormals,stepDpds,stepDpdt;};
 inline void primitiveAttributes(const rdl::SceneObject& o,struct MeshData& m,size_t uniformCount,size_t vertexCount,size_t varyingCount,size_t faceVaryingCount,
                                 std::vector<std::pair<std::string,unsigned>>* named);
 // scene_rdl2 xfmPoint with an Xform3f made of a Mat4d: (x vx + (y vy + z vz)) + p in floats.
@@ -684,9 +687,10 @@ template<class Call> inline auto withMeshInput(const rdl::SceneObject& o,const r
  const rdl::Mat4d p2r=reference?identity:objectToWorld*w2r;float xf[4][3];for(int i=0;i<4;++i)for(int c=0;c<3;++c)xf[i][c]=float(p2r[i][c]);
  std::vector<float> vertices;vertices.reserve(v.size()*3);
  if(worldVertices){
-  // A time step's vertices (meshMotionSteps, world space) to render space.
+  // A time step's vertices (meshMotionSteps, world space) to render space; a shared primitive's stay in its own space.
   need(worldVertices->size()==v.size(),o.getName()+": a time step's vertices do not match the mesh");
-  float wr[4][3];for(int i=0;i<4;++i)for(int c=0;c<3;++c)wr[i][c]=float(w2r[i][c]);
+  const rdl::Mat4d& s2r=reference?identity:w2r;
+  float wr[4][3];for(int i=0;i<4;++i)for(int c=0;c<3;++c)wr[i][c]=float(s2r[i][c]);
   for(const auto& p:*worldVertices){const V3 r=xformPointF(wr,rdl::Vec3f(p.x,p.y,p.z));vertices.insert(vertices.end(),{r.x,r.y,r.z});}}
  else for(const auto& p:v){X2_NEED(std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z),o.getName()+": invalid vertex");const V3 r=xformPointF(xf,p);vertices.insert(vertices.end(),{r.x,r.y,r.z});}
  // Normals as the tessellation's transformAttributes takes them (normals, the inverse transpose), uvs as they are.
@@ -785,10 +789,18 @@ template<class F> inline void parallelRange(size_t n,const F& f){
  for(auto& t:pool)t.join();if(failed)std::rethrow_exception(failed);}
 // A part of preparation timed while it is in scope (PrepLaps::parts).
 struct PrepPart{const char* what;long long began=nowNs();~PrepPart();};
+// laterSteps: a deforming mesh's time steps after worldVertices (meshMotionSteps, in worldVertices' space), tessellated
+// with it once: every step on one topology, as OpenSubdivMesh tessellates under motion blur.
 inline std::shared_ptr<const SubdSurface> tessellateSubdivision(const rdl::SceneObject& o,const rdl::Layer& layer,const Plan& plan,const rdl::Mat4d& objectToWorld,
-                                                              const std::vector<V3>* worldVertices=nullptr,const SubdDisplaceCall& displaceCall={},bool reference=false){
+                                                              const std::vector<V3>* worldVertices=nullptr,const SubdDisplaceCall& displaceCall={},bool reference=false,
+                                                              const std::vector<std::vector<V3>>* laterSteps=nullptr){
  const auto& lib=subdLibrary();need(lib.tessellate&&lib.release,o.getName()+": MoonRay's subdivision (xpu2_geom.dll) did not load");
  return withMeshInput(o,layer,plan,objectToWorld,worldVertices,displaceCall,[&](X2SubdInput& in,const MeshData& control,const rdl::Mat4d& w2r){
+ std::vector<float> later;
+ if(laterSteps&&!laterSteps->empty()){float wr[4][3];for(int i=0;i<4;++i)for(int c=0;c<3;++c)wr[i][c]=float(w2r[i][c]);
+  for(const auto& step:*laterSteps){need(step.size()==in.vertexCount,o.getName()+": a time step's vertices do not match the mesh");
+   for(const auto& p:step){const V3 r=xformPointF(wr,rdl::Vec3f(p.x,p.y,p.z));later.insert(later.end(),{r.x,r.y,r.z});}}
+  in.stepCount=unsigned(laterSteps->size()+1);in.stepVertices=later.data();}
  X2SubdOutput out{};char error[512]={0};
  const long long began=nowNs();
  const int made=lib.tessellate(&in,&out,error,sizeof error);
@@ -808,6 +820,10 @@ inline std::shared_ptr<const SubdSurface> tessellateSubdivision(const rdl::Scene
    s->dpds[i]=vec(out.dpds+3*i);s->dpdt[i]=vec(out.dpdt+3*i);}});
   s->st.assign(out.st,out.st+2*size_t(out.vertexCount));s->quads.assign(out.indices,out.indices+4*size_t(out.quadCount));
   s->controlFace.assign(out.controlFace,out.controlFace+out.quadCount);
+  for(unsigned t=1;t<out.stepCount;++t){std::vector<V3> p(n),nn(n),ds(n),dt(n);const size_t at=size_t(t-1)*n*3;
+   parallelRange(n,[&](size_t a,size_t b){for(size_t i=a;i<b;++i){p[i]=point(out.stepVertices+at+3*i);nn[i]=vec(out.stepNormals+at+3*i);
+    ds[i]=vec(out.stepDpds+at+3*i);dt[i]=vec(out.stepDpdt+at+3*i);}});
+   s->steps.push_back(std::move(p));s->stepNormals.push_back(std::move(nn));s->stepDpds.push_back(std::move(ds));s->stepDpdt.push_back(std::move(dt));}
   for(unsigned k=0;k<out.attributeCount;++k){const auto& a=control.prims[k];const auto& r=out.attributes[k];
    SubdAttribute t;t.key=a.key;t.components=a.components;t.kind=r.kind;t.values.assign(r.values,r.values+size_t(r.count)*a.components);s->attributes.push_back(std::move(t));}
  }catch(...){lib.release(&out);throw;}
@@ -961,7 +977,9 @@ inline MotionParams motionParams(const rdl::SceneVariables& sv,const rdl::SceneO
 inline bool meshHasMotion(const rdl::SceneObject& o){
  namespace sm=scene_rdl2::math;
  return !sm::isEqual(sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN)),sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END)))||
-        !o.get<rdl::Vec3fVector>("vertex_list_1").empty()||!o.get<rdl::Vec3fVector>("velocity_list_0").empty()||
+        // A second step the same as the first is no motion: a host may write one for meshes that do not deform.
+        (!o.get<rdl::Vec3fVector>("vertex_list_1").empty()&&o.get<rdl::Vec3fVector>("vertex_list_1")!=o.get<rdl::Vec3fVector>("vertex_list_0"))||
+        !o.get<rdl::Vec3fVector>("velocity_list_0").empty()||
         !o.get<rdl::Vec3fVector>("velocity_list_1").empty()||!o.get<rdl::Vec3fVector>("accleration_list").empty();}
 inline std::vector<std::vector<V3>> meshMotionSteps(const rdl::SceneObject& o,const MotionParams& mp,const rdl::Mat4d& xform0,const rdl::Mat4d& xform1,
                                                     bool staticTakesSecond=true,std::vector<float>* radiusScales=nullptr,
@@ -2424,8 +2442,22 @@ inline void instanceSurface(MeshData& m,const RenderItem& item,const MotionParam
  namespace sm=scene_rdl2::math;
  sm::XformComponent3f c0,c1;sm::decompose(item.sample[0],c0);sm::decompose(item.sample[1],c1);
  const bool turns=item.moves&&!(c0.r==c1.r||c0.r==-c1.r);
- const size_t n=item.moves?(turns?17:2):1;
- const std::vector<V3> p0=m.positions,n0=m.normals,s0=m.dpds,t0=m.dpdt;
+ // A prototype that deforms (its own time steps, tessellated on one topology): its shape at each of the instance's
+ // samples, between its steps about that time; at least as many samples as it has steps.
+ const size_t shapes=m.steps.size()+1;
+ const size_t n=std::max(item.moves?(turns?size_t(17):size_t(2)):size_t(1),shapes);
+ const std::vector<V3> base[4]={m.positions,m.normals,m.dpds,m.dpdt};
+ std::vector<std::vector<V3>> later[4]={m.steps,m.stepNormals,m.stepDpds,m.stepDpdt};
+ std::vector<V3> p0,n0,s0,t0;
+ auto shapeAt=[&](float u){
+  if(shapes<2){p0=base[0];n0=base[1];s0=base[2];t0=base[3];return;}
+  const float f=u*float(shapes-1);const size_t k=std::min(size_t(std::max(f,0.0f)),shapes-2);const float w=f-float(k);
+  auto at=[&](int which,size_t step)->const std::vector<V3>&{return step==0||later[which].size()<step?base[which]:later[which][step-1];};
+  auto mix=[&](int which,std::vector<V3>& out,bool unit){const auto& a=at(which,k);const auto& b=at(which,k+1);out.resize(a.size());
+   for(size_t i=0;i<a.size();++i){V3 v{a[i].x+(b[i].x-a[i].x)*w,a[i].y+(b[i].y-a[i].y)*w,a[i].z+(b[i].z-a[i].z)*w};
+    if(unit){V3 nv;if(surface::normalize(v,nv))v=nv;}out[i]=v;}};
+  mix(0,p0,false);mix(1,n0,true);mix(2,s0,false);mix(3,t0,false);};
+ shapeAt(0.0f);
  auto moved=[&](const sm::Xform3f& x,std::vector<V3>& p,std::vector<V3>& nn,std::vector<V3>& ds,std::vector<V3>& dt){
   const double L[3][3]={{x.l.vx.x,x.l.vx.y,x.l.vx.z},{x.l.vy.x,x.l.vy.y,x.l.vy.z},{x.l.vz.x,x.l.vz.y,x.l.vz.z}};
   const double det=L[0][0]*(L[1][1]*L[2][2]-L[1][2]*L[2][1])-L[0][1]*(L[1][0]*L[2][2]-L[1][2]*L[2][0])+L[0][2]*(L[1][0]*L[2][1]-L[1][1]*L[2][0]);
@@ -2440,7 +2472,7 @@ inline void instanceSurface(MeshData& m,const RenderItem& item,const MotionParam
   vec(s0,ds);vec(t0,dt);};
  moved(instanceXformAt(item,mp,0.0f),m.positions,m.normals,m.dpds,m.dpdt);
  m.steps.clear();m.stepNormals.clear();m.stepDpds.clear();m.stepDpdt.clear();
- for(size_t j=1;j<n;++j){std::vector<V3> p,nn,ds,dt;moved(instanceXformAt(item,mp,float(j)/float(n-1)),p,nn,ds,dt);
+ for(size_t j=1;j<n;++j){std::vector<V3> p,nn,ds,dt;shapeAt(float(j)/float(n-1));moved(instanceXformAt(item,mp,float(j)/float(n-1)),p,nn,ds,dt);
   m.steps.push_back(std::move(p));if(!n0.empty())m.stepNormals.push_back(std::move(nn));if(!s0.empty())m.stepDpds.push_back(std::move(ds));if(!t0.empty())m.stepDpdt.push_back(std::move(dt));}
  m.stepShading=n>1;m.instanced=true;
  const auto w=instanceMatrix(item).inverse();const double rows[12]={w[0][0],w[1][0],w[2][0],w[3][0],w[0][1],w[1][1],w[2][1],w[3][1],w[0][2],w[1][2],w[2][2],w[3][2]};
@@ -3221,8 +3253,8 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
  struct Displaced{size_t mesh;int edgeVertices;displace::Shader shader;};std::vector<Displaced> displaced;
  // Each subdivision surface tessellated once, whatever its parts (tessellateSubdivision).
  std::map<const rdl::SceneObject*,std::shared_ptr<const SubdSurface>> subdCache;
- // Under motion blur: each time step's tessellation.
- std::map<const rdl::SceneObject*,std::vector<std::shared_ptr<const SubdSurface>>> subdMotionCache;
+ // Under motion blur: the tessellation with its time steps.
+ std::map<const rdl::SceneObject*,std::shared_ptr<const SubdSurface>> subdMotionCache;
  // Each displaced polygon mesh MoonRay's PolyMesh makes, once whatever its parts (tessellatePolygons).
  std::map<const rdl::SceneObject*,std::shared_ptr<const PolySurface>> polyCache;
  // An instancer's prototypes, tessellated once in their own space for every instance (MoonRay's shared primitives).
@@ -3231,7 +3263,7 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
  // mesh's node transform, whether a polygon mesh.
  struct MappedVolume{unsigned volume;size_t mesh;const rdl::SceneObject* shader;rdl::Mat4d nodeXform;bool polygons;const rdl::SceneObject* vdb=nullptr;};
  std::vector<MappedVolume> mappedVolumes;
- TextureContext textureContext{assetRoot,&texSystem,&plan->textures,previous?&previous->textures:nullptr};
+ TextureContext textureContext{assetRoot,&texSystem,&plan->textures,&plan->mapRegisters,previous?&previous->textures:nullptr};
  for(auto& pair:sorted){auto& o=*pair.second;if(paths||o.getSceneClass().getName()!="ImageMap")continue;
   need(!spatial||domain==Domain::SurfaceTextures,"Spatial map derivatives not implemented; use reference");
   need(!assetRoot.empty()&&maps.size()<8,"Textured preparation requires frozen asset admission; at most 8 maps");
@@ -3641,7 +3673,7 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
   else attributes(o,{"vertex_list_0","face_vertex_count","vertices_by_index","is_subd","node_xform","smooth_normal"});
   const bool meshMotion=paths&&o.getSceneClass().getName()=="RdlMeshGeometry"&&(meshHasMotion(o)||item.moves);
   need(paths||!item.instancer||!displacementShader||!get<rdl::Bool>(sv,"enable_displacement"),o.getName()+": a displaced instance is not rendered yet");
-  need(!item.instancer||!(subdGeometry||polyGeometry)||!meshHasMotion(o),o.getName()+": an instanced tessellated mesh of its own motion is not rendered yet");
+  need(!item.instancer||!polyGeometry||!meshHasMotion(o),o.getName()+": an instanced displaced polygon mesh of its own motion is not rendered yet");
   need(!meshMotion||&o!=bakeGeometry,o.getName()+": a baked mesh in motion is not rendered yet");
   // A displaced mesh MoonRay is about to tessellate uniformly (subdivision or PolyMesh): its size told from its faces and
   // mesh resolution first (about r x r times its triangles, 18 bytes a triangle with its share of vertices), so one the
@@ -3670,25 +3702,33 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
    const bool polys=(plan->aovs&&plan->aovs->wireframe)||(mat&&(plan->materialRecords.at(materialIds.at(mat->getName())).flags&shade::MatPolyVertices));
    if(item.instancer){
     // An instance: the prototype tessellated once in its own space, moved by the instance's transform.
+    // A prototype that deforms over the shutter: its time steps in its own space, tessellated once over all of them;
+    // each instance then takes its shape at each of its own time samples (instanceSurface).
     auto& surface=subdRefCache[&o];
-    if(!surface){surface=tessellateSubdivision(o,layer,*plan,rdl::Mat4d(scene_rdl2::math::one),nullptr,displaceCall,true);subdDisplacement.check(o);}
+    if(!surface){
+     if(meshMotion&&meshHasMotion(o)){const rdl::Mat4d one(scene_rdl2::math::one);
+      auto steps=meshMotionSteps(o,plan->motion,one,one);const std::vector<std::vector<V3>> later(steps.begin()+1,steps.end());
+      surface=tessellateSubdivision(o,layer,*plan,one,&steps[0],displaceCall,true,&later);}
+     else surface=tessellateSubdivision(o,layer,*plan,rdl::Mat4d(scene_rdl2::math::one),nullptr,displaceCall,true);
+     subdDisplacement.check(o);}
     auto m=subdivisionMesh(*surface,faceMask,meshName,std::move(sig),rdl::Mat4d(scene_rdl2::math::one),polys);
+    m->steps=surface->steps;m->stepNormals=surface->stepNormals;m->stepDpds=surface->stepDpds;m->stepDpdt=surface->stepDpdt;
     if(shareInstance)m->instanced=true;  // in its own space, placed by each instance (placeInstance)
     else{instanceSurface(*m,item,plan->motion);instanceAttributes(*item.instancer,item.instance,item.count,*m);}
     data=std::move(m);++plan->preparedMeshes;
    }else if(meshMotion){
     // Under motion blur (SubdivisionMesh::transformPrimitive's transformVertexBuffer on the control cage): the cage at
-    // each time step, each tessellated; the steps' tessellations have one topology (uniform tessellation).
-    auto& surfaces=subdMotionCache[&o];
-    if(surfaces.empty()){
-     const auto steps=meshMotionSteps(o,plan->motion,o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN),o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END));
-     for(const auto& step:steps){surfaces.push_back(tessellateSubdivision(o,layer,*plan,transform,&step,displaceCall));subdDisplacement.check(o);}
-     for(size_t k=1;k<surfaces.size();++k)need(surfaces[k]->quads==surfaces[0]->quads&&surfaces[k]->positions.size()==surfaces[0]->positions.size(),
-      o.getName()+": a subdivision surface whose tessellation changes over the shutter is not rendered yet");}
-    auto m=subdivisionMesh(*surfaces[0],faceMask,meshName,std::move(sig),transform,polys);
-    for(size_t k=1;k<surfaces.size();++k){m->steps.push_back(surfaces[k]->positions);m->stepNormals.push_back(surfaces[k]->normals);
-     m->stepDpds.push_back(surfaces[k]->dpds);m->stepDpdt.push_back(surfaces[k]->dpdt);}
-    m->subdSteps=surfaces.size()>1;
+    // each time step, tessellated once over all of them (OpenSubdivMesh's motion samples), so one topology even where
+    // the tessellation is adaptive.
+    auto& surface=subdMotionCache[&o];
+    if(!surface){
+     auto steps=meshMotionSteps(o,plan->motion,o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN),o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END));
+     const std::vector<std::vector<V3>> later(steps.begin()+1,steps.end());
+     surface=tessellateSubdivision(o,layer,*plan,transform,&steps[0],displaceCall,false,&later);subdDisplacement.check(o);
+     need(surface->steps.size()+1==steps.size(),o.getName()+": MoonRay's subdivision gave "+std::to_string(surface->steps.size()+1)+" time steps of "+std::to_string(steps.size()));}
+    auto m=subdivisionMesh(*surface,faceMask,meshName,std::move(sig),transform,polys);
+    m->steps=surface->steps;m->stepNormals=surface->stepNormals;m->stepDpds=surface->stepDpds;m->stepDpdt=surface->stepDpdt;
+    m->subdSteps=!surface->steps.empty();
     data=std::move(m);++plan->preparedMeshes;
    }else if(onWorker&&!subdCache.count(&o)){
     // On a worker: its own displacement (the material pool copied), the mesh made there too.

@@ -2424,7 +2424,7 @@ X2_CALL U32 runMapProgram(const float* pool, U32 program, const State& st, const
                 State other = st;
                 other.s = st.s + ds[k];
                 other.t = st.t + dt[k];
-                Color shifted[MapMaxRegisters];
+                X2_MAP_REGISTERS(shifted, tex, 1);
                 const U32 status = runMapList(pool, program, list, listLength, other, tex, shifted);
                 if (status != tex::Ready) return status;
                 const MapParams Q2{P.p, P.b, P.nb, shifted};

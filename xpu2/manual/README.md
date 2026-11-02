@@ -184,9 +184,29 @@ Design: `ASYNC.md` ("How a frame runs"), `INDEXER.md` section 7.
 
 - **One CUDA stream** carries everything in order: chunk uploads into the mailbox ring, launches, readbacks and
   texture-cache updates.
-- **Launches** are fixed grids of 65,536 threads (`launchThreads`). Each thread claims one sample at a time with an
-  atomic: first parked samples, then its range of chunk items. Neighbouring claims are neighbouring pixels of the same
-  sample, so warps trace coherent rays. The device film accumulates in double precision.
+- **Launches** are grids of `launchThreads` threads. Each thread claims one sample at a time with an atomic: first
+  parked samples, then its range of chunk items. Neighbouring claims are neighbouring pixels of the same sample, so
+  warps trace coherent rays. The device film accumulates in double precision.
+- **Launch width by the card** (since 2026-11-02). The width is the largest power of two under the threads the card's
+  multiprocessors hold at once, at most 65,536 (an RTX 3090's), so a smaller card is just as full. As a scene is
+  prepared it is halved, down to 8,192, while the threads' scratch would take more than a quarter of the card's free
+  memory. Only then does a launch run narrower than the card can fill.
+- **Card memory** (since 2026-11-02). OptiX reserves the program's stack for every hardware thread, some 126,000 on an
+  RTX 3090, so each stack byte costs about 126 KB of the card. Five things keep it small:
+  - The stack is sized from the real call chains (`Program::create`), not `optixUtilComputeStackSizes`'s worst case,
+    which counted the largest callable twice. The map callable reports 24 bytes, below its PTX frames, so it is given
+    at least 4 KB.
+  - The continuation stack covers the volume module's callables only where the scene can call them (`fitStack`, as
+    a frame begins): volume ones with volumes, subsurface with a DwaBase-family material, the only ones with subsurface.
+  - A map program's registers live in each thread's scratch, sized by the scene's largest program
+    (`X2_MAP_REGISTERS`), not 3 KB on the stack at every material call.
+  - The rest of the scratch is the scene's: AOVs, Cryptomatte, DwaBase slots, glitter and moving lights only where used.
+    The Bsdf (10.6 KB) and the pending rays (8 KB) are fixed: smaller ones would change the picture.
+  - The parked-sample queue is sized by the frame, and is a token where the scene has no textures (`sizeParked`).
+  On an RTX 3090 a scene with plain materials went from 10.9 GB to 4.5 GB, subsurface and normal maps from 11.1 to
+  5.7–6.6 GB, fog 11.1 to 5.7 GB and 9 Spheres 12.1 to 7.5 GB, at the same speed, the pictures within each build's own
+  run-to-run noise, and no OptiX exception on eight scenes in the exceptions build. `XPU2_ASYNC_STACKS=1` logs each
+  program's stack, the stack asked for and the scratch.
 - **Acceleration structures.** One GAS per mesh, kept while the mesh is unchanged, under an IAS. Curves and points
   are OptiX custom primitives. Geometry in motion has a key a time step, traced at the sample's time, so the pipeline
   is compiled for motion in every scene (about 2 to 3% on a still one).
@@ -543,6 +563,7 @@ Environment variables read by the session or the renderer. The defaults are the 
 | `XPU2_SESSION_GEOMETRY_MB` | Fixes the prepared-geometry budget (default: measured from free RAM, 256 MB to 64 GB) |
 | `XPU2_SESSION_GPU_GEOMETRY_MB` | The card's geometry budget, past which the largest meshes go to the CPU lane alone (added 2026-10-26) |
 | `XPU2_SESSION_MEMORY_MB` | The session's memory ceiling (added 2026-10-26) |
+| `XPU2_ASYNC_STACKS=1` | Logs the GPU program's stacks and each thread's scratch (added 2026-11-02) |
 | `XPU2_SESSION_GEOMETRY_CACHE=0`, `_GEOMETRY_CACHE_GB` | No tessellation cache on disk; its size (default 20 GB) (added 2026-10-26) |
 | `XPU2_SESSION_TESSELLATION_JOBS` | Meshes tessellated at once (default 1) (added 2026-10-26) |
 | `XPU2_SESSION_SHARED_INSTANCES=0` | Each instance baked into a mesh of its own (added 2026-10-26) |
@@ -653,6 +674,8 @@ From the design notes. Each has more detail where it's listed.
 **MoonRay port**
 
 - On the GPU: VDB, heterogeneous and emissive volumes (deferred to the CPU today); light filters, shadow linking and lobe light sets (they keep a scene on the CPU today).
+- An instanced displaced polygon mesh that deforms (it goes to MoonRay XPU today; subdivision ones render since 2026-11-02).
+- Deforming subdivision surfaces and their instances are checked by eye on one test scene, not yet against MoonRay.
 - Resuming from a checkpoint, and deep output (`FEATURE_PROGRESS.md`).
 
 ## 22. Further reading
