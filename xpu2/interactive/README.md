@@ -1,39 +1,31 @@
-# Experimental XPU2 prototype
+# XPU2
 
-XPU2 is an experimental standalone Windows CPU/GPU renderer developed by Raphael Tobar with AI assistance. It explores indexed immutable scenes, resident GPU data and asynchronous path continuation alongside a pinned MoonRay XPU fallback. **It is not a production renderer, a replacement for MoonRay XPU, or an installed Modo feature.**
+*XPU2: Asynchronous Monte Carlo Path Tracer designed by Raphael Tobar, developed with AI assistance. Not affiliated with or endorsed by DreamWorks Animation; MoonRay and OpenMoonRay are DreamWorks Animation's.*
+
+XPU2 is a Windows path tracer in which the CPU and an NVIDIA GPU render the same image at once, each claiming its own work and neither waiting for the other. **In MoonRay for Modo 0.5, a pre-production release, it is the default GPU renderer for MoonRay previews; final renders come from MoonRay, and a scene XPU2 does not render yet goes to MoonRay XPU.**
+
+How it works, part by part: the [engineer manual](../manual/README.md).
 
 ## What works
 
-- CPU and OptiX/CUDA lanes perform supported traversal and shading, with fixed 50/50 checkerboard sample ownership and up to 12 CPU workers.
-- Static flat-shaded triangles, opaque diffuse/emissive USD Preview materials, supported RGB image maps, software mip/filter evaluation and a constant environment.
-- Bounded progressive batches preserve unfinished paths across frame deadlines. A missing texture can resume after a bounded whole-mip refill or migrate to the CPU.
-- Immutable scene data and GPU resources persist between requests. The host receives progressive float32 images through pipes.
-- Cancellation, stale-result rejection and whole-scene fallback to a pinned Windows MoonRay XPU build. Native and reference pixels are never blended. Reference rendering remains the default; native mode is opt-in.
+- Both devices together, or either alone: a work grid of cells that move between them, one integrator compiled for both, every sample defined by its identity so it gives the same result on either. Geometry and lights in motion, and points, render on both. What the GPU programs lack is deferred to the CPU lane.
+- MoonRay's path tracer and shader library, ported and checked against MoonRay: lights and light filters, the DwaBase materials and combinators, maps, subsurface, hair and curves, subdivision and displacement, volumes and VDB, cameras, motion blur, render outputs, light-path AOVs and Cryptomatte. Each feature's state and check are in [feature progress](FEATURE_PROGRESS.md).
+- Sampling by generations, spending samples where the picture is still noisy.
+- Textures in tiers: every level in host RAM, the coarse levels and a cache of fine tiles in VRAM, misses shaded from a coarser level and rendered again in full.
+- A session speaking the kit's preview protocol: scene edits as they happen, realtime camera and object moves, cancel and drain, and whole-scene fallback to MoonRay XPU. Native and reference pixels are never blended.
 
-## Measured results, not a general promise
+## Limits
 
-On an RTX 3090 and an i7-4930K (6 cores / 12 logical threads), two synthetic textured direct-lighting scenes passed frozen image-quality gates. At 12 threads their fresh warm render-phase medians fell from **4.095 to 2.763 seconds** and **6.882 to 4.605 seconds**, about **33% less time than original XPU**. At one thread the reductions were about 45% and 40%.
+[Feature progress](FEATURE_PROGRESS.md) lists what is not ported or not yet checked, and [section 21 of the manual](../manual/README.md#21-not-done-yet) what is not done yet. Measurements so far come from one machine (an RTX 3090 and an i7-4930K).
 
-Those comparisons use original XPU's reported MCRT time versus XPU2 render-window wall time. They exclude startup, loading and output. One native gallery run was slower than the reference median and is retained in the evidence. They do not prove an end-to-end or arbitrary-scene speedup.
+## Measurements
 
-The subsequent shared-table update cut cold OptiX module compilation from **14.461 to 10.311 seconds** (29%) in three private-empty-cache runs per build. Its 1/12-thread images remain byte-identical to the preceding native images and warm-speed gates passed. This is a comparison against the previous XPU2 build, not another fresh XPU timing comparison.
+[The asynchronous renderer's results](ASYNC_RESULTS.md) (22 and 23 October) and the [table on the Modo scenes](../FOUNDATION.md) are specific to their scenes, not a general promise.
 
-See [validation and numerical evidence](VALIDATION.md).
-
-## Important limitations
-
-- Textured 3D scenes support **direct lighting only**. Untextured diffuse/emissive transport supports up to eight surface interactions.
-- No native glass, metal, glossy BSDFs, SSS, arbitrary material graphs, general light types, curves, hair, volumes, motion blur or complete Modo scene parity.
-- Flat geometric normals and a restricted camera/material/geometry admission domain; unsupported scenes require the reference path, not silent approximation.
-- Fixed device ownership; no dynamic CPU/GPU donation, production SIMD/NUMA scheduler or measured 30 ms interactive guarantee.
-- Texture residency uses bounded whole-mip uploads. Selective demand paging, LRU eviction and RAM/VRAM spill tiers are unfinished. Fine refill uses a 64 MiB texel budget; existing device/pinned staging limits remain.
-- Native preview/decode is capped at **1,048,576 pixels**, below 1920×1080.
-- Frozen RDLB packages are the input. There is no Modo change-tracking adapter or kit installation in this prototype.
-- Native/reference outputs remain globally unqualified. Reference multiworker variation is measured on finite fixtures; a clean source-to-reference-binary rebuild is not established.
-- Source publication only: no portable installer, runtime bundle or SDK redistribution. Building requires the existing Windows MoonRay development toolchain; clean-machine build/install validation remains open.
+As a record, the 22 October prototype this renderer grew from was compared with original XPU on two synthetic textured direct-lighting scenes: fresh warm render-phase medians fell from **4.095 to 2.763 seconds** and **6.882 to 4.605 seconds** at 12 threads. See [its validation and numerical evidence](VALIDATION.md).
 
 ## Build, run, and licensing
 
 Read [BUILDING.md](BUILDING.md) before running. Original code is [MIT-licensed](LICENSE), copyright Raphael Tobar. Upstream-derived portions retain Apache-2.0/BSD terms and notices; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-Earlier experiments elsewhere under `xpu2/` are historical. This directory is the current standalone prototype; comments describing its former private development do not restrict the licenses above. Local historical reports and generated assets are not all included. Source snapshots and scripts retain experimental guards rather than silently relaxing them for publication.
+Earlier experiments elsewhere under `xpu2/` are historical. Comments describing this directory's former private development do not restrict the licenses above. Local historical reports and generated assets are not all included.

@@ -26,6 +26,7 @@ int main(int argc, char** argv) {
         const unsigned threads = unsigned(std::stoul(argv[6])), repeats = unsigned(std::stoul(argv[7]));
         const int mode = std::stoi(argv[8]);
         cpu::need(threads >= 1 && threads <= 64 && repeats >= 1 && repeats <= 16 && mode >= 0 && mode <= 2, "Probe bounds");
+        if (std::getenv("XPU2_SESSION_SPILL_MB")) texture::watchPressure(0);
         async::RenderOptions options;
         options.threads = threads;
         options.mode = mode;

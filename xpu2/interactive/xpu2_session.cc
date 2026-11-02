@@ -1,4 +1,4 @@
-// XPU2's preview session for MoonRay for Modo, a private test build: the kit's persistent preview protocol v1
+// XPU2's preview session for MoonRay for Modo: the kit's persistent preview protocol v1
 // (native-port/persistent_session.inc) rendered by the asynchronous renderer. No Modo API.
 //
 //   moonray_xpu2 -in <scene> [-in <scene> ...] -out <image> -exec_mode <mode> [-info] [-threads <n>]
@@ -32,6 +32,7 @@
 #include <cstring>
 #include <new>
 #include <psapi.h>
+#include <functional>
 #include <dxgi.h>
 #include <fstream>
 #include <iostream>
@@ -91,6 +92,30 @@ void memoryCeiling() {
 }
 
 // The session's committed memory now and at its peak, in MB.
+// Where the scene's textures stand, for the MoonRay XPU2 Terminal: at a load (whole) and after each frame (what changes).
+void logTextures(const cpu::Plan& plan, const async::GpuLane* card, bool whole) {
+    std::vector<std::shared_ptr<texture::File>> files;
+    for (auto* bindings : {&plan.diffuseMaps, &plan.emissionMaps})
+        for (auto& pair : *bindings)
+            if (std::find(files.begin(), files.end(), pair.second.file) == files.end()) files.push_back(pair.second.file);
+    for (auto& file : plan.textures)
+        if (std::find(files.begin(), files.end(), file) == files.end()) files.push_back(file);
+    if (files.empty()) return;
+    const texture::TextureReport r = texture::reportTextures(files, plan.realtime);
+    const auto mb = [](uint64_t bytes) { return double(bytes) / (1 << 20); };
+    if (whole) {
+        std::printf("MoonRay XPU2: textures: %zu files (%zu 8-bit, %zu half, %zu float), %zu of them grey; at most %u pixels a side%s; finest levels %.0f MB if all read, coarser levels %.0f MB\n",
+                    r.files, r.eightBit, r.half, r.floats, r.grey, r.largest, plan.realtime ? " in realtime" : "", mb(r.finest), mb(r.coarser));
+        std::printf("MoonRay XPU2: textures could save: grey maps as one channel %.0f MB, half-float maps as 16-bit %.0f MB, flat tiles about %.0f MB (read in %.3f s)\n",
+                    mb(r.saveGrey), mb(r.saveHalf), mb(r.saveFlat), r.scanSeconds);
+    }
+    std::printf("MoonRay XPU2: textures in RAM: coarser levels %.0f MB, %llu of %llu finest tiles decoded (%.0f MB)\n", mb(r.coarser),
+                (unsigned long long)r.tilesDecoded, (unsigned long long)r.tiles, mb(r.decoded));
+    if (card) std::printf("MoonRay XPU2: textures on the card: %s\n", card->textureCardText().c_str());
+    if (const std::string overflow = texture::overflowWords(); !overflow.empty()) std::printf("MoonRay XPU2: textures %s (texture overflow mode; %zu of %zu files compressed)\n", overflow.c_str(), r.compressed, r.files);
+    std::fflush(stdout);
+}
+
 std::string memoryText() {
     PROCESS_MEMORY_COUNTERS_EX counters{};
     counters.cb = sizeof counters;
@@ -226,7 +251,14 @@ std::unique_ptr<async::GpuLane> gpuLane(const Programs& p, std::function<void(un
 // OptiX hands out compile tasks whether or not its disk cache holds a program, so whether it does is kept as a mark
 // of our own: a file named for the programs' text and the graphics driver (a new driver empties OptiX's cache),
 // left once they have compiled.
-fs::path shaderMark(const Programs& p) {
+// It also says, inside, which programs and which driver it was for: a mark that is not this one tells why they are out of
+// date (shadersCompiled).
+struct ShaderStamp {
+    std::uint64_t programs = 0, driver = 0;
+    fs::path mark;
+};
+ShaderStamp shaderStamp(const Programs& p) {
+    ShaderStamp stamp;
     std::uint64_t h = 1469598103934665603ull;
     auto mix = [&](const void* data, size_t n) {
         for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
@@ -239,20 +271,29 @@ fs::path shaderMark(const Programs& p) {
     }
     // So is a diagnostic build's with OptiX's exceptions (XPU2_OPTIX_EXCEPTIONS).
     if (std::getenv("XPU2_OPTIX_EXCEPTIONS")) mix("exceptions", 10);
+    stamp.programs = h;
     wchar_t system[MAX_PATH] = {};
     GetSystemDirectoryW(system, MAX_PATH);
     WIN32_FILE_ATTRIBUTE_DATA driver{};
     if (GetFileAttributesExW((fs::path(system) / "nvcuda.dll").c_str(), GetFileExInfoStandard, &driver))
         mix(&driver.ftLastWriteTime, sizeof(driver.ftLastWriteTime)), mix(&driver.nFileSizeLow, sizeof(driver.nFileSizeLow));
+    {
+        const std::uint64_t programs = stamp.programs;
+        stamp.driver = (std::uint64_t(driver.ftLastWriteTime.dwHighDateTime) << 32 | driver.ftLastWriteTime.dwLowDateTime) ^ driver.nFileSizeLow;
+        stamp.programs = programs;
+    }
     const char* local = std::getenv("LOCALAPPDATA");
     char name[32];
     std::snprintf(name, sizeof(name), "%016llx.compiled", (unsigned long long)h);
-    return fs::u8path(local ? local : ".") / "MoonRayForModo" / "xpu2-shaders" / name;
+    stamp.mark = fs::u8path(local ? local : ".") / "MoonRayForModo" / "xpu2-shaders" / name;
+    return stamp;
 }
+fs::path shaderMark(const Programs& p) { return shaderStamp(p).mark; }
 void markCompiled(const Programs& p) {
     std::error_code ignored;
-    fs::create_directories(shaderMark(p).parent_path(), ignored);
-    std::ofstream(shaderMark(p)) << "compiled\n";
+    const ShaderStamp stamp = shaderStamp(p);
+    fs::create_directories(stamp.mark.parent_path(), ignored);
+    std::ofstream(stamp.mark) << "compiled\n" << stamp.programs << ' ' << stamp.driver << '\n';
 }
 
 // --compile-shaders: the GPU programs into OptiX's disk cache, with progress as it goes.
@@ -281,9 +322,34 @@ int compileShaders(const fs::path& folder) {
 
 int shadersCompiled(const fs::path& folder) {
     try {
-        const bool compiled = fs::exists(shaderMark(programs(folder)));
-        std::cout << (compiled ? "MoonRay XPU2 shaders: compiled" : "MoonRay XPU2 shaders: not compiled") << std::endl;
-        return compiled ? 0 : 3;
+        const ShaderStamp stamp = shaderStamp(programs(folder));
+        if (fs::exists(stamp.mark)) {
+            std::cout << "MoonRay XPU2 shaders: compiled" << std::endl;
+            return 0;
+        }
+        // Not these, but compiled before: out of date (exit 4), and why, by the newest mark that says what it was for.
+        std::error_code ignored;
+        fs::path newest;
+        fs::file_time_type when{};
+        for (const auto& entry : fs::directory_iterator(stamp.mark.parent_path(), ignored)) {
+            if (entry.path().extension() != ".compiled") continue;
+            const auto written = entry.last_write_time(ignored);
+            if (newest.empty() || written > when) {
+                newest = entry.path();
+                when = written;
+            }
+        }
+        if (newest.empty()) {
+            std::cout << "MoonRay XPU2 shaders: not compiled" << std::endl;
+            return 3;
+        }
+        std::ifstream file(newest);
+        std::string word;
+        std::uint64_t oldPrograms = 0, oldDriver = 0;
+        const bool said = bool(file >> word >> oldPrograms >> oldDriver);
+        const char* why = !said ? "" : oldPrograms == stamp.programs ? ": new graphics driver" : oldDriver == stamp.driver ? ": XPU2 updated" : ": XPU2 and graphics driver updated";
+        std::cout << "MoonRay XPU2 shaders: out of date" << why << std::endl;
+        return 4;
     } catch (const std::exception& e) {
         std::cerr << "MoonRay XPU2 shaders: " << e.what() << std::endl;
         return 1;
@@ -407,6 +473,16 @@ struct Scene {
     std::map<std::string, size_t> baseInstances;
     // And the lights edited since the base plan (any of their settings), admitted again (cpu::updateLights).
     std::vector<const rdl::SceneObject*> editedLights;
+    // All that was made of the scene let go, for it to be made again (texture overflow mode), its edits kept.
+    void dropForOverflow() {
+        cpuScene.reset();
+        plan.reset();
+        basePlan.reset();
+        cameraFrom.reset();
+        placedFrom.reset();
+        coarse = coarseCamera = cameraOnly = placementOnly = false;
+        changed = true;
+    }
     // A full plan the placement-only fast path starts from (after a full preparation, or the full plan after a coarse
     // one): its render space, and where its meshes' geometries stand.
     void keepBase(const cpu::PlanView& full) {
@@ -507,8 +583,14 @@ struct Scene {
     }
     // The coarse first pass (coarse_geometry.h; XPU2_SESSION_COARSE_FIRST=0 leaves it out): a full preparation is made
     // coarse first, where that makes any mesh lighter (coarse), and the full plan from the same canonical frame
-    // (frameHeld) by refine() while the coarse one renders. Not for realtime, whose geometry the kit cuts already.
+    // (frameHeld) by refine() while the coarse one renders. In realtime for the session's first preparation alone: the kit
+    // has cut its geometry already, but a heavy scene's tessellation still kept its first picture back, and after it an
+    // edit keeps what it can (a coarse pass again would make every mesh twice).
     bool coarseFirst = true, coarse = false;
+    // The camera moved since the coarse plan's frame, before its full plan came: that plan, made from the frame, has the
+    // camera as it was (the frame's picture would end there, whatever the view had come to).
+    bool coarseCamera = false;
+    std::function<void()> beforeFullPreparation;
     CanonicalView frameHeld;
     // Whether the scene's tessellation is heavy enough for a coarse first pass to bring its first picture on: its
     // subdivision surfaces' and displaced meshes' faces times their resolution squared (an adaptive mesh's as 4), two
@@ -681,6 +763,7 @@ struct Scene {
                 plan = next;
                 cpuScene = std::make_unique<async::CpuScene>(plan, std::move(*cpuScene));
                 changed = cameraOnly = false;
+                if (coarse) coarseCamera = true;
                 std::printf("MoonRay XPU2: the camera alone changed: prepared in %.1f ms\n",
                             std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count() * 1000.0);
                 return;
@@ -738,6 +821,9 @@ struct Scene {
         }
         placementOnly = false;
         cameraOnly = false;
+        // The full plan being made reads the canonical copy, which this changes: it first, for this to keep what it can.
+        if (beforeFullPreparation) beforeFullPreparation();
+        coarseCamera = false;
         ++epoch;
         const fs::path folder = staging / ("frame-" + std::to_string(++frames));
         const auto began = std::chrono::steady_clock::now();
@@ -754,7 +840,7 @@ struct Scene {
             cpu::Limits limits;
             limits.bytes = geometryBudget();
             limits.gpuBytes = gpuGeometryBudget();
-            limits.coarse = coarseFirst && !realtimeAsked() && heavyTessellation();
+            limits.coarse = coarseFirst && (!realtimeAsked() || !plan) && heavyTessellation();
             plan = cpu::prepare(*canonical, frame, plan, limits, assetRoot(), cpu::Domain::SurfaceTextures, true, true);
             coarse = limits.coarse && plan->coarsened > 0;
             frameHeld = frame;
@@ -1318,6 +1404,52 @@ int session(const Args& args, const fs::path& directory) {
     const bool realtimeDenoise = envOn("XPU2_SESSION_RT_DENOISE", true);
     std::unique_ptr<RealtimeDenoiser> denoiser;
     std::string denoiserError;
+    // The full plan being made behind a coarse first pass. It outlives a frame: a camera moved meanwhile is followed on the
+    // coarse geometry (Scene's camera path) while it goes on, where the view used to stand still until it was done (8 to 15 s
+    // on a heavy scene). Anything else that prepares the scene waits for it first (it reads the canonical copy).
+    struct RefineJob {
+        std::thread thread;
+        std::atomic<bool> ready{false};
+        std::pair<cpu::PlanView, std::unique_ptr<async::CpuScene>> full;
+        std::exception_ptr failed;
+        Clock::time_point began = Clock::now();
+        ~RefineJob() {
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::unique_ptr<RefineJob> refining;
+    // The full plan taken in, the view as it now is where the camera moved since its frame. The renderer holding the coarse
+    // CPU scene is gone by now.
+    auto takeRefined = [&] {
+        refining->thread.join();
+        if (refining->failed) {
+            auto failed = refining->failed;
+            refining.reset();
+            scene.coarse = false;
+            std::rethrow_exception(failed);
+        }
+        auto full = std::move(refining->full);
+        if (scene.coarseCamera) {
+            scene.coarseCamera = false;
+            auto moved = std::make_shared<cpu::Plan>(*full.first);
+            std::string refused;
+            if (cpu::updateCamera(*moved, *scene.source, &refused)) {
+                moved->aovs = scene.plan->aovs;  // their files' names as the last edit left them
+                full.second = std::make_unique<async::CpuScene>(moved, std::move(*full.second));
+                full.first = moved;
+            } else {
+                std::printf("MoonRay XPU2: the full plan cannot take the camera moved meanwhile: %s\n", refused.c_str());
+            }
+        }
+        refining.reset();
+        scene.coarse = false;
+        scene.plan = full.first;
+        scene.keepBase(scene.plan);
+        scene.cpuScene = std::move(full.second);
+    };
+    scene.beforeFullPreparation = [&] {
+        if (refining) takeRefined();
+    };
     try {
         scene.load(args.scenes);
     } catch (const std::exception& e) {
@@ -1327,6 +1459,8 @@ int session(const Args& args, const fs::path& directory) {
     for (;;) {
         event("APPLIED", id);
         bool complete = false;
+        bool loaded = false;  // the scene made ready: past here the lanes are at work, and a failure is not one to go on from
+    renderFrame:
         if (!waiting()) {
             async::RenderResult result;
             try {
@@ -1338,12 +1472,16 @@ int session(const Args& args, const fs::path& directory) {
                     renderer.reset();
                 }
                 scene.prepare();
+                // Said for every scene sent while it holds, the preview's notices being each scene's.
+                if (const std::string overflow = texture::overflowWords(); !overflow.empty())
+                    modoProtocolLine("@@MODO_XPU2 NOTICE Texture overflow mode: memory ran short, so textures are " + overflow +
+                                     ". Free memory, or use fewer or smaller textures, then start the preview again for full detail.");
                 if (scene.plan->aovs) checkOutputs(*scene.plan->aovs, mode != 0);
                 if (mode != 0 && !gpu) {
                     const Programs p = programs(folder);
                     if (!fs::exists(shaderMark(p))) {
                         outlines.watch(nullptr, id, 0, 0);
-                        fallback("XPU2's GPU programs are not compiled yet: System > Preferences > MoonRay > XPU2 (experimental) > "
+                        fallback("XPU2's GPU programs are not compiled yet: System > Preferences > MoonRay > XPU2 > "
                                  "Compile XPU2 Shaders (about an hour, once)");
                         return 0;
                     }
@@ -1375,6 +1513,11 @@ int session(const Args& args, const fs::path& directory) {
                     std::printf("MoonRay XPU2: memory with the GPU lane made: %s\n", memoryText().c_str());
                 }
                 if (fresh) {
+                    // The card has come to hold less than the fine-detail cache was sized for: made again to fit.
+                    if (gpu && gpuUsable && gpuPlan && gpu->fineCacheTooBig()) {
+                        std::printf("MoonRay XPU2: the card is fuller than it was: its fine-detail texture cache made again to fit\n");
+                        gpuPlan.reset();
+                    }
                     // A scene the GPU programs do not render yet (async::GpuLane::cpuOnly) renders on the CPU alone.
                     if (gpu && gpuPlan != scene.plan && scene.cameraFrom && gpuPlan == scene.cameraFrom) {
                         // A camera-only edit: the GPU's scene stays, its configuration (the camera) goes again.
@@ -1411,6 +1554,7 @@ int session(const Args& args, const fs::path& directory) {
                     renderer = std::make_unique<async::Renderer>(scene.plan, *scene.cpuScene, gpuUsable ? gpu.get() : nullptr);
                     renderer->deviceRatio(deviceRatio);
                     std::printf("MoonRay XPU2: memory with the renderer made: %s\n", memoryText().c_str());
+                    logTextures(*scene.plan, gpu && gpuUsable ? gpu.get() : nullptr, true);
                     // Sampling generations: uniform's samples spent where they show, or adaptive's to its target error.
                     std::printf("MoonRay XPU2: scene ready in %.2f s (%ux%u, %s %u)\n", std::chrono::duration<double>(Clock::now() - began).count(),
                                 scene.plan->width, scene.plan->height,
@@ -1690,12 +1834,16 @@ int session(const Args& args, const fs::path& directory) {
                     watch.checkpointSeconds = std::max(1.0, scene.plan->aovs->checkpointMinutes * 60.0);
                     watch.checkpoint = [&](async::RenderResult&& sofar) { checkpoints.save(std::move(sofar)); };
                 }
+                // Every tile let go and RAM short still, the card full too (or no card in this render): textures smaller, as
+                // for a failed load.
+                if (texture::pressureShort().exchange(false) && texture::pressure(ceilingBytes) && texture::canOverflow() &&
+                    (mode == 0 || (gpu && gpuUsable && gpu->cardTight())))
+                    throw std::runtime_error("memory is short on the machine and the card (texture overflow)");
+                loaded = true;
                 // The coarse first pass (coarse_geometry.h): the frame's first samples on lighter geometry, in its pictures
                 // and never in its film, while the full geometry is prepared on this thread; then the full plan renders the
                 // frame from its start, its pictures shown once they are as far on as the coarse pass's were.
                 if (scene.coarse && !waiting()) {
-                    const auto coarseBegan = Clock::now();
-                    std::atomic<bool> fullReady{false};
                     double reached = 0;
                     async::Watch first = watch;
                     const auto shown = watch.preview;
@@ -1703,56 +1851,58 @@ int session(const Args& args, const fs::path& directory) {
                         reached = std::max(reached, fraction);
                         shown(rgb, w, h, fraction);
                     };
-                    first.stop = [&] { return fullReady.load() || waiting(); };
+                    if (!refining) {
+                        refining = std::make_unique<RefineJob>();
+                        const rdl::SceneContext& replica = scene.canonical->replica();
+                        refining->thread = std::thread([job = refining.get(), &replica, frame = scene.frameHeld, coarsePlan = scene.plan] {
+                            try {
+                                job->full = Scene::refine(replica, frame, coarsePlan);
+                            } catch (...) {
+                                job->failed = std::current_exception();
+                            }
+                            job->ready = true;
+                        });
+                    }
+                    first.stop = [&] { return refining->ready.load() || waiting(); };
                     first.drain = [] { return false; };
                     first.checkpoint = nullptr;
                     first.checkpointSeconds = 0;
                     async::RenderOptions firstOptions = options;
                     firstOptions.watch = &first;
-                    std::pair<cpu::PlanView, std::unique_ptr<async::CpuScene>> full;
-                    std::exception_ptr failed;
-                    const rdl::SceneContext& replica = scene.canonical->replica();
-                    std::thread fullThread([&, frame = scene.frameHeld, coarsePlan = scene.plan] {
-                        try {
-                            full = Scene::refine(replica, frame, coarsePlan);
-                        } catch (...) {
-                            failed = std::current_exception();
-                        }
-                        fullReady = true;
-                    });
                     try {
                         renderer->render(firstOptions);
                     } catch (const std::exception& e) {
                         // The coarse pass is only pictures: the full frame follows whatever became of it.
                         std::printf("MoonRay XPU2: coarse first pass stopped: %s\n", e.what());
                     }
-                    // The coarse frame done before the full geometry: its last picture stays meanwhile.
-                    fullThread.join();
-                    const unsigned lighter = scene.plan->coarsened;
-                    scene.coarse = false;
-                    if (failed) std::rethrow_exception(failed);
-                    // The coarse renderer holds the coarse CPU scene: let go first, the outlines' watch on it before it.
-                    outlines.watch(nullptr, id, 0, 0);
-                    renderer.reset();
-                    scene.plan = full.first;
-                    scene.keepBase(scene.plan);
-                    scene.cpuScene = std::move(full.second);
-                    if (gpu) {
-                        const std::string why = async::GpuLane::cpuOnly(scene.plan);
-                        gpuUsable = why.empty();
-                        if (gpuUsable) gpu->prepare(scene.plan);
-                        gpuPlan = scene.plan;
+                    // The coarse frame done before the full geometry: its last picture stays meanwhile, unless an edit comes.
+                    while (!refining->ready.load() && !waiting()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    if (refining->ready.load()) {
+                        const unsigned lighter = scene.plan->coarsened;
+                        const double fullSeconds = std::chrono::duration<double>(Clock::now() - refining->began).count();
+                        // The coarse renderer holds the coarse CPU scene: let go first, the outlines' watch on it before it.
+                        outlines.watch(nullptr, id, 0, 0);
+                        renderer.reset();
+                        loaded = false;  // nothing renders till the full plan is on the card: as a load, it may overflow
+                        takeRefined();
+                        if (gpu) {
+                            const std::string why = async::GpuLane::cpuOnly(scene.plan);
+                            gpuUsable = why.empty();
+                            if (gpuUsable) gpu->prepare(scene.plan);
+                            gpuPlan = scene.plan;
+                        }
+                        renderer = std::make_unique<async::Renderer>(scene.plan, *scene.cpuScene, gpuUsable ? gpu.get() : nullptr);
+                        renderer->deviceRatio(deviceRatio);
+                        outlines.watch(renderer.get(), id, width, height);
+                        options.mode = gpu && gpuUsable ? mode : 0;
+                        loaded = true;
+                        // The full frame's pictures from where the coarse pass came to, but no later than a quarter of the way: a
+                        // coarse frame done before the full geometry was ready would otherwise stand for the whole render.
+                        hideBelow = std::min(reached, 0.25);
+                        std::printf("MoonRay XPU2: coarse first pass: %u meshes lighter, rendered to %.0f%%; the full geometry ready in %.2f s\n", lighter,
+                                    reached * 100.0, fullSeconds);
+                        std::fflush(stdout);
                     }
-                    renderer = std::make_unique<async::Renderer>(scene.plan, *scene.cpuScene, gpuUsable ? gpu.get() : nullptr);
-                    renderer->deviceRatio(deviceRatio);
-                    outlines.watch(renderer.get(), id, width, height);
-                    options.mode = gpu && gpuUsable ? mode : 0;
-                    // The full frame's pictures from where the coarse pass came to, but no later than a quarter of the way: a
-                    // coarse frame done before the full geometry was ready would otherwise stand for the whole render.
-                    hideBelow = std::min(reached, 0.25);
-                    std::printf("MoonRay XPU2: coarse first pass: %u meshes lighter, rendered to %.0f%%; the full geometry ready in %.2f s\n", lighter,
-                                reached * 100.0, std::chrono::duration<double>(Clock::now() - coarseBegan).count());
-                    std::fflush(stdout);
                 }
                 // A moved volume's baked grid made again on a worker (cpu::rebakeVolume) while the frame renders with the old
                 // one moved along with it; once made, and nothing newer asked for, it is swapped into a copy of the plan (the
@@ -1920,11 +2070,32 @@ int session(const Args& args, const fs::path& directory) {
                         std::printf("MoonRay XPU2: %s in %.2f s (CPU %llu samples, GPU %llu)\n", result.drained ? "drained" : "finished",
                                     result.seconds, (unsigned long long)result.cpuSamples, (unsigned long long)result.gpuSamples);
                         std::printf("MoonRay XPU2: memory: %s; GPU lane %s\n", memoryText().c_str(), gpu ? gpu->memoryText().c_str() : "none");
+                        logTextures(*scene.plan, gpu && gpuUsable ? gpu.get() : nullptr, false);
                     }
                 }
                 outlines.watch(nullptr, id, 0, 0);
             } catch (const std::exception& e) {
                 outlines.watch(nullptr, id, 0, 0);
+                // Out of memory on the machine or the card as the scene is made ready, with textures that could be smaller:
+                // texture overflow mode, the frame again with them halved, before the scene is given up to MoonRay XPU.
+                const std::string why = e.what();
+                const bool memory = dynamic_cast<const std::bad_alloc*>(&e) || why.find("texture overflow") != std::string::npos ||
+                                    why.find("Decoded texture budget") != std::string::npos || why.find("Aggregate host texture budget") != std::string::npos ||
+                                    why.find("residency budget") != std::string::npos || why == "CUDA error 2" ||  // CUDA_ERROR_OUT_OF_MEMORY
+                                    why == "OptiX error 7002";  // OPTIX_ERROR_HOST_OUT_OF_MEMORY
+                if (memory && !loaded && texture::nextOverflowSide()) {
+                    std::printf("MoonRay XPU2: %s: textures %s\n", why.c_str(), texture::overflowWords().c_str());
+                    std::fflush(stdout);
+                    denoiser.reset();
+                    renderer.reset();
+                    refining.reset();
+                    scene.dropForOverflow();
+                    gpuPlan.reset();
+                    if (gpu) gpu->dropScene();  // what it holds of the scene gone before the scene is made again, not after
+                    // Realtime's textures are 1024 pixels a side at most on the card: larger steps would free nothing there.
+                    while (scene.realtimeAsked() && texture::overflowSide().load() > 1024 && texture::nextOverflowSide()) {}
+                    goto renderFrame;
+                }
                 fallback(e.what());
                 return 0;
             }
@@ -1954,6 +2125,12 @@ int session(const Args& args, const fs::path& directory) {
                     if (bar == std::string::npos) break;
                     at = bar + 1;
                 }
+                refining.reset();
+                scene.coarse = scene.coarseCamera = false;
+                texture::overflowSide().store(0);  // a scene loaded anew may fit: it steps down again if not
+                texture::overflowCompress().store(false);
+                if (gpu) gpu->dropScene();
+                gpuPlan.reset();
                 scene.load(list);
                 event("RELOADED", id);
             } else if (mode_ == "delta") {
@@ -1978,6 +2155,7 @@ int main(int argc, char** argv) {
     const char* directory = std::getenv("MOONRAY_MODO_SESSION");
     if (!directory) return passThrough(argc, argv);
     memoryCeiling();
+    texture::watchPressure(ceilingBytes);
     try {
         const int code = session(parse(argc, argv), fs::u8path(directory));
         cpu::finishGeometryCache();  // the tessellations being written to the cache, whole

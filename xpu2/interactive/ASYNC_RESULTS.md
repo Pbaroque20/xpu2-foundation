@@ -13,7 +13,7 @@ upload; 0.95 to 1.33 s) is reported apart, as XPU's render preparation is.
 
 ## Uniform sampling: 64 samples a pixel
 
-Report: `test-results/async-benchmark-9/report.json` (23 October, the current build).
+Report: `test-results/async-benchmark-9/report.json` (the build of 23 October).
 
 | Scene | Threads | XPU | XPU2 | Less time |
 | --- | --- | --- | --- | --- |
@@ -89,6 +89,8 @@ spheres and spend their samples on the textured floor and the edges.
 - **The passes are made on the GPU.** The whole frame is queued at once; on the device, each pass's errors, region
   trees, masks and active tiles are made from the passes before it, and the next render follows. Passes made on the
   host instead give every pixel exactly the same samples (checked on both scenes), at 0.055 s and 0.076 s a frame.
+  This is the benchmark's way: the kit's previews make their passes on the host unless its adaptive passes preference
+  says otherwise (`XPU2_SESSION_CHAIN`, off by default; `xpu2_session.cc`, `native.py`).
 - **The CPU alone** renders an adaptive frame in 1.29 s (gallery) and 1.97 s (workshop) at 12 threads, also less
   than XPU's time, and agrees with the GPU-only frame within 0.0042 on every 8×8 block mean.
 - **Steady.** The trees see only completed passes, so an adaptive frame's allocation does not depend on timing: every

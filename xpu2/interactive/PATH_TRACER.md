@@ -44,17 +44,18 @@ XPU mode runs the bundled ISPC integrator, with the same structure as the scalar
 Radiance is `color × intensity × 2^exposure`, divided by the area when `normalized` (`LightUtil.h`,
 `computeLightRadiance`). Every light can `sample(P, N, r[3])` (direction, distance, light normal), `eval` (Li and
 the solid-angle pdf) and `intersect(P, wi)` (for BSDF samples). Area pdfs become solid-angle pdfs by `d² / cos`
-(`areaToSolidAngleScale`). Phase 1 admits: `EnvLight` (constant colour), `RectLight`, `DiskLight`, `SphereLight`,
+(`areaToSolidAngleScale`). Phase 1 admitted `EnvLight` (constant colour), `RectLight`, `DiskLight`, `SphereLight`,
 `SpotLight` and `DistantLight`, each without image maps, light filters or clear radius; `CylinderLight`, `MeshLight`,
-`PortalLight`, textured lights and light filters follow. Anything not admitted renders by fallback, as now.
+`PortalLight`, textured lights, clear radius and light filters have followed (`FEATURE_PROGRESS.md`, Lights). Anything
+not admitted renders by fallback.
 
 ## XPU2's design
 
-- **Shared code.** Lights (`async_lights.h`) and the integrator are `X2_HD`: the CPU lane and the GPU lane run the
+- **Shared code.** Lights (`light_core.h`) and the integrator are `X2_HD`: the CPU lane and the GPU lane run the
   same estimator, operation for operation, so the device split, the parity of identities and the audits hold.
 - **Scene preparation** (`cpu_scene.h`) reads the lights of the layer's light sets into flat records in render space
-  (transforms, radiance, sizes, sidedness, spread, visibility flags), gives each mesh a mask of its light set's lights
-  (up to 32), and admits `max_depth`, `max_diffuse_depth`, `max_glossy_depth`, `max_mirror_depth`, `bsdf_samples`,
+  (transforms, radiance, sizes, sidedness, spread, visibility flags), gives each mesh its light set, a bitset over the
+  lights, and admits `max_depth`, `max_diffuse_depth`, `max_glossy_depth`, `max_mirror_depth`, `bsdf_samples`,
   `light_samples`, `russian_roulette_threshold` and `lights_visible_in_camera`.
 - **Random numbers.** The camera (dimensions 0-1) and, at the first hit, the BSDF samples (16-17) and light samples
   (18-19) are stratified across the pixel's samples (Sobol, digitally shifted); so are, at the first hit, subsurface
@@ -115,8 +116,8 @@ lacks shades as the fatal colour and ends the path (`hasAllRequiredAttributes`).
 - **Hair** (`shade_hair.h`): `HairMaterial_v3` and `HairDiffuseMaterial` through DwaBase (`DWABASE_addHairLobes`):
   the one-sampler lobe or the separate R, TT, TRT and TRRT lobes (the latter three under R's hair attenuator, as
   MoonRay places them), glints from each strand's `scatter_tag`, and hair diffuse, which also replaces the hair on a
-  caustic path the material does not cast. Subsurface scattering on curves, hair in a layer and `HairLayerMaterial`
-  are refused.
+  caustic path the material does not cast. Subsurface scattering on curves and hair under a DwaBase combinator are
+  refused; hair combines through `HairLayerMaterial` and `HairColorCorrectMaterial` (see Materials).
 - **Hair toon** (`HairToonMaterial`): hair diffuse at its weight and up to three toon specular sets, each MoonRay's
   surface toon specular or its hair toon specular (`HairToonSpecularBsdfLobe`: a hair R lobe's value through the
   ramp by its luminance, sampled by a second R lobe at the indirect roughness when indirect reflections are on).
@@ -148,9 +149,9 @@ bound to closed meshes, with or without a surface material (a mesh with no mater
   triangle's geometric normal, the outermost entry and exit of each volume kept counting back from the far end), so
   the regions it starts in are known without tracking them along the path. The GPU keeps volume meshes in the same
   instance tree under visibility 2 (surfaces 1); the CPU keeps them in an Embree scene of their own.
-- Homogeneous volumes only (no attribute bound): one step a stretch of the ray (`decoupledRayMarching`), with
-  BaseVolume's ramps over the stretch's length; overlapping volumes summed, the thickest taken, or one picked by its
-  extinction (`volume_overlap_mode`).
+- Homogeneous volumes (no attribute bound), as this section was first written: one step a stretch of the ray
+  (`decoupledRayMarching`), with BaseVolume's ramps over the stretch's length; overlapping volumes summed, the thickest
+  taken, or one picked by its extinction (`volume_overlap_mode`).
 - Single scattering per light (`integrateVolumeScatteringDirect`): equi-angular samples about a point on bounded
   lights and distance samples, with MIS; the light sample's shadow ray goes through the volumes' transmittance. With
   `max_volume_depth` above one, Wrenninge's multiple scattering approximation with the attenuation, contribution and
@@ -158,8 +159,9 @@ bound to closed meshes, with or without a surface material (a mesh with no mater
 - The volume depth goes up by one at every BSDF bounce as well as after a ray's own scattering (MoonRay's
   multi-sampler sets a child's to its parent's plus one), so with the default `max_volume_depth` of one only camera
   rays gather in-scattered light; later rays only take the transmittance.
-- Refused: heterogeneous volumes (bound attributes; MoonRay bakes them), emissive volumes, other volume shaders
-  (VDB, amorphous), `volume_indirect_samples` above zero, more than 32 volumes.
+- Refused: volume shaders other than BaseVolume, VdbVolume and CutoutVolume, `volume_indirect_samples` above zero,
+  more than 32 volumes. Heterogeneous and emissive volumes, VDB and cutouts, refused when this was written, have been
+  ported since (`volume_grid.h`, `volume_emission.h`; state and checks in `FEATURE_PROGRESS.md`).
 
 ## Displacement
 
@@ -178,9 +180,11 @@ when the scene is prepared; the renderers get an ordinary mesh:
   with `smooth_normal` and no normals of its own gets the same smoothing undisplaced.
 - CombineDisplacement (its inputs' displacements scaled, added or the longer or shorter kept) and
   SwitchDisplacement (its choice, a float read as an int and cycled through 64, at preparation).
-- Refused: adaptive tessellation (`adaptive_error` above zero needs the camera's frustum), subdivision meshes,
-  object-space VectorDisplacement, `mesh_resolution` above 64, and maps that read the polygon or require attributes in
-  a displacement (MoonRay tessellates a displaced mesh into quads, four polyvertices).
+- Not taken here: adaptive tessellation (`adaptive_error` above zero), meshes with quads, n-gons or parts,
+  `mesh_resolution` above 64, maps that read the polygon, and subdivision meshes. These, refused when this was written,
+  now go through MoonRay's own tessellation in `xpu2_geom.dll` (`cpu_scene.h`, `polyGeometry`), which also hands a
+  displacement the mesh's attributes (`INDEXER.md` sections 15 and 16). Object-space VectorDisplacement is now taken
+  here (`objectSpace`).
 
 ## Maps
 
@@ -207,10 +211,9 @@ tables, a negative index wrapped where MoonRay reads before its table), MultiCha
 HairMap, HairColumnMap (scatter_tag required), HairColorPresetsMap, ToonMap, CurvatureMap and WireframeMap (a mesh hit a
 triangle, MoonRay's TriMesh; the normal's St partials from the vertex normals, not flipped with N as MoonRay's are not),
 DirectionalMap, DeformationMap (ref_P required; the scene's fatal colour where a pair of partials is degenerate),
-ProjectTriplanarUdimMap, ExtraAovMap (its colour; XPU2 renders no AOVs), ListMap (white), DebugMap and
+ProjectTriplanarUdimMap, ExtraAovMap (its colour) and ListMap (white), each with the extra AOVs it lists (`FEATURE_PROGRESS.md`), DebugMap and
 DistortNormalMap (MoonRay passes it no transform: its noise reads the render-space position unless St, input
-coordinates or ref_P; the hair surface coordinates are refused). Not ported: OpenVdbMap, which needs VDB grids (with
-VdbVolume and CutoutVolume among the volume shaders).
+coordinates or ref_P; the hair surface coordinates are refused). Not ported: OpenVdbMap.
 
 ## Gates
 
@@ -220,6 +223,8 @@ alpha 0.015. At 64 samples, relative MSE at or below XPU's own. The existing uni
 passing.
 
 ## Phases
+
+The plan as first written. All five have been carried out; `FEATURE_PROGRESS.md` lists what each came to.
 
 1. Path tracer: lights, MIS, bounces, Russian roulette, splitting. Lambert only.
 2. BSDF lobes and `BsdfBuilder` (shading/bsdf): Cook-Torrance/GGX with energy compensation, transmission, Oren-Nayar,

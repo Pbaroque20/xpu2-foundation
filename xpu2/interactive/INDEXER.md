@@ -2,11 +2,13 @@
 
 The scene index (`../indexed_scene.h`, `../rdl_scene_index.h`, `../rdl_replica.h`) captures every RDL object and
 attribute of a Modo session incrementally, and the router (`routing_index.h`) keeps a decision per entity, redone only
-for what an edit touched. Until now no classifier was given: every decision was "fallback", and the plan builder
-(`cpu_scene.h`, `cpu::prepare`) did its own admission for the whole scene, refusing it at the first thing XPU2 does
-not render, and the GPU refused whole scenes for anything its programs lack (`async_gpu.h`, `cpuOnly`).
+for what an edit touched. The classifier (`entity_classes.h`) gives each object its device class, shown in the
+session's log. The plan builder (`cpu_scene.h`, `cpu::prepare`) stays the final check of every attribute, refusing a
+scene at the first thing XPU2 does not render, and the GPU leaves a whole scene to the CPU for what its programs lack
+and no stand-in can take (`async_gpu.h`, `cpuOnly`).
 
-This note is the plan to finish it.
+This note began as the plan to finish it. It keeps that plan and what each step came to; the list at the end says
+where they stand.
 
 ## 1. Classification per entity
 
@@ -32,7 +34,7 @@ material and many DwaBase ones is not judged by the glitter.
   map interpreter split into a function per map type and the families moved into separate modules, a scene compiles
   only what it uses, cached per combination.
 - **Deferral to the CPU.** An entity classified `Cpu` is in the GPU scene as a stand-in: a bounding primitive (a
-  moving mesh's motion bounds, a VDB's box, points' bounds) or a flag on a light or material. A GPU sample that meets
+  VDB's box, a mesh left to the CPU by the card's budget) or a flag on a light or material. A GPU sample that meets
   one stops and is handed to the CPU lane, which renders that sample whole from its identity (pixel, index, frame).
   Every sample's random numbers come from its identity, so the CPU's result is the one the GPU would have made; no
   path state crosses devices, and the GPU's partial work for it is dropped (its film never sees it). The CPU lane's
@@ -206,8 +208,11 @@ generations (async_adaptive.h Cellular); the scene's sampling mode picks only wh
 
 - Uniform (cpu::Plan::sampleBudget, cpu_scene.h): every pixel is seeded with an eighth of its samples (16 at least);
   the seed's steady rate (its passes after the first, which go out together) prices uniform's samples as uniform's
-  time. Each generation after, the target is the error every tile would come down to if the samples that time left
-  buys, at the last generation's rate, were spent (a tile's error falls as the square root of its samples); tiles above
+  time. Where the first pass ended past half way to the seed's end (its texture tiles still loading), that time says nothing,
+  and all the seed's samples over all its time price it: the car, at 16 a pixel, had stopped at 10.7 after 64.9 s, at 100%
+  from 35 s; now 18.9 in 111 s at the same rate, past 16 because the seed's rate includes the first tiles' loading. Each generation
+  after, the target is the error every tile would come down to if the samples that time left
+  buys, at the last generation's rate (uniform's where the seed's passes ended together), were spent (a tile's error falls as the square root of its samples); tiles above
   it sample the next pass, the furthest above first if the pass would buy more than the time left. The frame ends when
   the time is up, at most twice uniform's samples and 16 times its samples a pixel. spp stays uniform's (ray
   differentials, progress). Not with a pixel sample map, a bake camera, or at 16 samples a pixel or fewer.
@@ -217,14 +222,14 @@ generations (async_adaptive.h Cellular); the scene's sampling mode picks only wh
   counts, sqrt(nG^2 eG^2 + nC^2 eC^2) / n).
 - Test switches: XPU2_SESSION_UNIFORM_BUDGET=0 (exact uniform, for the rounds against MoonRay's uniform renders),
   XPU2_SESSION_ADAPTIVE_CPU=0 (the GPU takes every adaptive chunk), XPU2_SESSION_ADAPTIVE=trees (MoonRay's trees).
-- The kit's render settings (Sampling, after Target Error; the private kit's build_xpu2_kit.py generations()): XPU2
-  Sampling Generations (on), XPU2 Samples (a pixel on average; 0: Pixel Samples'), XPU2 Spend (as long as uniform would
-  take, or exactly the samples), XPU2 Noise Target (target_adaptive_error's units; 0: none, or an adaptive scene's
-  own), XPU2 First Generation and XPU2 Most Samples (0: an eighth, 16 at least, and 16 times the average; adaptive:
-  its minimum and maximum), XPU2 CPU Workers. A preview's scene carries them as UserData("/modo/xpu2/generations")
-  {1, on, samples, spend exactly, noise, first, most, CPU} (MoonRay leaves it alone; never in a final render's), which
-  prepare reads (cpu_scene.h); an adaptive scene given samples has a budget besides its target, ending at whichever
-  comes first. The session's log says what a frame got ("XPU2: generations: first ..., most ...").
+- The kit's render settings (the XPU2 Sampling group, scene_settings.py): Generation Samples (a pixel on average; 0:
+  Pixel Samples squared), First Look (0: an eighth, 16 at least), Halting Rule (as long as uniform would take, or
+  exactly the samples), Halt at Noise (Target Error's units; 0: none), Most Samples (0: 16 times the average), CPU
+  Workers. A preview's scene carries them as UserData("/modo/xpu2/generations") {2, on, samples, spend exactly, noise,
+  first, most, CPU, realtime} (rdla.py; MoonRay leaves it alone; never in a final render's), which prepare reads
+  (cpu_scene.h). Form 2 says they rule: a scene's adaptive sampling is then MoonRay's alone (form 1 left an adaptive
+  scene its own minimum, maximum and target error). The session's log says what a frame got ("XPU2: generations:
+  first ..., most ...").
 
 His dragon scene at 640x360, display error (8-bit RMS) against 1,024 samples a pixel:
 
@@ -265,7 +270,7 @@ mean ratio 1.0000 (MoonRay tessellated in the first camera's render space).
 
 ## 13. Realtime
 
-The private kit's preview window has an RT switch beside the engine (MoonLightIPR, or MoonRay where XPU2 renders the
+The kit's preview window has an RT switch beside the engine (MoonLightIPR, or MoonRay where XPU2 renders the
 preview); Render renders once. With RT on the preview follows the scene at the realtime preview size, and the
 generations' UserData carries realtime (its ninth value, cpu_scene.h):
 
@@ -273,10 +278,12 @@ generations' UserData carries realtime (its ninth value, cpu_scene.h):
   makes the camera and render space again and the GPU gets its configuration (GpuLane::updateCamera): 0.1 ms, where
   preparing took 0.21 s. A scene whose view depends on the camera (adaptive subdivision, volumes, filters, a pixel
   sample map, motion) prepares as before.
-- A realtime frame is the GPU's alone; its first two passes are sparse (a quarter of the pixels, then the rest, one
-  sample each), each before the next, with launches sized to about 15 ms of the GPU's rate across frames (rateHint), and
+- A realtime frame is the GPU's alone; its first pass covers every pixel (sparse first passes, a quarter of the pixels
+  then the rest, flashed as scanlines before they settled and are off since 2026-10-30; XPU2_SESSION_RT_SPARSE=1), with launches sized to about 15 ms of the GPU's rate across frames (rateHint), and
   its pictures every 33 ms.
-- Pictures with Denoised Beauty chosen are denoised in the session (RealtimeDenoiser, on a thread of its own): OptiX's
+- Not used by the 0.5 kit, which under XPU2 offers no Denoised Beauty in realtime and writes no guides for it
+  (`panel.py` `_offer_denoised`, `denoising.py`); the session keeps the capability, and the measurements below are
+  its record. Pictures with Denoised Beauty chosen are denoised in the session (RealtimeDenoiser, on a thread of its own): OptiX's
   denoiser (GpuLane::Denoiser, its HDR model on a stream of its own at the highest priority) with the kit's guides, the
   albedo denoised on its own first (as the kit's "Denoiser cleans its guides first"; this dragon's albedo differs from
   sample to sample) and the normals in camera space. A picture some of whose pixels have no sample yet is denoised at
@@ -300,7 +307,8 @@ the session 11.3 to 10.0 GB. The frame took as long (about 59 s): realtime's GPU
 
 ## 14. His Modo scenes (9 Spheres, Dose, Interior) and the Source Overrides
 
-Exported headless with the installed private kit (modo_cl, test-results/xpu2-cl), each was refused before drawing:
+Recorded at the time: exported headless with the test kit then installed (modo_cl, test-results/xpu2-cl), each was
+refused before drawing:
 
 - A displacement on fur (9 Spheres): MoonRay displaces meshes alone (PolyMesh, OpenSubdivMesh); on curves and points it
   is now left out as there, not refused.
@@ -322,7 +330,7 @@ displaced through a named UV set's AttributeMap) engulfs the camera; XPU2 draws 
 in XPU2 because ball6's absorption volume is textured (FamilyVolumesMapped, not in GpuFamilies): 3.6 million of its
 19.7 million samples go to the CPU.
 
-Source Overrides: XPU2 follows the toon terminator and albedo, Cryptomatte volumes, fog alpha, opaque alpha,
+Source Overrides: XPU2 follows the toon terminator and albedo, Cryptomatte volumes, fog alpha, lights seen by the camera in light outputs (`MOONRAY_MODO_CAMERA_LIGHT_LPE`), opaque alpha,
 transmission roughness and USD specular; counts each Cryptomatte sample once by construction (no shared flag to race);
 the scene-level ones (display filter inputs, toon lines apart, light motion) arrive in the scene. Low-latency rendering
 (async::lowLatency, from the process's priority class the kit lowers, or XPU2_SESSION_LOW_LATENCY): no thread raised
@@ -433,9 +441,19 @@ objects (3 s) and texture pyramids (5 s).
 
 ## Order
 
-1. Classifier from the admission rules, with the GPU capability table; decisions shown in the session's log.
-2. Scene mode from the decisions; the plan builder keeps its checks as assertions.
-3. Deferral to the CPU (GPU stand-ins, deferral status, the CPU lane's retry queue), replacing `cpuOnly`.
-4. Cell seeding by suitability and ownership by deferral rate.
-5. GPU program families as separate modules, compiled on demand.
-6. The change set to the renderer: partial rebuilds of the scene on both devices.
+As of 2026-10-30, where it could be checked against the code:
+
+1. Classifier from the admission rules, with the GPU capability table; decisions shown in the session's log. Done
+   (`entity_classes.h`).
+2. Scene mode from the decisions; the plan builder keeps its checks as assertions. The mode is worked out and logged
+   ("MoonRay XPU2 routing", `xpu2_session.cc`); the plan builder still refuses by itself.
+3. Deferral to the CPU (GPU stand-ins, deferral status, the CPU lane's retry queue), replacing `cpuOnly`. Done for
+   stand-ins; `cpuOnly` remains for light filters, shadow linking, lobe light sets and emissive volumes. Points, and
+   geometry and lights in motion, are the GPU's since sessions 211-213 (`XPU2_GPU_MOTION_OFF` defers them again, to
+   compare).
+4. Cell seeding by suitability and ownership by deferral rate. Done (`device_suit.h`; deferred samples count as the
+   CPU's in the ownership flips).
+5. GPU program families as separate modules, compiled on demand. Nine modules, done (`build_async.py`); linking and
+   compiling per scene by its families, not done.
+6. The change set to the renderer: partial rebuilds of the scene on both devices. In part: a camera or a move
+   without a rebuild where it can (`GpuLane::updateCamera`, `GpuLane::updatePlacements`), unchanged meshes kept.

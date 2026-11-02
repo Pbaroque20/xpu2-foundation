@@ -4,6 +4,7 @@
 #include <optix.h>
 #include <optix_device.h>
 #include "async_gpu_abi.h"
+#include "points_core.h"
 using namespace xpu2::interactive;
 using namespace xpu2::interactive::async;
 
@@ -123,6 +124,95 @@ struct GpuBackend {
         time = t;
         missed = false;
         deferFlag = false;
+        if (params.movedLightSlots) {  // no light in motion worked out yet at this time
+            U32* tags = movedLightTags();
+            for (U32 k = 0; k < params.movedLightSlots; ++k) tags[k] = ~0u;
+        }
+    }
+    __device__ lights::Light* movedLights() const {
+        return reinterpret_cast<lights::Light*>(params.scratch + U64L(optixGetLaunchIndex().x) * params.scratchStride + params.movedLightsOffset);
+    }
+    __device__ U32* movedLightTags() const { return reinterpret_cast<U32*>(movedLights() + params.movedLightSlots); }
+    // A light in motion at the sample's time, worked out when first reached, in slots used in turn: the path tracer holds
+    // one light at a time, so a slot is reused only after the light in it has been let go.
+    __device__ const lights::Light& movedLight(U32 i) const {
+        lights::Light* records = movedLights();
+        U32* tags = movedLightTags();
+        for (U32 k = 0; k < params.movedLightSlots; ++k)
+            if (tags[k] == i) return records[k];
+        U32& next = tags[params.movedLightSlots];
+        const U32 at = next < params.movedLightSlots ? next : 0u;
+        next = at + 1u;
+        tags[at] = i;
+        records[at] = lights::lightAtTime(params.lights[i], params.lightMotion[params.lightMoved[i]], time);
+        return records[at];
+    }
+    __device__ surface::V3 vertexAt(const MeshMotion& motion, U32 i) const { return motionVertex(motion, i, time); }
+    // Mesh geom's points (radii and centres), or null when it holds none.
+    __device__ const float* pointRadii(U32 geom) const { return params.meshMotion ? params.meshMotion[geom].pointRadius : nullptr; }
+    // A point's hit worked out again from its sphere (CpuBackend::trace, the same arithmetic).
+    __device__ bool pointHit(const surface::Ray& ray, resume::Hit& out) const {
+        const MeshMotion& motion = params.meshMotion[out.geom];
+        const surface::V3 centre = motion.steps > 1 ? vertexAt(motion, out.prim) : params.geometry[out.geom].vertices[out.prim];
+        float t;
+        surface::V3 Ng;
+        if (!points::intersect(centre, motion.pointRadius[out.prim], ray.origin, ray.direction, ray.nearT, ray.farT, t, Ng)) return false;
+        out.t = t;
+        out.u = out.v = 0.0f;
+        out.point = surface::add(ray.origin, surface::mul(ray.direction, t));
+        surface::V3 n;
+        if (!surface::normalize(Ng, n)) return false;
+        out.normal = surface::dot(n, ray.direction) > 0.0f ? surface::mul(n, -1.0f) : n;
+        const float eps = 1e-5f * fmaxf(1.0f, fmaxf(fabsf(out.point.x), fmaxf(fabsf(out.point.y), fabsf(out.point.z))));
+        out.origin = surface::add(out.point, surface::mul(out.normal, eps));
+        out.below = surface::add(out.point, surface::mul(out.normal, -eps));
+        return true;
+    }
+    // A mesh's shading attributes at the sample's time: its own while it is still, else a copy in local holding the time
+    // steps about that time (CpuBackend::motion, curveAttributes).
+    __device__ const shade::MeshAttributes& attributesAt(U32 geom, shade::MeshAttributes& local) const {
+        const shade::MeshAttributes& a = params.meshAttributes[geom];
+        if (!params.meshMotion || params.meshMotion[geom].steps < 2) return a;
+        const MeshMotion& m = params.meshMotion[geom];
+        local = a;
+        if (m.kind == MotionCurves) {
+            local.curve.time = time;
+            local.time = time;
+            return local;
+        }
+        if (m.kind == MotionPolygon) {
+            local.positions0 = m.positions[0];
+            local.positions1 = m.positions[1];
+            local.normals1 = m.normals1;
+            local.time = time;
+            return local;
+        }
+        const float f = time * float(m.steps - 1);
+        const U32 k = umin(U32(fmaxf(f, 0.0f)), m.steps - 2);
+        const float between = f - float(k);
+        if (m.normals) {
+            local.normals = m.normals[k];
+            local.normals1 = m.normals[k + 1];
+        }
+        if (m.dpds) {
+            local.dpds = m.dpds[k];
+            local.dpds1 = m.dpds[k + 1];
+            local.dpdt = m.dpdt[k];
+            local.dpdt1 = m.dpdt[k + 1];
+            local.sampleTime = between;
+        }
+        if (m.kind == MotionSubd) {
+            // OpenSubdivMesh::postIntersect: the motion vector and polyvertices from the first two steps.
+            local.positions0 = m.positions[0];
+            local.positions1 = m.positions[1];
+            local.time = time;
+            return local;
+        }
+        local.positions0 = m.positions[k];
+        local.positions1 = m.positions[k + 1];
+        local.time = between;
+        local.motionScale = float(m.steps - 1);
+        return local;
     }
     // Partial shading: the launch thread's mark that its sample read a coarser texel (null: off).
     __device__ U32* threadMark() const { return params.partial ? params.lowFlags + optixGetLaunchIndex().x : nullptr; }
@@ -159,12 +249,20 @@ struct GpuBackend {
         tock(ProfileTrace, from);
         return h;
     }
-    // Mesh geom's triangle's vertices where they are: a shared instance's placed by its transform (shade::placed).
+    // Mesh geom's triangle's vertices where they are: a moving mesh's at the sample's time, a shared instance's placed by
+    // its transform (shade::placed).
     __device__ void triangleAt(U32 geom, const mixed::Geometry& m, const surface::Triangle& t, surface::V3& a, surface::V3& b,
                                surface::V3& c) const {
-        a = m.vertices[t.a];
-        b = m.vertices[t.b];
-        c = m.vertices[t.c];
+        if (params.meshMotion && params.meshMotion[geom].steps > 1) {
+            const MeshMotion& motion = params.meshMotion[geom];
+            a = vertexAt(motion, t.a);
+            b = vertexAt(motion, t.b);
+            c = vertexAt(motion, t.c);
+        } else {
+            a = m.vertices[t.a];
+            b = m.vertices[t.b];
+            c = m.vertices[t.c];
+        }
         if (params.meshAttributes && params.meshAttributes[geom].instance) {
             const shade::MeshAttributes& x = params.meshAttributes[geom];
             a = shade::placedPoint(x, a);
@@ -181,9 +279,12 @@ struct GpuBackend {
         h.geom = instance;
         h.prim = primitive;
         if (params.meshAttributes && params.meshAttributes[instance].curve.basis) {
-            if (!curveHit(params.meshAttributes[instance].curve, ray, h)) return resume::Hit{};
+            curves::Set c = params.meshAttributes[instance].curve;
+            c.time = time;  // read only by curves in motion
+            if (!curveHit(c, ray, h)) return resume::Hit{};
             return h;
         }
+        if (pointRadii(instance)) return pointHit(ray, h) ? h : resume::Hit{};
         const auto m = params.geometry[instance];
         if (primitive >= m.triangleCount) {
             h.normal = {};
@@ -236,20 +337,27 @@ struct GpuBackend {
     __device__ bool surfaceState(const resume::Hit& h, const surface::Ray& ray, shade::State& st) {
         const auto& c = *params.config;
         if (h.geom >= c.meshes) return false;
-        if (params.meshAttributes[h.geom].curve.basis) {
-            if (!shade::curveState(params.meshAttributes[h.geom], h.prim, h.u, h.v, h.normal, h.point, ray.direction, st)) return false;
+        shade::MeshAttributes local;
+        const shade::MeshAttributes& attributes = attributesAt(h.geom, local);
+        if (attributes.curve.basis) {
+            if (!shade::curveState(attributes, h.prim, h.u, h.v, h.normal, h.point, ray.direction, st)) return false;
             st.geom = h.geom;
-            shade::curveDifferentials(params.meshAttributes[h.geom], ray, st.pixelSamples ? st.pixelSamples : c.spp, st);
+            shade::curveDifferentials(attributes, ray, st.pixelSamples ? st.pixelSamples : c.spp, st);
+            return true;
+        }
+        if (pointRadii(h.geom)) {
+            if (!points::state(attributes, h.prim, h.normal, h.point, ray.direction, st)) return false;
+            st.geom = h.geom;
             return true;
         }
         const auto m = params.geometry[h.geom];
         const auto t = m.triangles[h.prim];
         surface::V3 a, b, cc;
         triangleAt(h.geom, m, t, a, b, cc);
-        if (!shade::hitState(params.meshAttributes[h.geom], h.prim, t.a, t.b, t.c, a, b, cc, h.u, h.v, h.point, ray.direction, st))
+        if (!shade::hitState(attributes, h.prim, t.a, t.b, t.c, a, b, cc, h.u, h.v, h.point, ray.direction, st))
             return false;
         st.geom = h.geom;
-        shade::hitDifferentials(params.meshAttributes[h.geom], h.prim, t.a, t.b, t.c, a, b, cc, ray, st.pixelSamples ? st.pixelSamples : c.spp,
+        shade::hitDifferentials(attributes, h.prim, t.a, t.b, t.c, a, b, cc, ray, st.pixelSamples ? st.pixelSamples : c.spp,
                                 st);
         return true;
     }
@@ -262,15 +370,18 @@ struct GpuBackend {
         presence = 1.0f;
         if (h.geom >= c.meshes) return tex::Ready;
         shade::State st;
-        if (params.meshAttributes[h.geom].curve.basis) {
-            const shade::MeshAttributes& a = params.meshAttributes[h.geom];
-            if (!shade::curveState(a, h.prim, h.u, h.v, h.normal, h.point, ray.direction, st)) return tex::Ready;
+        shade::MeshAttributes local;
+        const shade::MeshAttributes& attributes = attributesAt(h.geom, local);
+        if (attributes.curve.basis) {
+            if (!shade::curveState(attributes, h.prim, h.u, h.v, h.normal, h.point, ray.direction, st)) return tex::Ready;
+        } else if (pointRadii(h.geom)) {
+            if (!points::state(attributes, h.prim, h.normal, h.point, ray.direction, st)) return tex::Ready;
         } else {
             const auto m = params.geometry[h.geom];
             const auto t = m.triangles[h.prim];
             surface::V3 a, b, cc;
             triangleAt(h.geom, m, t, a, b, cc);
-            if (!shade::hitState(params.meshAttributes[h.geom], h.prim, t.a, t.b, t.c, a, b, cc, h.u, h.v, h.point, ray.direction, st))
+            if (!shade::hitState(attributes, h.prim, t.a, t.b, t.c, a, b, cc, h.u, h.v, h.point, ray.direction, st))
                 return tex::Ready;
         }
         st.geom = h.geom;
@@ -285,13 +396,22 @@ struct GpuBackend {
     __device__ unsigned shade(const resume::Hit& h, const surface::Ray& ray, shade::State& st, shade::Bsdf& bsdf, float& presence) {
         const auto& c = *params.config;
         if (h.geom >= c.meshes) return tex::Invalid;
-        if (params.meshAttributes[h.geom].curve.basis) {
-            const shade::MeshAttributes& a = params.meshAttributes[h.geom];
-            if (!shade::curveState(a, h.prim, h.u, h.v, h.normal, h.point, ray.direction, st)) return tex::Invalid;
+        shade::MeshAttributes local;
+        const shade::MeshAttributes& attributes = attributesAt(h.geom, local);
+        if (attributes.curve.basis) {
+            if (!shade::curveState(attributes, h.prim, h.u, h.v, h.normal, h.point, ray.direction, st)) return tex::Invalid;
             st.geom = h.geom;
             st.worldToRender = c.worldToRender;
-            st.worldToObject = a.worldToObject;
-            shade::curveDifferentials(a, ray, st.pixelSamples ? st.pixelSamples : c.spp, st);
+            st.worldToObject = params.meshAttributes[h.geom].worldToObject;
+            shade::curveDifferentials(attributes, ray, st.pixelSamples ? st.pixelSamples : c.spp, st);
+            const DeviceTextures textures{params.textures, params.textureCount, threadMark()};
+            return shadeMaterial(params.meshMaterials[h.geom], st, textures, bsdf, presence);
+        }
+        if (pointRadii(h.geom)) {
+            if (!points::state(attributes, h.prim, h.normal, h.point, ray.direction, st)) return tex::Invalid;
+            st.geom = h.geom;
+            st.worldToRender = c.worldToRender;
+            st.worldToObject = params.meshAttributes[h.geom].worldToObject;
             const DeviceTextures textures{params.textures, params.textureCount, threadMark()};
             return shadeMaterial(params.meshMaterials[h.geom], st, textures, bsdf, presence);
         }
@@ -299,13 +419,13 @@ struct GpuBackend {
         const auto t = m.triangles[h.prim];
         surface::V3 a, b, cc;
         triangleAt(h.geom, m, t, a, b, cc);
-        if (!shade::hitState(params.meshAttributes[h.geom], h.prim, t.a, t.b, t.c, a, b, cc, h.u, h.v, h.point, ray.direction, st))
+        if (!shade::hitState(attributes, h.prim, t.a, t.b, t.c, a, b, cc, h.u, h.v, h.point, ray.direction, st))
             return tex::Invalid;
         st.geom = h.geom;
         st.worldToRender = c.worldToRender;
         st.worldToObject = params.meshAttributes[h.geom].worldToObject;
         const shade::MaterialRecord& record = params.meshMaterials[h.geom];
-        shade::hitDifferentials(params.meshAttributes[h.geom], h.prim, t.a, t.b, t.c, a, b, cc, ray, st.pixelSamples ? st.pixelSamples : c.spp,
+        shade::hitDifferentials(attributes, h.prim, t.a, t.b, t.c, a, b, cc, ray, st.pixelSamples ? st.pixelSamples : c.spp,
                                 st);
         const DeviceTextures textures{params.textures, params.textureCount, threadMark()};
         return shadeMaterial(record, st, textures, bsdf, presence);
@@ -371,7 +491,10 @@ struct GpuBackend {
         return reinterpret_cast<shade::GlitterScratch*>(params.scratch + U64L(optixGetLaunchIndex().x) * params.scratchStride +
                                                         params.glitterOffset);
     }
-    __device__ const lights::Light& light(U32 i) const { return params.lights[i]; }
+    __device__ const lights::Light& light(U32 i) const {
+        if (params.lightMoved && params.lightMoved[i] != ~0u) return movedLight(i);
+        return params.lights[i];
+    }
     // The volumes, and a ray's crossings of their meshes past tnear, nearest first (the instances of visibility 2),
     // each entering or leaving by the triangle's geometric normal; repeats at one distance dropped.
     __device__ const volume::Shader* volumes() const { return params.volumes; }

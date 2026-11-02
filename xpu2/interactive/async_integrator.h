@@ -244,6 +244,23 @@ X2_HD inline void inheritLobeSets(Pending& child, const Pending& parent, U32 lob
     if (lobeSet != 0xffffffffu && child.parentSetCount < 8) child.parentSets[child.parentSetCount++] = lobeSet;
 }
 constexpr U32 MaxPending = 32;
+// A hit can ask for more rays than a path has room for (Material Samples 4 on a material of three lobes, 48 at the first
+// hit; a full stack failed the whole frame). A hit's bounces are thinned evenly to the room below the reserve, before they
+// go out, so that what they find has room in turn (bounceThinning); past the reserve each further child is kept by chance.
+// Either way a child's share of light is divided by its chance: the same image on average, a little noisier there. While
+// room is plenty nothing changes.
+constexpr U32 PendingReserve = 16;
+X2_HD inline float bounceThinning(U32 top, U32 planned) {
+    const U32 room = top < PendingReserve ? PendingReserve - top : 1u;
+    return planned > room ? float(room) / float(planned) : 1.0f;
+}
+X2_HD inline bool roomForChild(U32 top, float u, float& weight) {
+    if (top >= MaxPending) return false;
+    const float chance = float(MaxPending - top) / float(PendingReserve + 1);
+    if (u >= chance) return false;
+    weight = 1.0f / chance;
+    return true;
+}
 // A ray's mask (rdl2 VisibilityType): CAMERA for a camera ray and its presence continuations (lobe type 0), else the
 // mask of the lobe it samples (lobeTypeToRayMask).
 X2_HD inline U32 rayMask(U32 lobeType) { return lobeType == 0 ? 1u : lights::lobeRayMask(lobeType); }
@@ -1154,17 +1171,21 @@ X2_CALL V3 subsurfaceExitRadiance(const mixed::Config& c, const sample::Identity
             }
         }
         const shade::Color throughput = pt * f * (1.0f / pdf);
-        if (doIndirect) {
-            if (top >= MaxPending) {
-                status = SampleStatus::Error;
-                return radiance;
-            }
+        float keptShare = 1.0f;
+        bool pushChild = doIndirect;
+        if (pushChild && top + PendingReserve >= MaxPending) {
+            sample::Identity kid = root;
+            kid.branch = childBranch(branch, 0xfffd, s);
+            Stream chance(kid, pv.depth, 0);
+            pushChild = roomForChild(top, chance.next(), keptShare);
+        }
+        if (pushChild) {
             Pending child;
             child.pixelWeight = 0.0f;
             child.volumeDepth = pv.volumeDepth;
             child.origin = shade::dot(wi, entryHit.normal) >= 0.0f ? entryHit.origin : entryHit.below;
             child.dir = wi;
-            child.T = throughput;
+            child.T = throughput * keptShare;
             child.branch = childBranch(branch, 0xfffe, s);
             child.depth = pv.depth + 1;
             child.diffuseDepth = pv.diffuseDepth + depthAdd;
@@ -1856,8 +1877,8 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
             radiance += Lv;
             // LPE: the camera saw a light in front of a surface (PathIntegratorBundled). One seen past every surface adds
             // nothing: MoonRay's miss handler (RayHandlers.cc, its case 1) declares the state anew inside its branch, so
-            // the state it accumulates with stays -1.
-            if (lpeOn && hitLight != ~0u && !missed)
+            // the state it accumulates with stays -1. MOONRAY_MODO_CAMERA_LIGHT_LPE keeps it (tools/port_camera_light_lpe.py).
+            if (lpeOn && hitLight != ~0u && (!missed || (c.modoSwitches & 8u)))
                 aov::light(at, aovs, aovDepths, Lv, nullptr, 0, aov::lpeNext(at, pv.lpe, aov::LpeLight, backend.light(hitLight).lpeLabel));
         }
         if (hit.geom == ~0u) {
@@ -1995,8 +2016,8 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                 const int s = aov::lpeNext(at, pv.lpe, aov::LpeExtra, bsdf.extraLabel[i]);
                 if (s >= 0) aov::light(at, aovs, aovDepths, bsdf.extraValue[i] * pv.T * presence, nullptr, 0, s);
             }
-        if (presence < 1.0f - lights::Epsilon) {
-            if (top >= MaxPending) return SampleStatus::Error;
+        // With no room at all what lies behind goes unseen, rather than the whole frame failing.
+        if (presence < 1.0f - lights::Epsilon && top < MaxPending) {
             const float totalPresence = (1.0f - pv.totalPresence) * presence;
             Pending through = pv;
             through.heldLight = ~0u;  // settled at this hit, where its shadow ray would have stopped (bounce-ray reuse)
@@ -2132,6 +2153,9 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
         U32 lobeSamples[shade::MaxLobes];
         for (U32 k = 0; k < bsdf.topCount; ++k)
             lobeSamples[k] = (!split || (shade::topLobe(bsdf, k).type & shade::Mirror)) ? 1 : c.bsdfSamples;
+        U32 plannedBounces = 0;
+        for (U32 k = 0; k < bsdf.topCount; ++k) plannedBounces += lobeSamples[k];
+        const float thinning = bounceThinning(top, plannedBounces);
         const V3 above = hit.origin, below = hit.below;
         // A curve's rays (PathIntegrator: the hit's epsilon hint): shadow rays skip its epsilon and reach at least twice
         // it; bounces skip the epsilon over the cosine to Ng.
@@ -2440,7 +2464,6 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
         float albedo[3 * shade::MaxLobes];
         for (U32 k = 0; k < 3 * shade::MaxLobes; ++k) albedo[k] = 0.0f;
         // The BSDF samples out of line (X2_OUT_OF_LINE); a full stack of pending paths ends the sample as before.
-        bool stackFull = false;
         [&]() X2_OUT_OF_LINE {
         for (U32 k = 0; k < bsdf.topCount; ++k) {
             const U32 record = bsdf.top[k];
@@ -2567,7 +2590,7 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                     const lights::Light& L = backend.light(lightIndex);
                     lightShadowSpan(L, lightDistance, shadowNear, shadowFar);
                     backend.shadowFor(lightIndex, hit.geom);
-                    held = bounces && top < MaxPending && !forceUnoccluded && !L.presenceShadows && lobeMask && (c.shadowReuse & lobeMask) == lobeMask &&
+                    held = bounces && thinning >= 1.0f && top + PendingReserve < MaxPending && !forceUnoccluded && !L.presenceShadows && lobeMask && (c.shadowReuse & lobeMask) == lobeMask &&
                            !c.volumeCount && shadowNear == start && shadowFrom.x == origin.x && shadowFrom.y == origin.y && shadowFrom.z == origin.z;
                     if (held) {
                         backend.countRay(RayCountHeld);
@@ -2612,9 +2635,20 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                     }
                 }
                 if (!bounces) continue;  // its indirect light, under the transparency threshold (mirror transmission lobes accumulate opacity)
-                if (top >= MaxPending) {
-                    stackFull = true;
-                    return;
+                float keptShare = 1.0f;
+                if (thinning < 1.0f || top + PendingReserve >= MaxPending) {
+                    sample::Identity kid = bid;
+                    kid.branch = childBranch(sampleBranch, 0xfff7, 0);
+                    Stream chance(kid, pv.depth, 0);
+                    if (thinning < 1.0f) {
+                        if (chance.next() >= thinning) continue;
+                        keptShare = 1.0f / thinning;
+                    }
+                    if (top + PendingReserve >= MaxPending) {
+                        float tight = 1.0f;
+                        if (!roomForChild(top, chance.next(), tight)) continue;
+                        keptShare *= tight;
+                    }
                 }
                 Pending child;
                 child.pixelWeight = 0.0f;
@@ -2624,7 +2658,7 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                 child.origin = origin;
                 child.dir = wi;
                 child.diff = shade::scatterDifferentials(bsdf, record, st, wi, r1, r2, origin, primaryScale);
-                child.T = indirect;
+                child.T = indirect * keptShare;
                 child.branch = sampleBranch;
                 child.depth = pv.depth + 1;
                 child.diffuseDepth = pv.diffuseDepth + ((lobe.type & shade::Diffuse) ? 1 : 0);
@@ -2670,7 +2704,6 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
             }
         }
         }();
-        if (stackFull) return SampleStatus::Error;
         materialAovs(albedo, ssAov);
     }
     cryptoCredit();

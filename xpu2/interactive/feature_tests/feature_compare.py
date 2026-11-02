@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runq
 
 S = Path(__file__).resolve().parent
-HARNESS = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2-async\xpu2\interactive\session_harness.py')
+HARNESS = S.parent / 'session_harness.py'
 # The reference MoonRay: the installed kit's, or XPU2_REFERENCE_RUNTIME's (a pinned reference runtime).
 RT = Path(os.environ.get('XPU2_REFERENCE_RUNTIME', r'C:\Users\Raphael Tobar\AppData\Roaming\Luxology\Kits\MoonRayForModo\runtime'))
 MOONRAY = RT / 'moonray.exe'

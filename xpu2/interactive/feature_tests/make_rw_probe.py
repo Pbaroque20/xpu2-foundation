@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2-async\xpu2\interactive')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from make_material_scenes import mesh_rdla, sphere  # noqa: E402
 
 out = Path(sys.argv[1]).resolve()

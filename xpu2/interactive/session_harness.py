@@ -212,7 +212,11 @@ def main():
             (session / 'drain.tmp').replace(session / 'drain.txt')
         wait(lambda: state['done'] and state['done'][1] == identity, a.timeout)
         send(identity + 1, 'quit')
-        proc.wait(30)
+        try:
+            proc.wait(30)
+        except subprocess.TimeoutExpired:
+            # A frame that never ended: its lines are what is wanted.
+            report['stuck'] = True
     finally:
         if proc.poll() is None:
             proc.kill()

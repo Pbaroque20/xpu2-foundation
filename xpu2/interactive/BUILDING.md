@@ -1,6 +1,6 @@
-# Building and running the experimental source
+# Building and running XPU2
 
-This is a research source snapshot for the existing **native Windows** toolchain, not a clean-machine installer. No CUDA/OptiX SDK, Windows renderer, compiled PTX, user scenes, or DLLs are bundled here. The older code elsewhere on this branch is not a substitute for the required build dependencies.
+XPU2 is built from source with the existing **native Windows** toolchain; this is not a clean-machine installer. No CUDA/OptiX SDK, Windows renderer, compiled PTX, user scenes, or DLLs are bundled here. The older code elsewhere on this branch is not a substitute for the required build dependencies.
 
 ## Prerequisites
 
@@ -16,19 +16,28 @@ The builder reads an existing MoonRay Windows development tree supplied with `--
 
 The `--runtime` folder must match `reference-lock.json`, which pins 1,135 files from the tested Windows reference. The build fails closed if they differ. The lock and hashes are included, but those binaries are not. Do not weaken the verification or overwrite the lock to make a different runtime appear validated. An independently rebuilt reference requires a new, separately documented pin and all image/performance gates rerun. Reference build provenance is binary-pinned; a clean source-to-binary rebuild remains unverified.
 
-## Build and preview
+## Build the renderer and its session
 
-From the repository root, substitute your actual development-tree and pinned-runtime locations. Every output directory must be new.
+From the repository root, substitute your actual development-tree and pinned-runtime locations. Every output directory must be new. The steps after these (compiling the GPU programs, packaging) are in [the manual, section 14](../manual/README.md#14-building-and-running).
 
 ```powershell
 $toolchainRoot = 'D:/MoonRayForModo-dev'
 $referenceRoot = 'D:/references/moonray-042'
+python xpu2/interactive/build_async.py --source $toolchainRoot --runtime $referenceRoot --output test-results/async-build-N
+python xpu2/interactive/build_session.py --source $toolchainRoot --runtime $referenceRoot --build test-results/async-build-N --output test-results/xpu2-session-N
+```
+
+## The 22 October prototype and its preview
+
+The standalone prototype these tools build is kept as a record; it is not what the kit runs.
+
+```powershell
 python xpu2/interactive/build_prototype.py --source $toolchainRoot --runtime $referenceRoot --output test-results/my-xpu2-build
 python xpu2/interactive/prepare_prototype_scene.py --scene 'D:/scenes/example.rdla' --build test-results/my-xpu2-build/build.json --runtime $referenceRoot --output test-results/my-scene
 python xpu2/interactive/prototype_preview.py --build test-results/my-xpu2-build/build.json --runtime $referenceRoot --output test-results/my-preview --manifest test-results/my-scene/frozen/manifest.json --fine-textures --publish-ms 33
 ```
 
-Select the admitted domain and opt into experimental native preview. Without that opt-in, rendering uses reference XPU. The GUI conversion is sRGB on black with clipped highlights; comparisons use separate raw linear float32 values, never display pixels.
+In the prototype's preview, select the admitted domain and opt into its native preview. Without that opt-in, rendering uses reference XPU. The GUI conversion is sRGB on black with clipped highlights; comparisons use separate raw linear float32 values, never display pixels.
 
 ## Checks and reproduction
 

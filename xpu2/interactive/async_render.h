@@ -23,6 +23,15 @@
 
 namespace xpu2::interactive::async {
 
+// Realtime's first sample in two passes, a pixel in each 2x2 of every tile and then the other three, so that a quarter of
+// the samples showed the whole picture (filled between, then denoised at half size and enlarged by OptiX). Off since
+// 2026-10-30 (asked): the filled picture flashed as scanlines before it settled, for little gain; each picture is the
+// whole first pass. XPU2_SESSION_RT_SPARSE=1 brings it back.
+inline bool sparseStart(const cpu::Plan& p) {
+    static const bool on = [] { const char* v = std::getenv("XPU2_SESSION_RT_SPARSE"); return v && v[0] == '1'; }();
+    return on && p.realtime;
+}
+
 struct RenderOptions {
     unsigned threads = 12;  // CPU lane workers
     int mode = 2;           // 0 CPU only, 1 GPU only, 2 both
@@ -382,6 +391,17 @@ public:
                 r.live_.clear();
             }
         } quiet{*this};
+        // A failure thrown out of the feeder (a tile that cannot be read, the GPU's): the workers stop before the frame's grid and film go.
+        struct Halt {
+            CpuLane& lane;
+            int uncaught = std::uncaught_exceptions();
+            ~Halt() {
+                if (std::uncaught_exceptions() > uncaught) {
+                    lane.cancel();
+                    lane.waitParked();
+                }
+            }
+        } halt{cpuLane};
         // The queued launches' cells: one list a launch, oldest first, as long as the GPU's queue.
         auto flights = [&](const Chunk* chunks, U32 count) {
             std::vector<U32> cells;
@@ -574,7 +594,7 @@ public:
                     }
                     // Realtime's sparse passes (a pixel in each 2x2, then the other three): a chunk holds 16 or 48 of a tile's
                     // 64 pixel samples, which the launch is sized by.
-                    const double realtimeItems = plan_->realtime && adaptive && state.retired < 2 ? (state.retired == 0 ? 16.0 : 48.0) : 0.0;
+                    const double realtimeItems = sparseStart(*plan_) && adaptive && state.retired < 2 ? (state.retired == 0 ? 16.0 : 48.0) : 0.0;
                     const U32 want = std::min(launchSize(o, grid, gpuRate, cpuLane, queuedSamples, start, realtimeItems), gpu_->chunkRoom(refineCount));
                     claim.resize(want);
                     U32 got = 0;
@@ -625,7 +645,10 @@ public:
                     lastParked = gpu_->parkedOutstanding();
                 }
             }
-            if (cpuLane.counters.failures.load()) failure = "CPU sample failure; whole epoch must use fallback";
+            if (cpuLane.counters.failures.load()) {
+                failure = cpuLane.failure();
+                if (failure.empty()) failure = "CPU sample failure; whole epoch must use fallback";
+            }
             if (adaptive && !draining) {
                 const U64 before = useGpu ? gpu_->launchCount() : 0;
                 state.advance(grid, film, useGpu ? gpu_ : nullptr, *pool_);
@@ -910,7 +933,7 @@ private:
             if (!p.adaptive) return;
             // Realtime: the first sample in two passes, a pixel in each 2x2 of every tile, then the other three, so that a
             // quarter of the picture's samples shows the whole of it (filled between, fillUncovered).
-            if (p.realtime && !passes.empty() && passes[0].start == 0 && passes[0].end == 1) passes.insert(passes.begin(), adaptive::Pass{0, 1});
+            if (sparseStart(p) && !passes.empty() && passes[0].start == 0 && passes[0].end == 1) passes.insert(passes.begin(), adaptive::Pass{0, 1});
             cpu::need(passes.size() <= MaxPasses, "Adaptive pass budget");
             inImage.assign(tiles, 0);
             for (U32 tile = 0; tile < tiles; ++tile)
@@ -934,6 +957,8 @@ private:
             if (plan.budgetBySamples) return spent >= double(plan.sampleBudget);  // the kit's "exactly the samples"
             return spent >= 2.0 * double(plan.sampleBudget) || (budgetSeconds > 0 && at() >= budgetSeconds);
         }
+        // Whether pass j's end came well after the one before it (at most half way through the time to it).
+        bool firstEndedEarly(U32 j) const { return j > 0 && trace[j - 1].completed < 0.5 * trace[j].completed; }
         // The time a frame by sampling generations has: the seed samples every pixel alike, so its rate is uniform's,
         // and uniform's samples at that rate are uniform's time. Known once the seed's passes have all completed.
         void priceBudget() {
@@ -947,9 +972,11 @@ private:
             if (samples <= 0 || seconds <= 0) return;
             // Uniform would go on at the seed's steady rate: its passes after the first (whose launches, the first,
             // are slower), which go out together, over the time from the first's end to the seed's end; then the time
-            // so far, and the rest of uniform's samples at that rate.
+            // so far, and the rest of uniform's samples at that rate. Where the first ended about when the seed did (its
+            // texture tiles still loading, a car's: 33 s of 34) that time says nothing, and priced uniform at a few
+            // seconds more than the seed: all the seed's samples over all its time.
             double rate = samples / seconds;
-            if (seed >= 2 && trace[seed - 1].completed > trace[0].completed)
+            if (seed >= 2 && firstEndedEarly(seed - 1))
                 rate = (samples - double(expected[0])) / (trace[seed - 1].completed - trace[0].completed);
             budgetSeconds = seconds + std::max(0.0, double(plan.sampleBudget) - samples) / rate;
         }
@@ -961,7 +988,8 @@ private:
             if (budgetSeconds > 0) {
                 const U32 g = generated - 1;
                 double rate = double(plan.sampleBudget) / budgetSeconds;  // uniform's
-                if (g > 0 && trace[g].completed > trace[g - 1].completed)
+                // The seed's last pass ends with those before it where they went out together: its time says nothing of its rate.
+                if (g > 0 && trace[g].completed > trace[g - 1].completed && (!uniformStage(g) || firstEndedEarly(g)))
                     rate = double(expected[g]) / (trace[g].completed - trace[g - 1].completed);
                 left = std::min(left, (budgetSeconds - at()) * rate);
             }
@@ -1014,7 +1042,7 @@ private:
             for (U32 tile = 0; tile < tiles; ++tile) {
                 std::uint64_t active = inImage[tile];
                 // Realtime's first two passes (above): a pixel in each 2x2, then the rest.
-                if (plan.realtime && j < 2) {
+                if (sparseStart(plan) && j < 2) {
                     constexpr std::uint64_t sparse = 0x0055005500550055ull;  // even rows' even columns
                     active &= j == 0 ? sparse : ~sparse;
                 }

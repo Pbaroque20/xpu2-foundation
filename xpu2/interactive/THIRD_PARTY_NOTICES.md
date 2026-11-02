@@ -17,3 +17,8 @@ Keep these notices and license texts with redistributed source or binaries as th
 ## External dependencies
 
 MoonRay/scene_rdl2, Embree, OpenImageIO, NVIDIA CUDA/NVRTC/OptiX, and the Windows build dependencies retain their separate licenses. This source publication does not distribute their SDKs, runtime binaries, or a right to relicense them. Obtain required SDKs and dependencies under their own terms. It also does not relicense the rest of MoonRayForModo or the earlier architecture experiments.
+
+## ISPC Texture Compressor
+
+`xpu2_bc6h.cc` compiles Intel's ISPC Texture Compressor (Copyright 2017 Intel Corporation, MIT License, `upstream/ISPCTextureCompressor`), and
+`bc6h_core.h` is generated from the BC6H layouts in its `kernel.ispc`. Its whole license is in the kit, in `licenses/ISPCTextureCompressor-LICENSE.txt`.

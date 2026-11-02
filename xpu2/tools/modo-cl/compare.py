@@ -14,7 +14,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 RT = Path(os.environ['APPDATA']) / 'Luxology' / 'Kits' / 'MoonRayForModo' / 'runtime'
-HARNESS = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2-async\xpu2\interactive\session_harness.py')
+HARNESS = HERE.parents[1] / 'interactive' / 'session_harness.py'
 TR = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2\test-results')
 p = argparse.ArgumentParser()
 p.add_argument('name')

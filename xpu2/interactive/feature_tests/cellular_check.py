@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 S = Path(__file__).resolve().parent
-HARNESS = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2-async\xpu2\interactive\session_harness.py')
+HARNESS = S.parent / 'session_harness.py'
 RT = Path(r'C:\Users\Raphael Tobar\AppData\Roaming\Luxology\Kits\MoonRayForModo\runtime')
 MOONRAY = RT / 'moonray.exe'
 TOOL = RT / 'oiiotool.exe'

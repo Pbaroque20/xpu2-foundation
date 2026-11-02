@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 TR = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2\test-results')
-HARNESS = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2-async\xpu2\interactive\session_harness.py')
+HARNESS = Path(__file__).resolve().parents[2] / 'interactive' / 'session_harness.py'
 KIT_ENV = ['MOONRAY_MODO_%s=1' % k for k in ('TOON_TERMINATOR', 'TOON_ALBEDO', 'DENOISE_CLEAN_GUIDES', 'CRYPTO_VOLUMES', 'FOG_ALPHA', 'CRYPTO_ONCE',
                                             'USD_SPECULAR', 'OPAQUE_ALPHA', 'TRANSMISSION_ROUGHNESS')]
 p = argparse.ArgumentParser()

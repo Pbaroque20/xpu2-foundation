@@ -2,10 +2,10 @@
 
 *XPU2: Asynchronous Monte Carlo Path Tracer designed by Raphael Tobar. Not affiliated with or endorsed by DreamWorks Animation; MoonRay and OpenMoonRay are DreamWorks Animation's.*
 
-How XPU2 works, part by part, with the files behind each part. Written 2026-10-25 against commit 242eb5c on
-`xpu2-async`; updated 2026-10-26 for the tessellation handler and the second round of scene preparation (`INDEXER.md`
-sections 16 and 17). The design notes it points to go deeper. Where this manual and the code disagree, the code wins: fix
-the manual.
+How XPU2 works, part by part, with the files behind each part. Written 2026-10-25; updated 2026-10-26 for the
+tessellation handler and the second round of scene preparation (`INDEXER.md` sections 16 and 17); corrected 2026-10-30
+against `MoonLightIPR` at 422a003, the 0.5 release, where XPU2 is part of the kit. The design notes it points to go
+deeper. Where this manual and the code disagree, the code wins: fix the manual.
 
 All paths are relative to `xpu2/interactive/` unless they start with `xpu2/` or another top-level folder.
 
@@ -188,9 +188,12 @@ Design: `ASYNC.md` ("How a frame runs"), `INDEXER.md` section 7.
   atomic: first parked samples, then its range of chunk items. Neighbouring claims are neighbouring pixels of the same
   sample, so warps trace coherent rays. The device film accumulates in double precision.
 - **Acceleration structures.** One GAS per mesh, kept while the mesh is unchanged, under an IAS. Curves and points
-  are OptiX custom primitives.
-- **Stand-ins.** Objects classified `Cpu` are in the GPU scene as bounding stand-ins (a moving mesh's motion bounds,
-  a VDB's box, points' bounds). A sample that meets one is deferred to the CPU lane through the deferred-samples ring.
+  are OptiX custom primitives. Geometry in motion has a key a time step, traced at the sample's time, so the pipeline
+  is compiled for motion in every scene (about 2 to 3% on a still one).
+- **Lights in motion.** Each launch thread holds up to 16 records of them at the sample's time, worked out as the sample
+  reaches a light (`GpuBackend::movedLight`), however many lights move.
+- **Stand-ins.** Objects classified `Cpu` are in the GPU scene as bounding stand-ins (a VDB's box, a mesh the card's
+  budget left to the CPU). A sample that meets one is deferred to the CPU lane through the deferred-samples ring.
 - **The program in modules.** OptiX compiles each module separately and in parallel, but a module's call graph
   compiles as a whole, so the program is split until no module is large. Today it has nine modules (section 12 lists
   them). Direct callables can't trace rays in OptiX 7.6, so anything that traces is a continuation callable or stays
@@ -205,14 +208,14 @@ Design: `ASYNC.md` ("How a frame runs"), `INDEXER.md` section 7.
 `async_cpu.h`. Persistent, pinned workers claim their own chunks by the cellular rules. Embree, in robust mode,
 traverses triangles, and user geometry handles curves and points. The CPU lane:
 
-- renders every feature XPU2 has, including those the GPU defers (today: points, geometry in motion, VDB volumes, and
-  heterogeneous and emissive volumes);
+- renders every feature XPU2 has, including those the GPU defers (today: VDB volumes, and heterogeneous and emissive
+  volumes);
 - works through the retry queue: deferred GPU samples, each re-rendered whole from its identity;
 - re-renders provisional samples in full: every texture level is in RAM, so the CPU never misses;
 - keeps its own film, merged with the GPU's when the frame ends.
 
 Some features keep a whole scene on the CPU lane because the GPU programs lack them and they affect every sample
-(`GpuLane::cpuOnly`): today, lights in motion, light filters, shadow linking, lobe light sets and emissive volumes.
+(`GpuLane::cpuOnly`): today, light filters, shadow linking, lobe light sets and emissive volumes.
 
 ## 8. The shared integrator
 
@@ -259,13 +262,17 @@ differ: presence shadows, shadow linking, volumes, a minimum shadow distance and
 
 ## 10. Memory tiers and partial shading
 
-- **Host RAM** holds every texture's mip levels and is the system of record (`host_texture.h`). The CPU lane reads it
+- **Host RAM** holds every texture's coarser mip levels and the level-0 tiles read so far (`host_texture.h`); the texture
+  files on disk are the system of record. The CPU lane reads RAM
   directly. Since 2026-10-26 the finest level (level 0) is decoded tile by tile the first time it is read
   (`Pyramid::loadTile`, through an OpenImageIO ImageCache), the coarser levels as the scene is prepared;
   `XPU2_SESSION_EAGER_TEXTURES=1` decodes them all at once. 8-bit files are kept as bytes (`tex::Mip::format`).
 - **VRAM** holds every texture's levels 1 and up for the whole session, plus a cache of level-0 (fine-detail) tiles,
   loaded on demand and evicted least recently used.
-- **The cache's budget** (`GpuLane::fineBudget`) is measured at each preparation: what the scene's level-0 tiles need,
+- **Under memory pressure** the oldest decoded level-0 tiles are let go, and a scene that still does not load has its
+  textures compressed (BC6H), then limited, for the session (texture overflow mode, `ASYNC.md`, "Limits a scene can meet").
+- **A tile that cannot be read** fails the frame with its file and reason, and the scene goes to the reference renderer.
+- **The cache's budget** (`GpuLane::fineBudget`) is measured at each preparation, and again as a frame starts if the card has filled up (`fineCacheTooBig`): what the scene's level-0 tiles need,
   up to the card's free memory minus a fifth of the card (at least 1.5 GB left for the frame and the host's own use),
   and never below 256 MB. `XPU2_SESSION_FINE_BUDGET_MB` fixes it.
 - **Filtering** is shared by both devices (`texture_core.h`, adapted from OpenImageIO). A miss names the tile it needs
@@ -371,16 +378,18 @@ module.
 XPU2 renders MoonRay for Modo's previews, which makes Modo the showcase for XPU2 on real production scenes.
 
 ```
-Modo ── MoonRay for Modo kit (XPU2 build) ──► moonray_xpu2.exe  (XPU2 session)
+Modo ── MoonRay for Modo kit ───────────────► moonray_xpu2.exe  (XPU2 session)
                  ▲            │                        │
                  │            │  "@@MODO_XPU2 FALLBACK <reason>"
                  │            └──────────────► moonray.exe (MoonRay XPU takes the same scene)
                  └── pictures through shared memory, @@MODO_* protocol lines on stdout
 ```
 
-- **The XPU2 kit** (`xpu2/tools/kit/build_xpu2_kit.py`) is the standard kit with XPU2 added. A preference picks the
-  GPU renderer (MoonRay XPU or XPU2). When XPU2 is chosen and the render's execution mode is XPU or Auto, the preview
-  session starts `moonray_xpu2.exe` in MoonRay's place. Final renders, MoonRay LS and MoonLightIPR stay MoonRay's.
+- **XPU2 in the kit.** Since 0.5 XPU2 is part of the standard kit (`native.py`, `preferences.py`, `persistent.py` and
+  `xpu2_sampling.py` in `kit/MoonRayForModo/python/moonray_modo/`), its session in `runtime-xpu2` beside `runtime`. A
+  preference picks the GPU renderer (XPU2 by default, or MoonRay XPU). When XPU2 is chosen and the render's execution
+  mode is XPU or Auto, the preview session starts `moonray_xpu2.exe` in MoonRay's place. Final renders, MoonRay LS and
+  MoonLightIPR stay MoonRay's.
 - **The session program** (`xpu2_session.cc`, built as `moonray_xpu2.exe`) is the only part of XPU2 that knows the
   host. It speaks the kit's persistent preview protocol v1, the same one MoonRay's session speaks
   (`native-port/persistent_session.inc`): the scene and its deltas, frames, drain, hold and cancel, pictures through
@@ -391,7 +400,9 @@ Modo ── MoonRay for Modo kit (XPU2 build) ──► moonray_xpu2.exe  (XPU2 
   takes it back.
 - **Scenes in memory.** The scene's text may come as `modo-memory:<length>:<name>` and, since 2026-10-26, the
   geometry's binary scene as `modo-memory-rdlb:<length>:<name>` (`readBinaryMemory`): mappings the kit holds, so a
-  heavy scene's gigabyte of geometry doesn't go through the disk. MoonRay, on fallback, is handed files.
+  heavy scene's gigabyte of geometry doesn't go through the disk. MoonRay, on fallback, is handed files. A scene already
+  applied has let its prepared parts go, its text holding the meshes' fingerprints alone: the kit writes it again first
+  (`persistent._Rewrite`).
 - **Without `MOONRAY_MODO_SESSION`**, `moonray_xpu2.exe` passes its arguments to the kit's own `moonray.exe`
   (`MOONRAY_XPU2_MOONRAY` names it).
 
@@ -403,19 +414,25 @@ What the session does besides rendering:
   MoonRay after a minute rather than compile for an hour.
 - **Outlines** for the kit: `@@MODO_TILES` (cells being rendered), `@@MODO_WORKERS` (each CPU worker's tile) and
   `@@MODO_GPU_WORKERS` (cells the GPU's queued launches hold, drawn in their own colour).
-- **Checkpoints** for Safe Denoising (class `Checkpoints`): the frame so far, saved every `checkpoint_interval`
-  minutes, with MoonRay's "Wrote:" lines. Continue starts the render again; resuming from a save isn't done yet.
-- **Denoiser guides.** Albedo and normal at the first hit, for the kit's denoiser and for Smart Render's drains.
+- **Checkpoints** (class `Checkpoints`): the frame so far, saved every `checkpoint_interval` minutes, with MoonRay's
+  "Wrote:" lines, for a scene that asks. A capability of the session: the 0.5 kit does not ask, as Safe Denoising is
+  greyed while XPU2 renders the preview (`lxserv/moonray_render_settings.py`, `panel.py`) and `render.py` writes no
+  saves under XPU2. Resuming from a save isn't done yet: Continue starts the render again.
+- **Denoiser guides.** Albedo and normal at the first hit, for the kit's denoiser. Smart Render, MoonRay's, is greyed
+  while XPU2 renders the preview, and realtime asks for no guides (`denoising.py`).
 - **Realtime** (`INDEXER.md` section 13). With the kit's RT switch on, the preview follows the scene at the realtime
-  size. A realtime frame is the GPU's alone: its first two passes are sparse (a quarter of the pixels, then the rest),
-  launches are sized to about 15 ms and a picture goes out every 33 ms. With Denoised Beauty chosen,
-  `RealtimeDenoiser` runs OptiX's HDR denoiser on its own high-priority stream with the kit's guides.
+  size. A realtime frame is the GPU's alone: its first pass covers every pixel (sparse first passes, a quarter of
+  the pixels then the rest, are off: XPU2_SESSION_RT_SPARSE=1), launches are sized to about 15 ms and a picture goes
+  out every 33 ms. The session also has `RealtimeDenoiser` (OptiX's HDR denoiser on its own high-priority stream, for
+  Denoised Beauty with guides), which the 0.5 kit does not use: under XPU2 it offers no Denoised Beauty in realtime
+  and writes no guides for it (`panel.py` `_offer_denoised`, `denoising.py`).
 - **Settings from Modo.** The kit's render settings for sampling generations (Generation Samples, Halting Rule,
   Halt at Noise, First Look, Most Samples, CPU Workers) reach the scene as UserData `/modo/xpu2/generations`. Its
   form 2 says they rule: a scene's adaptive sampling is then MoonRay's alone, and XPU2 samples from Pixel Samples and
   these settings (form 1 left an adaptive scene its own minimum, maximum and target error). The kit's Devices
   preference sets `XPU2_SESSION_MODE`. The kit's Source Overrides (`MOONRAY_MODO_*`) apply to XPU2 as to MoonRay.
-- **Limits.** 1 GiB of prepared geometry unless `XPU2_SESSION_GEOMETRY_MB` is set, and a memory ceiling.
+- **Limits.** Prepared geometry up to what the machine has room for, measured from the free RAM as each scene is
+  prepared, between 256 MB and 64 GB (`geometryBudget`; `XPU2_SESSION_GEOMETRY_MB` fixes it), and a memory ceiling.
 - **The frame report** in the log: when the grid ran out of chunks, the GPU's launches and rate, parked samples,
   texture cache loads and evictions, and the GPU profile when `XPU2_PROFILE` is set.
 
@@ -441,11 +458,11 @@ python xpu2/interactive/build_session.py --source $toolchainRoot --runtime $refe
 # 3. Compile the GPU programs into OptiX's cache (about an hour the first time; cached after)
 test-results/xpu2-session-N/runtime-xpu2/moonray_xpu2.exe --compile-shaders
 
-# 4. The XPU2 kit, from the clean standard kit and the session
-python xpu2/tools/kit/build_xpu2_kit.py --session test-results/xpu2-session-N --base <clean kit>
+# 4. A release: XPU2 is part of the standard kit (kit/MoonRayForModo); the package adds the session's folder as runtime-xpu2
+python tools/package_development_release.py --runtime <runtime> --geometry <geometry> --xpu2-runtime test-results/xpu2-session-N/runtime-xpu2
 
-# 5. Install it (Modo closed); "restore" puts the standard kit back
-python xpu2/tools/kit/install_xpu2.py install
+# 5. Check the package. For a development install, copy runtime-xpu2 into the installed kit beside runtime (Modo closed)
+python tools/check_release_package.py <version> [<release folder>]
 ```
 
 Run each script with `--help` for its full arguments. Notes:
@@ -454,8 +471,8 @@ Run each script with `--help` for its full arguments. Notes:
   pass `--cpu-test` for CPU-only tests (`XPU2_SESSION_MODE=0`), which never load the GPU programs.
 - Any change to code the GPU program includes means compiling the shaders again (step 3). Use `XPU2_OPTIX_LEVEL=0`
   for quick correctness builds.
-- The kit tools run from `MoonRayForModo-xpu2/test-results/xpu2-kit/` on the development machine (git-ignored). The
-  copies in `xpu2/tools/` are kept for safekeeping.
+- The scripts in `xpu2/tools/modo-cl/` find the session harness in this tree; their results go to the test-results
+  folder each names at its top, outside the repository.
 - Close Modo before installing, and check `tasklist` shows no `modo.exe`.
 - Never attach gdb to Modo: its JIT breakpoint on `nvgpucomp64` kills Modo. Use `xpu2/tools/modo-cl/debug_modo.py`.
 
@@ -510,6 +527,10 @@ Environment variables read by the session or the renderer. The defaults are the 
 | Variable | Effect |
 |---|---|
 | `XPU2_SESSION_MODE` | `0` CPU only, `1` GPU only, `2` both (default) |
+| `XPU2_SESSION_COARSE_FIRST` | `0` leaves out the coarse first pass of a heavy scene |
+| `XPU2_SESSION_PREP_ITEMS` | `1` logs each mesh made, its time and triangles |
+| `XPU2_SESSION_SPILL_MB` | Holds decoded texture tiles to this many MB, for tests |
+| `XPU2_SESSION_CARD_FREE_MB` | Says the card has this much memory, all of it free, for tests of a full card |
 | `XPU2_SESSION_PARTIAL=0` | No partial shading: texture misses wait for their tile |
 | `XPU2_SESSION_ADAPTIVE=trees` | MoonRay's error trees instead of sampling generations |
 | `XPU2_SESSION_ADAPTIVE_CPU=0` | With generations, the GPU takes every chunk |
@@ -519,7 +540,7 @@ Environment variables read by the session or the renderer. The defaults are the 
 | `XPU2_SESSION_PREVIEW_MS` | Interval between progressive pictures (default 100) |
 | `XPU2_SESSION_LOW_LATENCY` | `0` or `1`: overrides the host's low-latency setting |
 | `XPU2_SESSION_FINE_BUDGET_MB` | Fixes the level-0 texture cache's budget |
-| `XPU2_SESSION_GEOMETRY_MB` | Prepared-geometry budget (default 1 GiB) |
+| `XPU2_SESSION_GEOMETRY_MB` | Fixes the prepared-geometry budget (default: measured from free RAM, 256 MB to 64 GB) |
 | `XPU2_SESSION_GPU_GEOMETRY_MB` | The card's geometry budget, past which the largest meshes go to the CPU lane alone (added 2026-10-26) |
 | `XPU2_SESSION_MEMORY_MB` | The session's memory ceiling (added 2026-10-26) |
 | `XPU2_SESSION_GEOMETRY_CACHE=0`, `_GEOMETRY_CACHE_GB` | No tessellation cache on disk; its size (default 20 GB) (added 2026-10-26) |
@@ -530,7 +551,7 @@ Environment variables read by the session or the renderer. The defaults are the 
 | `XPU2_SESSION_EAGER_TEXTURES=1` | Every texture level decoded as the scene is prepared (added 2026-10-26) |
 | `XPU2_SESSION_RT_TEXTURE_SIDE` | Realtime's largest texture side (default 1280; 0: whole) (added 2026-10-27) |
 | `XPU2_SESSION_CANONICAL_FILE=1` | The canonical replica also written as an RDLB file, to inspect (added 2026-10-26) |
-| `XPU2_SESSION_RT_DENOISE=0`, `_RT_GUIDES`, `_RT_SHOW`, `_RT_DEBUG`, `_RT_PRIORITY=0` | Realtime denoiser diagnostics (`INDEXER.md` section 13) |
+| `XPU2_SESSION_RT_DENOISE=0`, `_RT_GUIDES`, `_RT_SHOW`, `_RT_DEBUG`, `_RT_PRIORITY=0` | Diagnostics of the session's realtime denoiser, unused by the 0.5 kit (`INDEXER.md` section 13) |
 | `XPU2_SESSION_DEBUG_FAILURES` | Names the CPU lane's first failed shadings and texture lookups |
 | `XPU2_PROFILE` | GPU profile by stage, printed per frame |
 | `XPU2_OPTIX_LEVEL` | `0` to `3`: lower OptiX optimization for quick GPU test builds (cached as a separate program) |
@@ -549,11 +570,11 @@ port share one folder today; this map says which layer each file belongs to.
 
 | File | What it is |
 |---|---|
-| `async_render.h` (1.3k) | Coordinator and GPU broker, `RenderOptions`, the frame's end, merge and audit |
+| `async_render.h` (1.4k) | Coordinator and GPU broker, `RenderOptions`, the frame's end, merge and audit |
 | `async_grid.h` (0.5k) | Work grid, chunks, cellular rules, ownership flips |
 | `device_suit.h` | Cells by suitability |
-| `async_cpu.h` (1.5k) | CPU lane |
-| `async_gpu.h` (2.2k) | GPU lane, host side |
+| `async_cpu.h` (1.8k) | CPU lane |
+| `async_gpu.h` (2.5k) | GPU lane, host side |
 | `async_gpu_abi.h`, `async_gpu_device.h` | Host/device shared layout, launch parameters, device texture access |
 | `async_integrator.h` (2.8k) | One sample, both devices: the core's contract, holding the reference's estimator |
 | `async_adaptive.h`, `async_adaptive_core.h`, `async_adaptive.cu` | Sampling generations, the error trees, the GPU pass chain |
@@ -568,10 +589,12 @@ port share one folder today; this map says which layer each file belongs to.
 
 | Path | What it is |
 |---|---|
-| `xpu2_session.cc` (1.3k), `xpu2_scene.cc`, `xpu2_cpu.cc` | `moonray_xpu2.exe`: protocol, fallback, outlines, checkpoints, realtime denoiser |
+| `xpu2_session.cc` (2.0k), `xpu2_scene.cc`, `xpu2_cpu.cc` | `moonray_xpu2.exe`: protocol, fallback, outlines, checkpoints, realtime denoiser |
 | `session_harness.py` | Drives a session as the kit does, without Modo |
 | `native-port/persistent_session.inc`, `native-port/modo_*.h` | The kit's preview protocol, shared with MoonRay's session |
-| `xpu2/tools/kit/` | `build_xpu2_kit.py`, `install_xpu2.py`, `check_xpu2_session_qt.py` |
+| `kit/MoonRayForModo/python/moonray_modo/` | XPU2 in the kit: `native.py` (renderer, devices, runtime folder), `preferences.py`, `persistent.py`, `xpu2_sampling.py`; `kit/MoonRayForModo/lxserv/moonray_xpu2.py` |
+| `tools/package_development_release.py`, `tools/check_release_package.py` | The release, with `runtime-xpu2` beside `runtime`, and its check |
+| `xpu2/tools/kit/` | `check_xpu2_session_qt.py` and other checks; `build_xpu2_kit.py` and `install_xpu2.py` are retired, kept as a record |
 | `xpu2/tools/modo-cl/` | Headless Modo export (`run_cl.py`, `export_probe.py`), comparison (`compare.py`), crash debugging (`debug_modo.py`) |
 
 **Build and test**
@@ -619,19 +642,18 @@ From the design notes. Each has more detail where it's listed.
 
 **Core**
 
-- Scene edits as change sets to both devices: refitting per changed mesh instead of rebuilding (`INDEXER.md` order,
-  step 6).
+- Scene edits as change sets to both devices. Realtime's moves and light changes already go without a rebuild where
+  they can (`GpuLane::updatePlacements`, `cpu::placeMoved`), and unchanged meshes keep their GAS; other edits prepare
+  the plan again, and a changed mesh's structures are built again, never refitted (`INDEXER.md` order, step 6).
 - GPU program modules linked per scene by its families (`INDEXER.md` section 5).
 - Cellular generations on the GPU pass chain; the adaptive chain as one CUDA graph (`ASYNC.md`).
-- SIMD batches on the CPU lane; RAM-to-VRAM spill under host memory pressure (`ASYNC.md`).
+- SIMD batches on the CPU lane (`ASYNC.md`).
 - Material-coherent shading on the GPU: on hold, since the profile says shadow rays dominate (`INDEXER.md` section 9).
 
 **MoonRay port**
 
-- On the GPU: VDB, heterogeneous and emissive volumes, points and motion (deferred to the CPU today); light filters,
-  shadow linking and lobe light sets (they keep a scene on the CPU today).
+- On the GPU: VDB, heterogeneous and emissive volumes (deferred to the CPU today); light filters, shadow linking and lobe light sets (they keep a scene on the CPU today).
 - Resuming from a checkpoint, and deep output (`FEATURE_PROGRESS.md`).
-- Remaining Modo switches: opaque alpha, transmission roughness, toon terminator, fog alpha (`FEATURE_PROGRESS.md`).
 
 ## 22. Further reading
 
@@ -642,7 +664,7 @@ From the design notes. Each has more detail where it's listed.
 | [`INDEXER.md`](../interactive/INDEXER.md) | Indexer, routing, scheduling, partial shading, shadow reuse, generations, scene preparation, realtime, Modo scenes |
 | [`PATH_TRACER.md`](../interactive/PATH_TRACER.md) | MoonRay's estimator, lights, materials, curves, hair, glitter, the material benchmark |
 | [`FEATURE_PROGRESS.md`](../interactive/FEATURE_PROGRESS.md) | Every MoonRay feature: state and check |
-| [`KIT_ROADMAP.md`](../interactive/KIT_ROADMAP.md) | XPU2 in the Modo kit: where things are, what's measured |
+| [`KIT_ROADMAP.md`](../interactive/KIT_ROADMAP.md) | XPU2 in the Modo kit: a history note to 24 October, and the first measurements |
 | [`BUILDING.md`](../interactive/BUILDING.md) | Build prerequisites and the pinned reference |
 | [`feature_tests/README.md`](../interactive/feature_tests/README.md) | The feature comparison scripts |
 | [`xpu2/tools/README.md`](../tools/README.md) | Kit and headless Modo tools |

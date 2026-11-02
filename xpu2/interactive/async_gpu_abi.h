@@ -89,6 +89,28 @@ struct ChainArgs {
     adaptive::Layout layout;
 };
 
+// Geometry in motion on the device: a mesh's arrays at each time step over the shutter (cpu::MeshData::steps and their
+// kin), which GpuBackend reads at the sample's time as CpuBackend::motion does. steps 0: the mesh is still.
+enum : U32 { MotionPolygon = 0, MotionStepped = 1, MotionSubd = 2, MotionCurves = 3 };
+struct MeshMotion {
+    const surface::V3* const* positions = nullptr;  // steps arrays, the open's first
+    const surface::V3* const* normals = nullptr;    // the same, for a moving instance or subdivision surface (else null)
+    const surface::V3* const* dpds = nullptr;
+    const surface::V3* const* dpdt = nullptr;
+    const surface::V3* normals1 = nullptr;  // a polygon mesh's second normal sample
+    const float* pointRadius = nullptr;     // points in place of triangles, moving or still: each one's radius
+    U32 steps = 0, kind = MotionPolygon;
+};
+// A vertex in motion at a time: between the two time steps about it (cpu::positionAt, the same arithmetic).
+X2_HD inline surface::V3 motionVertex(const MeshMotion& motion, U32 i, float time) {
+    const float f = time * float(motion.steps - 1);
+    U32 k = f > 0.0f ? U32(f) : 0u;
+    if (k > motion.steps - 2) k = motion.steps - 2;
+    const float u = f - float(k);
+    const surface::V3 a = motion.positions[k][i], b = motion.positions[k + 1][i];
+    return surface::V3{(1.0f - u) * a.x + u * b.x, (1.0f - u) * a.y + u * b.y, (1.0f - u) * a.z + u * b.z};
+}
+
 // Launch parameters. mode 0 renders; mode 1 applies tile-cache updates; mode 2
 // works out every pixel's adaptive error from the film; mode 3 renders a pass
 // the chain made on the device.
@@ -110,6 +132,14 @@ struct LaunchParams {
     // records' parameter pool (shade_material.h).
     const shade::MaterialRecord* meshMaterials;
     const shade::MeshAttributes* meshAttributes;
+    const MeshMotion* meshMotion;  // one a mesh (null: nothing in the scene moves and no points)
+    // The lights in motion and each light's place among them (~0u: still). A thread's scratch at movedLightsOffset holds
+    // movedLightSlots records at the sample's time, then their lights' indices and the next slot to use, filled as the
+    // sample reaches them (GpuBackend::movedLight). 0 slots: no light moves.
+    const lights::LightMotion* lightMotion;
+    const U32* lightMoved;
+    U64L movedLightsOffset;
+    U32 movedLightSlots, lightMotionPad;
     const float* materialPool;
     // Per launch thread: the path tracer's Bsdf and pending rays (async_integrator.h).
     unsigned char* scratch;

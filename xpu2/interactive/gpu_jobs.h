@@ -37,7 +37,7 @@ struct Config {path::Epoch epoch;surface::Camera camera;surface::V3 sky;U32 widt
     // Light filters (light_filter_core.h): whether any light has some at any shading point.
     U32 lightFilters=0;
     // The kit's MoonRay source switches the integrator reads (Plan::modoSwitches): 1 MOONRAY_MODO_TOON_ALBEDO, 2
-    // MOONRAY_MODO_FOG_ALPHA, 4 MOONRAY_MODO_CRYPTO_VOLUMES.
+    // MOONRAY_MODO_FOG_ALPHA, 4 MOONRAY_MODO_CRYPTO_VOLUMES, 8 MOONRAY_MODO_CAMERA_LIGHT_LPE.
     U32 modoSwitches=0;
     // Bounce-ray reuse (async_integrator.h): the ray visibility bits (rdl2 VisibilityType) of the bounces whose rays
     // meet exactly the occluders a shadow ray meets, every mesh visible to both or to neither; 0: no reuse.

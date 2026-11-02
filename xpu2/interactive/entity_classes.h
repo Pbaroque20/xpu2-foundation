@@ -48,7 +48,7 @@ enum Family : uint64_t {
     FamilyCutouts = 1ull << 36,
 };
 // The families the GPU programs implement today (async_gpu.h's cpuOnly refuses the rest).
-constexpr uint64_t GpuFamilies = FamilyStructure | FamilyCamera | FamilyTriangles | FamilySubdivision | FamilyDisplacement | FamilyCurves |
+constexpr uint64_t GpuFamilies = FamilyStructure | FamilyCamera | FamilyTriangles | FamilySubdivision | FamilyDisplacement | FamilyCurves | FamilyPoints | FamilyMotion |
                                  FamilyInstances | FamilyDwaBase | FamilyLayers | FamilyHair | FamilyGlitter | FamilyToon |
                                  FamilySubsurface | FamilyUsd | FamilySwitch | FamilyMapsProcedural | FamilyMapsImage | FamilyMapsNormal |
                                  FamilyMapsProjection | FamilyLights | FamilyLightTextures | FamilyMeshLights | FamilyVolumes |

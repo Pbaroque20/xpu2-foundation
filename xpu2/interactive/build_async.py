@@ -11,16 +11,16 @@ import shutil
 from pathlib import Path
 
 from gpu_build import compile_ptx
-from native_build import build_units
+from native_build import bc6h_kernels, build_units
 from reference_runtime import sha, verify
 
 HERE = Path(__file__).resolve().parent
-HEADERS = ('async_gpu_abi.h', 'async_adaptive_core.h', 'async_integrator.h', 'light_core.h', 'light_image.h', 'light_tree.h', 'gpu_jobs.h', 'resume_core.h', 'triangle_hit.h',
+HEADERS = ('async_gpu_abi.h', 'points_core.h', 'async_adaptive_core.h', 'async_integrator.h', 'light_core.h', 'light_image.h', 'light_tree.h', 'gpu_jobs.h', 'resume_core.h', 'triangle_hit.h',
            'texture_core.h', 'surface_core.h', 'sample_stream.h', 'path_stage.h', 'shade_math.h', 'shade_tables.h',
            'shade_fresnel.h', 'shade_color.h', 'shade_lobes.h', 'shade_lobes_eval.h', 'shade_hair.h', 'shade_flakes.h', 'shade_glitter.h', 'shade_glitter_tables.h', 'shade_state.h', 'shade_builder.h',
            'shade_colorcorrect.h', 'shade_dwabase.h', 'shade_dwalayer.h', 'shade_maps.h', 'shade_noise.h', 'shade_bssrdf.h', 'shade_mapnodes.h', 'shade_mapnodes_more.h', 'curve_core.h', 'curve_embree.h', 'volume_core.h', 'shade_material.h',
            'dwa_admission.h', 'map_admission.h', 'aov_core.h', 'aov_material.h', 'aov_state.h', 'aov_crypto.h', 'camera_core.h', 'light_filter_core.h', 'volume_grid.h', 'volume_emission.h',
-           'async_gpu_device.h')
+           'async_gpu_device.h', 'bc6h_core.h')
 FAST_FLAGS = ['--std=c++17', '--gpu-architecture=compute_75', '--fmad=true', '--prec-div=true',
               '--prec-sqrt=true', '--ftz=false', '-DXPU2_PATHS_ONLY']
 
@@ -81,10 +81,11 @@ def build_all(source, runtime, out):
                    source / 'upstream/openmoonray/moonray/moonray/lib/rendering/displayfilter',
                    source / 'build/native-renderer-avx/moonray/lib/rendering/displayfilter']
         # With meshoptimizer's simplifier (the coarse first pass, coarse_geometry.h), a unit of its own as the session's.
-        exe, report['native_build'] = build_units(source, [HERE / 'async_probe.cc', HERE / 'xpu2_meshopt.cc'], out / 'native',
+        kernels, kernel_flags = bc6h_kernels(source, out / 'bc6h')
+        exe, report['native_build'] = build_units(source, [HERE / 'async_probe.cc', HERE / 'xpu2_meshopt.cc', HERE / 'xpu2_bc6h.cc'], out / 'native',
                                                   [runtime / 'libembree4.dll', runtime / 'librendering_lpe.dll', runtime / 'librendering_displayfilter.dll',
-                                                   '-lcfgmgr32', '-lwinmm'],
-                                                  ['-I' + str(v) for v in include] + ['-I' + str(source / 'upstream/meshoptimizer/src')])
+                                                   *kernels, '-lcfgmgr32', '-lwinmm'],
+                                                  ['-I' + str(v) for v in include] + ['-I' + str(source / 'upstream/meshoptimizer/src')] + kernel_flags)
         # MoonRay's sampler tables (a random walk's sequences) beside the GPU program.
         sampler = source / 'upstream/openmoonray/moonray/moonray/lib/rendering/pbr/sampler'
         for name in ('bc_1D_integrator_points_4096_sequences_of_1024.bin', 'ppd_2D_integrator_points_4096_sequences_of_1024.bin'):

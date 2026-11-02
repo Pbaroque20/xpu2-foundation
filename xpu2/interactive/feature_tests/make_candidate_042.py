@@ -3,7 +3,7 @@ import json, shutil, subprocess, sys
 from pathlib import Path
 
 X = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2')
-sys.path[:0] = [str(X)]
+sys.path[:0] = [str(Path(__file__).resolve().parents[3])]  # the repository, for xpu2.reference
 from xpu2.reference import digest_file
 
 old = X / 'test-results/xpu2-disabled-route-build'

@@ -1,5 +1,5 @@
 # Standalone prototype guide
 
-The current guide is [README.md](README.md), with [build/run instructions](BUILDING.md), [validation](VALIDATION.md) and [license notices](THIRD_PARTY_NOTICES.md).
+> **Moved.** XPU2 as it is now: [README.md](README.md), with [build/run instructions](BUILDING.md), the [engineer manual](../manual/README.md) and [license notices](THIRD_PARTY_NOTICES.md). The prototype's [validation](VALIDATION.md) is a record of 22 October 2026.
 
-This public source snapshot supersedes the earlier local-only packaging instructions. Native routing stays experimental and opt-in. The publication is not an installation into Modo and does not change the production plugin defaults.
+When the prototype was published, on 22 October 2026, that source snapshot superseded the earlier local-only packaging instructions; native routing was opt-in, and the publication was not an installation into Modo. Since 0.5 XPU2 is part of the kit.

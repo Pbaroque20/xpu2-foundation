@@ -355,7 +355,8 @@ struct CpuScene {
         // A mesh with no material bounds a volume only: it is in the volumes' scene, not the surfaces'.
         const bool surface = plan->meshes[i].material != ~0u, bounds = plan->meshes[i].volume >= 0;
         for (int pass = ownScene(i) || plan->meshes[i].instance ? 1 : 0; pass < 2; ++pass) {
-            if (pass == 0 ? !surface : !bounds) return;
+            if (pass == 0 && !surface) continue;
+            if (pass == 1 && !bounds) return;
             if (pass == 1 && surfaceOnly) return;
             if (pass == 1 && !volumes) {
                 volumes = rtcNewScene(device->handle);
@@ -1619,6 +1620,10 @@ public:
         counters.samples = counters.chunks = counters.retried = counters.steals = counters.moves = counters.idleSpins = 0;
         counters.refined = 0;
         counters.failures = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failure_.clear();
+        }
         counters.busyMicros = counters.slowestChunkMicros = counters.lastClaimMicros = 0;
         counters.firstClaimMicros = ~0ull;
         {
@@ -1650,6 +1655,11 @@ public:
     void waitParked() const {
         while (parked_.load(std::memory_order_acquire) != workers_.size()) std::this_thread::yield();
     }
+    // What failed on a worker this frame, where it said.
+    std::string failure() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return failure_;
+    }
     void cancel() {
         cancelled_.store(true, std::memory_order_release);
         finish();
@@ -1671,7 +1681,15 @@ private:
                 if (stop_) return;
                 seen = frame_;
             }
-            run(w, threads);
+            // A failure on a worker (a texture tile that cannot be read) is the frame's, with its reason: out of the thread it
+            // ended the process.
+            try {
+                run(w, threads);
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (failure_.empty()) failure_ = e.what();
+                counters.failures.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     void run(unsigned w, unsigned threads) {
@@ -1803,6 +1821,7 @@ private:
     const CpuScene& scene_;
     std::unique_ptr<std::atomic<U32>[]> active_;  // each worker's tile (activeTile)
     std::vector<std::thread> workers_;
+    std::string failure_;
     std::mutex mutex_, idleMutex_;
     std::condition_variable wake_, idleWake_;
     bool stop_ = false;

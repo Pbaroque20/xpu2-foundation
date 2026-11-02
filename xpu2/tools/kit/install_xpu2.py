@@ -42,7 +42,7 @@ def main():
     if busy:
         raise SystemExit('Close these first: ' + ', '.join(busy))
     if sys.argv[1] == 'install':
-        if not (KIT / 'index.cfg').is_file() or not (KIT / 'XPU2-EXPERIMENTAL.txt').is_file():
+        if not (KIT / 'index.cfg').is_file() or not any((KIT / name).is_file() for name in ('XPU2-README.txt', 'XPU2-EXPERIMENTAL.txt')):
             raise SystemExit('No XPU2 kit next to this script (build_xpu2_kit.py makes it)')
         BACKUPS.mkdir(exist_ok=True)
         backup = BACKUPS / ('kit-' + time.strftime('%Y%m%d-%H%M%S'))
@@ -52,7 +52,7 @@ def main():
             shutil.rmtree(TARGET)
         shutil.copytree(KIT, TARGET, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         print('XPU2 kit installed in', TARGET)
-        print('In Modo: System > Preferences > MoonRay > XPU2 (experimental): Compile XPU2 Shaders once, then GPU renderer > XPU2')
+        print('In Modo: System > Preferences > MoonRay > XPU2: Compile XPU2 Shaders once, then GPU renderer > XPU2')
     else:
         saved = sorted(BACKUPS.glob('kit-*')) if BACKUPS.is_dir() else []
         if not saved:

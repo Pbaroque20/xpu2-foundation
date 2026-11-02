@@ -20,10 +20,28 @@ extern "C" __global__ void __closesthit__triangle() {
     optixSetPayload_0(optixGetInstanceId());
     optixSetPayload_1(optixGetPrimitiveIndex());
 }
-// A curve span (MoonRay XPU's curve programs, curve_core.h): only the distance is reported; the hit is worked out
-// again from the span afterwards, as on the CPU.
+// A curve span (MoonRay XPU's curve programs, curve_core.h) or a point (points_core.h): only the distance is reported;
+// the hit is worked out again afterwards, as on the CPU.
 extern "C" __global__ void __intersection__curve() {
-    const curves::Set& c = params.meshAttributes[optixGetInstanceId()].curve;
+    if (params.meshMotion && params.meshMotion[optixGetInstanceId()].pointRadius) {
+        const MeshMotion& motion = params.meshMotion[optixGetInstanceId()];
+        const U32 prim = optixGetPrimitiveIndex();
+        const surface::V3 centre = motion.steps > 1 ? motionVertex(motion, prim, optixGetRayTime()) : params.geometry[optixGetInstanceId()].vertices[prim];
+        const float3 from = optixGetObjectRayOrigin(), along = optixGetObjectRayDirection();
+        float t;
+        surface::V3 Ng;
+        if (points::intersect(centre, motion.pointRadius[prim], surface::V3{from.x, from.y, from.z}, surface::V3{along.x, along.y, along.z}, optixGetRayTmin(),
+                              optixGetRayTmax(), t, Ng))
+            optixReportIntersection(t, 0);
+        return;
+    }
+    const curves::Set& still = params.meshAttributes[optixGetInstanceId()].curve;
+    curves::Set moved;
+    if (still.stepCount > 1) {  // curves in motion: their control points at the ray's time
+        moved = still;
+        moved.time = optixGetRayTime();
+    }
+    const curves::Set& c = still.stepCount > 1 ? moved : still;
     const float3 o = optixGetObjectRayOrigin(), d = optixGetObjectRayDirection();
     curves::Hit h;
     if (curves::intersectSpan(c, optixGetPrimitiveIndex(), surface::V3{o.x, o.y, o.z}, surface::V3{d.x, d.y, d.z}, optixGetRayTmin(),

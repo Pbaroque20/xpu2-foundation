@@ -2,9 +2,9 @@
 
 > **Historical first attempt.** This report belongs to the native-bridge research that began with the October 16, 2026 tests. It does not describe the newer standalone prototype. See the [current prototype](interactive/README.md), [current validation](interactive/VALIDATION.md), or [historical research index](RESEARCH_INDEX.md).
 
-XPU2 remains an opt-in experimental backend. Original XPU is the fallback and
-reference, not a backend being replaced. A protocol test or a selected diffuse
-kernel is not proof of full GPU shading, scene residency, or a speedup.
+When this was written XPU2 was an opt-in experimental backend. Original XPU was the
+fallback and reference, not a backend being replaced. A protocol test or a selected
+diffuse kernel was not proof of full GPU shading, scene residency, or a speedup.
 
 The next backend must meet all six requirements below. These gates are cumulative;
 no single successful fixture qualifies the renderer.

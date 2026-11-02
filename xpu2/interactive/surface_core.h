@@ -21,7 +21,7 @@ constexpr float Pi=3.14159265358979323846f,InvPi=0.31830988618379067154f;
 X2_HD inline sample::U32 frameSeed(sample::U32 frame,sample::U32 eye,bool lock){
     return lock?0u:(frame+8429u)*(2u*(1193047u+eye+6037u)+1u);
 }
-enum class Filter:unsigned {Box=0,Cubic=1,Quadratic=2};
+enum class Filter:unsigned {Box=0,Cubic=1,Quadratic=2,Gaussian=3,Triangle=4,BlackmanHarris=5};
 // Fixed software root on [0,1]. Identical operations on both devices; no pow
 // library discrepancy. Filter conformance uses an explicit absolute tolerance.
 X2_HD inline float cubeRootUnit(float x){
@@ -34,6 +34,16 @@ X2_HD inline float cubicMiddle(float r){
     float u=r;
     for(int i=0;i<5;++i)u=(11*r+u*u*(6+u*(8-9*u)))/(4+12*u*(1+u*(1-u)));
     return u;
+}
+// M. Giles, "Approximating the erfinv function", GPU Computing Gems Jade Edition (2011), single precision: the Gaussian
+// pixel filter's warp, as MoonRay's erfinvApprox (the plugin's patch to pbr/sampler/Sampling.ispc).
+X2_HD inline float erfinvApprox(float x){
+    float w=-logf((1.0f-x)*(1.0f+x)),p;
+    if(w<5.0f){w=w-2.5f;p=2.81022636e-08f;p=3.43273939e-07f+p*w;p=-3.5233877e-06f+p*w;p=-4.39150654e-06f+p*w;p=0.00021858087f+p*w;
+        p=-0.00125372503f+p*w;p=-0.00417768164f+p*w;p=0.246640727f+p*w;p=1.50140941f+p*w;}
+    else{w=sqrtf(w)-3.0f;p=-0.000200214257f;p=0.000100950558f+p*w;p=0.00134934322f+p*w;p=-0.00367342844f+p*w;p=0.00573950773f+p*w;
+        p=-0.0076224613f+p*w;p=0.00943887047f+p*w;p=1.00167406f+p*w;p=2.83297682f+p*w;}
+    return p*x;
 }
 X2_HD inline bool filter(Filter kind,float width,float r,float& out){
     if(!finite(width)||width<=0 || !finite(r)||r<0||r>1)return false;
@@ -50,6 +60,28 @@ X2_HD inline bool filter(Filter kind,float width,float r,float& out){
         else if(r<5.f/6){v=(6*r-3)/4;for(int i=0;i<4;++i)v=(8*v*v*v-12*r+6)/(12*v*v-9);}
         else v=1.5f-cubeRootUnit(6*(1-r));
         out=v*(width/3)+.5f;
+    }else if(kind==Filter::Gaussian){
+        // Cut off at three standard deviations either side (PBR_gaussianWarp): the footprint is 6.
+        const float e=fminf(fmaxf((2.0f*r-1.0f)*0.99730020f,-0.9999999f),0.9999999f);
+        v=fminf(fmaxf(1.41421356f*erfinvApprox(e),-3.0f),3.0f);
+        out=v*(width/6)+.5f;
+    }else if(kind==Filter::Triangle){
+        v=r<0.5f?sqrtf(2.0f*r)-1.0f:1.0f-sqrtf(2.0f*(1.0f-r));
+        out=v*(width/2)+.5f;
+    }else if(kind==Filter::BlackmanHarris){
+        // The window's integral solved for r of the whole (PBR_blackmanHarrisWarp): Newton's method, kept within a bracket.
+        const float a0=0.35875f,a1=0.48829f,a2=0.14128f,a3=0.01168f,pi2=6.28318530718f,target=r*a0;
+        float low=0.0f,high=1.0f,t=r;
+        for(int j=0;j<12;++j){
+            const float c=a0*t-a1*sinf(pi2*t)/pi2+a2*sinf(2.0f*pi2*t)/(2.0f*pi2)-a3*sinf(3.0f*pi2*t)/(3.0f*pi2)-target;
+            if(c>0.0f)high=t;else low=t;
+            const float w=a0-a1*cosf(pi2*t)+a2*cosf(2.0f*pi2*t)-a3*cosf(3.0f*pi2*t);
+            float next=w>1e-6f?t-c/w:0.5f*(low+high);
+            if(next<=low||next>=high)next=0.5f*(low+high);
+            t=next;
+        }
+        v=2.0f*t-1.0f;
+        out=v*(width/2)+.5f;
     }else return false;
     return finite(out);
 }

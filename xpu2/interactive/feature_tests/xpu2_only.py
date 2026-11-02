@@ -4,7 +4,7 @@ import argparse, json, shutil, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runq
-HARNESS = Path(r'C:\Users\Raphael Tobar\MoonRayForModo-xpu2-async\xpu2\interactive\session_harness.py')
+HARNESS = Path(__file__).resolve().parents[1] / 'session_harness.py'
 p = argparse.ArgumentParser()
 p.add_argument('folder', type=Path); p.add_argument('xpu2', type=Path); p.add_argument('case')
 p.add_argument('--mode', default='0'); p.add_argument('--name', default='xpu2'); p.add_argument('--threads', type=int, default=0)

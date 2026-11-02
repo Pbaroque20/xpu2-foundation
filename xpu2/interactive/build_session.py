@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 
 from build_async import HEADERS
-from native_build import build, build_units
+from native_build import bc6h_kernels, build, build_units
 from reference_runtime import sha, verify
 
 HERE = Path(__file__).resolve().parent
@@ -60,7 +60,7 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
     # A CPU test (XPU2_SESSION_MODE=0) never loads the GPU programs: their sources may have moved on.
     if drift and not cpu_test:
         raise RuntimeError('The GPU programs are made from sources changed since that build: ' + ', '.join(drift))
-    files = list(HERE.glob('*.h')) + [HERE / n for n in ('xpu2_session.cc', 'xpu2_scene.cc', 'xpu2_cpu.cc', 'xpu2_meshopt.cc', 'build_session.py', 'native_build.py',
+    files = list(HERE.glob('*.h')) + [HERE / n for n in ('xpu2_session.cc', 'xpu2_scene.cc', 'xpu2_cpu.cc', 'xpu2_meshopt.cc', 'xpu2_bc6h.cc', 'build_session.py', 'native_build.py',
                                                          'xpu2_geom.cc', 'build_geom.py')]
     files += sorted((HERE.parents[1] / 'native-port').glob('modo_*.h'))
     held = {str(p): sha(p) for p in files}
@@ -93,10 +93,11 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
         geom_thread = threading.Thread(target=make_geom)
         geom_thread.start()
         try:
-            exe, report['native_build'] = build_units(source, [HERE / 'xpu2_session.cc', HERE / 'xpu2_scene.cc', HERE / 'xpu2_cpu.cc', HERE / 'xpu2_meshopt.cc'], out / 'native',
+            kernels, kernel_flags = bc6h_kernels(source, out / 'bc6h')
+            exe, report['native_build'] = build_units(source, [HERE / 'xpu2_session.cc', HERE / 'xpu2_scene.cc', HERE / 'xpu2_cpu.cc', HERE / 'xpu2_meshopt.cc', HERE / 'xpu2_bc6h.cc'], out / 'native',
                                                       [runtime / 'libembree4.dll', runtime / 'librendering_lpe.dll',
-                                                       runtime / 'librendering_displayfilter.dll', '-lcfgmgr32', '-lwinmm'],
-                                                      ['-I' + str(v) for v in include] + ['-I' + str(source / 'upstream/meshoptimizer/src'), '-DXPU2_SPLIT_UNITS'])
+                                                       runtime / 'librendering_displayfilter.dll', *kernels, '-lcfgmgr32', '-lwinmm'],
+                                                      ['-I' + str(v) for v in include] + ['-I' + str(source / 'upstream/meshoptimizer/src'), '-DXPU2_SPLIT_UNITS'] + kernel_flags)
         finally:
             geom_thread.join()
         geom = geom_result
@@ -128,6 +129,10 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
         filters = sorted(runtime.glob('*DisplayFilter.so'))
         for p in filters:
             shutil.copyfile(p, rt / p.name)
+        # But for Toon's, as the kit's MoonRay has it: the reference is older than its Output Mode and whole lines, which
+        # the kit's scenes ask of it. As the reference's it gives every Output Mode the shading with its lines.
+        for name in ('ToonDisplayFilter.so', 'ToonDisplayFilter.so.proxy'):
+            shutil.copyfile(source / 'build/native-renderer-avx/bin' / name, rt / name)
         libraries = closure(objdump, runtime, [exe] + proxies + filters + [out / 'geom' / 'xpu2_geom.dll'])
         for p in libraries:
             shutil.copyfile(p, rt / p.name)

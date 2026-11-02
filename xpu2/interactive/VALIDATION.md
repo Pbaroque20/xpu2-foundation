@@ -1,5 +1,7 @@
 # Validation scope — 22 October 2026
 
+> **A record of 22 October 2026.** It describes the prototype as published that day; "current source" below meant that day's. For XPU2 as it is now, see the [README](README.md) and [feature progress](FEATURE_PROGRESS.md).
+
 Publication is justified as an experimental prototype by finite measured improvements, not by production qualification. Gates were fixed before timing. Numerical reports are in [evidence/](evidence/); only workstation path prefixes were redacted. [The manifest](evidence/manifest.json) records original and redacted report hashes. Raw images and binaries are not included.
 
 ## Fresh original-XPU comparison after the ray-hit correction
