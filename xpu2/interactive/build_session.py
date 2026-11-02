@@ -123,6 +123,8 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
         objdump = source / 'toolchain/msys64/ucrt64/bin/objdump.exe'
         # The scene classes are read through their proxies (proxy mode): every one, and what they load.
         proxies = sorted(runtime.glob('*.so.proxy'))
+        # And the kit's own class the reference is older than: without its proxy a scene holding one did not load at all.
+        proxies.append(source / 'build/native-renderer-avx/bin/ModoProceduralMap.so.proxy')
         for p in proxies:
             shutil.copyfile(p, rt / p.name)
         # The display filters run as MoonRay's own, from their DSOs (aov_display.h).

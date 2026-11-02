@@ -15,7 +15,7 @@ from native_build import bc6h_kernels, build_units
 from reference_runtime import sha, verify
 
 HERE = Path(__file__).resolve().parent
-HEADERS = ('async_gpu_abi.h', 'points_core.h', 'async_adaptive_core.h', 'async_integrator.h', 'light_core.h', 'light_image.h', 'light_tree.h', 'gpu_jobs.h', 'resume_core.h', 'triangle_hit.h',
+HEADERS = ('../../native-port/maps/ModoProcedural/modo_patterns.h', 'async_gpu_abi.h', 'points_core.h', 'async_adaptive_core.h', 'async_integrator.h', 'light_core.h', 'light_image.h', 'light_tree.h', 'gpu_jobs.h', 'resume_core.h', 'triangle_hit.h',
            'texture_core.h', 'surface_core.h', 'sample_stream.h', 'path_stage.h', 'shade_math.h', 'shade_tables.h',
            'shade_fresnel.h', 'shade_color.h', 'shade_lobes.h', 'shade_lobes_eval.h', 'shade_hair.h', 'shade_flakes.h', 'shade_glitter.h', 'shade_glitter_tables.h', 'shade_state.h', 'shade_builder.h',
            'shade_colorcorrect.h', 'shade_dwabase.h', 'shade_dwalayer.h', 'shade_maps.h', 'shade_noise.h', 'shade_bssrdf.h', 'shade_mapnodes.h', 'shade_mapnodes_more.h', 'curve_core.h', 'curve_embree.h', 'volume_core.h', 'shade_material.h',
@@ -32,6 +32,7 @@ def build_all(source, runtime, out):
     files = list(HERE.glob('*.h')) + [HERE / n for n in ('async_probe.cc', 'async_gpu.cu', 'async_material.cu', 'async_maps.cu', 'async_lights.cu', 'async_lobes.cu', 'async_volumes.cu', 'async_dwa.cu', 'async_dwalobes.cu', 'async_extras.cu',
                                                          'async_adaptive.cu', 'build_async.py',
                                                          'gpu_build.py', 'native_build.py')]
+    files = list(files) + [HERE / HEADERS[0]]  # the patterns, kept with MoonRay's map in native-port
     held = {str(p): sha(p) for p in files}
     report = {'status': 'incomplete', 'source_hashes': held}
     try:

@@ -960,9 +960,12 @@ inline MotionParams motionParams(const rdl::SceneVariables& sv,const rdl::SceneO
 // Whether a mesh has motion data or a moving transform (meshMotionSteps then places its vertices).
 inline bool meshHasMotion(const rdl::SceneObject& o){
  namespace sm=scene_rdl2::math;
- return !sm::isEqual(sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN)),sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END)))||
-        !o.get<rdl::Vec3fVector>("vertex_list_1").empty()||!o.get<rdl::Vec3fVector>("velocity_list_0").empty()||
-        !o.get<rdl::Vec3fVector>("velocity_list_1").empty()||!o.get<rdl::Vec3fVector>("accleration_list").empty();}
+ if(!sm::isEqual(sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN)),sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END))))return true;
+ // Asked of any geometry: ModoFurGeometry has none of these lists, and asking one it does not have throws.
+ for(const char* name:{"vertex_list_1","velocity_list_0","velocity_list_1","accleration_list"})
+  for(auto i=o.getSceneClass().beginAttributes();i!=o.getSceneClass().endAttributes();++i)
+   if((*i)->getName()==name&&!o.get<rdl::Vec3fVector>(name).empty())return true;
+ return false;}
 inline std::vector<std::vector<V3>> meshMotionSteps(const rdl::SceneObject& o,const MotionParams& mp,const rdl::Mat4d& xform0,const rdl::Mat4d& xform1,
                                                     bool staticTakesSecond=true,std::vector<float>* radiusScales=nullptr,
                                                     const std::vector<float>* w0=nullptr,const std::vector<float>* w1=nullptr,

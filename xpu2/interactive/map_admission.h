@@ -633,6 +633,11 @@ struct MapProgramBuilder {
             if (alphaOnly) h.gamma = 0;
         }
         if (c->kind == shade::MapModoTexture) listed.insert("uv_name");  // its keys after the attributes, below
+        if (c->kind == shade::MapModoProcedural) {
+            listed.insert("settings");  // its floats after the attributes, below
+            const int space = get<rdl::Int>(m, "space");
+            need(space == 0 || space == 2, m.getName() + ": a procedural in object space is not shaded yet");
+        }
         if (primvarReader) listed = {"varname", "warn_when_unavailable", "fallback"};
         if (c->kind == shade::MapUsdUVTexture) {
             for (const char* n : {"file", "wrapS", "wrapT", "sourceColorSpace"}) listed.insert(n);
@@ -776,6 +781,11 @@ struct MapProgramBuilder {
             need(get<rdl::Int>(m, "mode") == 1, m.getName() + ": feature-width LOD needs ray differentials (not shaded yet)");
             need(get<rdl::Float>(m, "start") > shade::Epsilon && get<rdl::Float>(m, "stop") - get<rdl::Float>(m, "start") > shade::Epsilon,
                  m.getName() + ": invalid LOD range");
+        }
+        if (c->kind == shade::MapModoProcedural) {
+            // The settings, each a float; bias and gain, the last two, 0.5, neutral, unless given (ModoProceduralMap::update).
+            const auto& given = get<rdl::FloatVector>(m, "settings");
+            for (int i = 0; i < 24; ++i) params.push_back(i < int(given.size()) ? given[i] : (i >= 22 ? 0.5f : 0.0f));
         }
         if (c->kind == shade::MapModoTexture) {
             // A named UV set (uv_name, modes 12 and 13): the keys of its primitive attribute and of modo_primary_uv

@@ -66,6 +66,7 @@ GPU in the final build. A scene with anything not listed as done still renders, 
 | Light-sample Russian roulette biases dim bounce light dark (0.1-4%, constant in spp) | not reproduced (tests use russian_roulette_threshold 0); XPU2 = scalar mode |
 | A BSDF ray meeting two lights picks one from a non-uniform sequence: 3% dark there (mirror reflecting a light in front of the environment) | not reproduced; XPU2 = scalar mode = exact (gl1: the chrome's reflection of the key light +3.6% against vector mode, within noise against scalar) |
 | Visibility misses counted once per lobe (insert's result discarded in accumVisibilityAovsOccluded) | reproduced |
+| Modo's procedural textures through the object (ModoProceduralMap), by the patterns MoonRay and MoonLightIPR share | ported, world and texture spaces; not yet compared pattern by pattern |
 | A camera ray seeing a light past every surface adds nothing to light AOVs (case 1 redeclares lpeStateId) | reproduced with the override off; MOONRAY_MODO_CAMERA_LIGHT_LPE keeps it |
 | Subsurface light samples give unoccluded LPEs the attenuated value and count visibility at any depth | reproduced |
 | Random walk rescales its light and visibility AOVs with its radiance (MOONRAY-3352) | reproduced |
