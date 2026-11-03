@@ -20,7 +20,7 @@ The mantra for XPU2 is: "Use your silicon!"
 
 ![Cellular automata scheduling in XPU2](/xpu2/manual/xpu2-cellular-scheduling.gif)
 
-*Cellular automata scheduling in XPU2*
+*Cellular automata scheduling in XPU2; both CPU/GPU contribute to the image without waiting. Footage Provided by Pixelwerk.*
 
 - **Samples are defined by identity.** A sample is a pixel, a sample index and a frame seed, and its random numbers
   derive from those alone. Either device produces the same result, so work moves between them freely.
