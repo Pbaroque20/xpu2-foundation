@@ -8,7 +8,7 @@ How it works, part by part: the [engineer manual](../manual/README.md).
 
 ## What works
 
-- Both devices together, or either alone: a work grid of cells that move between them, one integrator compiled for both, every sample defined by its identity so it gives the same result on either. Geometry and lights in motion, and points, render on both. What the GPU programs lack is deferred to the CPU lane.
+- Both devices together, or either alone: a work grid of cells that move between them, one integrator compiled for both, every sample defined by its identity so it gives the same result on either. Geometry and lights in motion, and points, render on both. What the GPU programs lack is deferred to the CPU lane, and light filters, shadow linking, lobe light sets and emissive volumes keep a scene on the CPU lane.
 - MoonRay's path tracer and shader library, ported and checked against MoonRay: lights and light filters, the DwaBase materials and combinators, maps, subsurface, hair and curves, subdivision and displacement, volumes and VDB, cameras, motion blur, render outputs, light-path AOVs and Cryptomatte. Each feature's state and check are in [feature progress](FEATURE_PROGRESS.md).
 - Sampling by generations, spending samples where the picture is still noisy.
 - Textures in tiers: every level in host RAM, the coarse levels and a cache of fine tiles in VRAM, misses shaded from a coarser level and rendered again in full.

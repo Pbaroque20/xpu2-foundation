@@ -2735,8 +2735,8 @@ inline bool admitMeshLight(const rdl::SceneObject& o,float sceneScale,const rdl:
 // A camera-only edit (the session's fast path, realtime): the camera, render space and render origin made again from the
 // scene's camera as it stands, the rest of the plan as it was prepared (its meshes are in world space). False where
 // something else follows the camera and the scene must be prepared again: a bake camera, a pixel sample map, a shutter
-// that changed (geometry in motion is read over it), volumes and light filters (evaluated at the render origin),
-// adaptive tessellation (cameraDependent).
+// that changed (geometry in motion is read over it), light filters (evaluated at the render origin), adaptive
+// tessellation (cameraDependent). A mapped volume's settings are worked out again at the new render origin.
 inline void admitCamera(const rdl::SceneObject& camera,const rdl::SceneVariables& sv,Plan& plan,const Plan* previous);
 // why, where given: what kept the camera from being taken alone (the session's log).
 inline bool updateCamera(Plan& plan,const rdl::SceneContext& context,std::string* why=nullptr){

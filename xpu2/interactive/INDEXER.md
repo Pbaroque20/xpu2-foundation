@@ -30,9 +30,9 @@ material and many DwaBase ones is not judged by the glitter.
 
 ## 2. Routing by device
 
-- **GPU programs by family.** The GPU program is built from the families the scene's `Both` entities use. With the
-  map interpreter split into a function per map type and the families moved into separate modules, a scene compiles
-  only what it uses, cached per combination.
+- **GPU programs by family.** The plan: the GPU program built from the families the scene's `Both` entities use,
+  the map interpreter split into a function per map type and the families moved into separate modules, so that a
+  scene compiles only what it uses. Built so far: nine modules, all linked into every pipeline (Order, step 5).
 - **Deferral to the CPU.** An entity classified `Cpu` is in the GPU scene as a stand-in: a bounding primitive (a
   VDB's box, a mesh left to the CPU by the card's budget) or a flag on a light or material. A GPU sample that meets
   one stops and is handed to the CPU lane, which renders that sample whole from its identity (pixel, index, frame).
@@ -53,8 +53,9 @@ renderer with the frame:
 
 - unchanged meshes, tessellations, grids, images and light tables are reused (as today, by signature), and the
   renderer is told which ones changed instead of finding out;
-- the CPU's Embree scene and the GPU's acceleration structures are refitted or rebuilt per changed mesh (instances:
-  their transforms only), not rebuilt whole;
+- the CPU's Embree scene and the GPU's acceleration structures are rebuilt per changed mesh (instances: their
+  transforms only), not rebuilt whole; today unchanged meshes keep theirs and a changed one is built again, never
+  refitted;
 - material, light and filter records are rewritten in place where their layout allows;
 - the RDLB file is written only for MoonRay's fallback, not on every edit.
 
@@ -78,9 +79,9 @@ function (integratePaths 30.8k to 12k instructions), but not OptiX's: it compile
    - continuation callables (they trace): subsurface (diffusion and random walk), volumes (their radiance and
      transmittance);
    - the raygen module keeps the path loop, light sampling and the traces.
-   On the CPU the same calls are plain calls. A scene's pipeline links only the modules its families use (the
-   indexer's families, step 1), each module compiled once and kept in OptiX's cache, so a new scene compiles at most
-   the modules it adds.
+   On the CPU the same calls are plain calls. Each module is compiled once and kept in OptiX's cache. Not built
+   yet: a scene's pipeline linking only the modules its families use (the indexer's families, step 1), so that a new
+   scene compiles at most the modules it adds; today all nine link into every pipeline.
 
    Done so far, in PTX instructions (whole, build 76 was 238k in one module):
 
@@ -105,7 +106,7 @@ function (integratePaths 30.8k to 12k instructions), but not OptiX's: it compile
 ## 6 in detail: where an edit's time goes now
 
 An edit makes the plan again (meshes, grids, images and light tables reused by signature), then the CPU's Embree
-scene whole, the GPU's every acceleration structure (GpuLane::prepare builds a GAS per mesh, reusing none) and a new
+scene whole, the GPU's every acceleration structure (GpuLane::prepare built a GAS per mesh, reusing none, until the steps below) and a new
 renderer. First steps: the GPU lane and the CPU scene keep each mesh's acceleration structure and uploaded buffers by
 its MeshData (the plan builder hands an unchanged mesh's same shared object to the next plan), rebuilding only the
 instance structures; the renderer keeps its ownership and lane rate across an edit of the same image size.
@@ -277,8 +278,8 @@ generations' UserData carries realtime (its ninth value, cpu_scene.h):
 
 - A camera moved alone (Scene::onlyCameraDirty) keeps the plan, the CPU scene and the GPU's scene: cpu::updateCamera
   makes the camera and render space again and the GPU gets its configuration (GpuLane::updateCamera): 0.1 ms, where
-  preparing took 0.21 s. A scene whose view depends on the camera (adaptive subdivision, volumes, filters, a pixel
-  sample map, motion) prepares as before.
+  preparing took 0.21 s. A scene with adaptive tessellation, light filters, a pixel sample map or a bake camera, or
+  whose shutter changed, prepares as before; a mapped volume's settings are worked out again at the new place.
 - A realtime frame is the GPU's alone; its first pass covers every pixel (sparse first passes, a quarter of the pixels
   then the rest, flashed as scanlines before they settled and are off since 2026-10-30; XPU2_SESSION_RT_SPARSE=1), with launches sized to about 15 ms of the GPU's rate across frames (rateHint), and
   its pictures every 33 ms.

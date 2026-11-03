@@ -138,12 +138,12 @@
   <text x="70" y="863" class="s">whole from its identity: no path state crosses devices</text>
   <text x="56" y="880" class="s">renders provisional samples again in full</text>
   <text x="56" y="897" class="s">reads every texture level from host RAM; its own film</text>
-  <text x="56" y="922" class="m">light filters, shadow linking, lights in motion and</text>
+  <text x="56" y="922" class="m">light filters, shadow linking, lobe light sets and</text>
   <text x="56" y="938" class="m">emissive volumes keep a whole scene on the CPU lane today</text>
 
   <rect x="760" y="771" width="480" height="205" rx="8" fill="#e9f7ec" stroke="#2e8b57" stroke-width="1.5"/>
   <text x="776" y="793" class="t">GPU lane (async_gpu.h, OptiX)</text>
-  <text x="776" y="813" class="s">fixed launches of 65,536 threads; each thread claims one</text>
+  <text x="776" y="813" class="s">launches as wide as the card holds; each thread claims one</text>
   <text x="790" y="829" class="s">sample at a time, neighbours in neighbouring pixels</text>
   <text x="776" y="846" class="s">acceleration structures kept while a mesh is unchanged</text>
   <text x="776" y="863" class="s">stand-ins for what only the CPU renders: a sample</text>

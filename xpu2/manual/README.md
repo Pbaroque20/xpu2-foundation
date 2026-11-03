@@ -4,7 +4,8 @@
 
 How XPU2 works, part by part, with the files behind each part. Written 2026-10-25; updated 2026-10-26 for the
 tessellation handler and the second round of scene preparation (`INDEXER.md` sections 16 and 17); corrected 2026-10-30
-against `MoonLightIPR` at 422a003, the 0.5 release, where XPU2 is part of the kit. The design notes it points to go
+against `MoonLightIPR` at 422a003, the 0.5 release, where XPU2 is part of the kit; updated 2026-11-02 for release 0.5.2
+and what came after it (card memory, subdivision under motion). The design notes it points to go
 deeper. Where this manual and the code disagree, the code wins: fix the manual.
 
 All paths are relative to `xpu2/interactive/` unless they start with `xpu2/` or another top-level folder.
@@ -131,8 +132,8 @@ refused here, with a reason.
 - Unchanged meshes, tessellations, grids, images and light tables are reused across edits by signature
   (`deepSignature` covers a displaced mesh's maps).
 - A camera-only edit (`Scene::onlyCameraDirty`) keeps the plan and both lanes' scenes. `cpu::updateCamera` and
-  `GpuLane::updateCamera` take about 0.1 ms. Scenes whose geometry depends on the camera (adaptive subdivision,
-  volumes, filters, motion) prepare again.
+  `GpuLane::updateCamera` take about 0.1 ms. Adaptive tessellation, light filters, a pixel sample map, a bake
+  camera or a changed shutter prepare again; a mapped volume's settings are worked out again at the new place.
 
 **The canonical copy** (`canonical_session.h`, added 2026-10-26 in its present form). The plan is made from a replica of
 the received scene, not from the scene itself: the renderers keep reading the replica's objects (materials, maps)
@@ -564,6 +565,12 @@ Environment variables read by the session or the renderer. The defaults are the 
 | `XPU2_SESSION_GPU_GEOMETRY_MB` | The card's geometry budget, past which the largest meshes go to the CPU lane alone (added 2026-10-26) |
 | `XPU2_SESSION_MEMORY_MB` | The session's memory ceiling (added 2026-10-26) |
 | `XPU2_ASYNC_STACKS=1` | Logs the GPU program's stacks and each thread's scratch (added 2026-11-02) |
+| `XPU2_GPU_MOTION_OFF=1` | Points, and geometry and lights in motion, left to the CPU lane as before the GPU rendered them, to compare |
+| `XPU2_SESSION_FAIL_TILE=N` | The Nth texture tile read fails, to test what follows one |
+| `XPU2_SESSION_RT_SPARSE=1` | Realtime's sparse first passes (a quarter of the pixels, then the rest) back |
+| `XPU2_SESSION_RT_UPSCALE=0` | Realtime denoises at full size while moving (the kit's Lower Resolution While Moving off) |
+| `XPU2_SESSION_EMBREE_DYNAMIC` | `0` the CPU lane's scene in one level always, `1` in two levels (instances moved without rebuilding) always |
+| `XPU2_SESSION_COARSE_SIMPLIFY=0` | The coarse first pass tessellates coarsely but simplifies no mesh |
 | `XPU2_SESSION_GEOMETRY_CACHE=0`, `_GEOMETRY_CACHE_GB` | No tessellation cache on disk; its size (default 20 GB) (added 2026-10-26) |
 | `XPU2_SESSION_TESSELLATION_JOBS` | Meshes tessellated at once (default 1) (added 2026-10-26) |
 | `XPU2_SESSION_SHARED_INSTANCES=0` | Each instance baked into a mesh of its own (added 2026-10-26) |
@@ -595,7 +602,7 @@ port share one folder today; this map says which layer each file belongs to.
 | `async_grid.h` (0.5k) | Work grid, chunks, cellular rules, ownership flips |
 | `device_suit.h` | Cells by suitability |
 | `async_cpu.h` (1.8k) | CPU lane |
-| `async_gpu.h` (2.5k) | GPU lane, host side |
+| `async_gpu.h` (2.9k) | GPU lane, host side |
 | `async_gpu_abi.h`, `async_gpu_device.h` | Host/device shared layout, launch parameters, device texture access |
 | `async_integrator.h` (2.8k) | One sample, both devices: the core's contract, holding the reference's estimator |
 | `async_adaptive.h`, `async_adaptive_core.h`, `async_adaptive.cu` | Sampling generations, the error trees, the GPU pass chain |
