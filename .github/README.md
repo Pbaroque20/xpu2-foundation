@@ -18,6 +18,10 @@ The mantra for XPU2 is: "Use your silicon!"
 
 ## Core ideas
 
+![Cellular automata scheduling in XPU2](/xpu2/manual/xpu2-cellular-scheduling.gif)
+
+*Cellular automata scheduling in XPU2*
+
 - **Samples are defined by identity.** A sample is a pixel, a sample index and a frame seed, and its random numbers
   derive from those alone. Either device produces the same result, so work moves between them freely.
 - **One integrator.** The path tracer is written once and compiled for both the CPU and the GPU.
