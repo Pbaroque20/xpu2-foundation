@@ -156,7 +156,7 @@ callable. What those builds shared: OptiX calls in the map callable (optixGetLau
 optixDirectCall). The textures now carry the thread's mark from where the raygen's thread is known, and the sink reads
 a parent texel as a plain function (session 94).
 
-## 9. Next: material-coherent shading on the GPU
+## 9. Material-coherent shading on the GPU: ruled out
 
 The Modo scene above, at 640x360 on the GPU alone: 1.1 s with no bounce, 6.4 s with one, 12.6 s with four; its
 subsurface makes no difference. Its 264 classes carry 489 map nodes, and a bounce ray meets any of them: a warp's
@@ -164,7 +164,8 @@ threads then run their different materials' maps one after another. MoonRay XPU 
 queue at a time (on the CPU); XPU2 is to do the same on the GPU: a bounce's hits written out, sorted by material, and
 shaded in order, with the path's state in memory between the stages (a wavefront), exactly as the megakernel shades.
 
-On hold (2026-10-25). Those timings came from the launches that did not fill the GPU (section 7). With full launches
+On hold from 2026-10-25, then ruled out on 2026-11-01: the GPU lane stays one kernel, with no wavefront in any
+form, its simplicity being what makes it work. Why it was held: those timings came from the launches that did not fill the GPU (section 7). With full launches
 (session 96, the same scene, 640x360, beauty only): depth 0 1.24 s, 1 3.43 s, 2 4.72 s, 4 5.01 s; a bounce costs 1.8x
 the first hit, not 5x. And the scene has two materials (its layer gives each of its two meshes one layered subsurface
 material; the 489 map nodes are inside them), so sorting by material would group threads into at most two sets. The

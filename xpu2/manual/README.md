@@ -667,9 +667,17 @@ From the design notes. Each has more detail where it's listed.
   they can (`GpuLane::updatePlacements`, `cpu::placeMoved`), and unchanged meshes keep their GAS; other edits prepare
   the plan again, and a changed mesh's structures are built again, never refitted (`INDEXER.md` order, step 6).
 - GPU program modules linked per scene by its families (`INDEXER.md` section 5).
-- Cellular generations on the GPU pass chain; the adaptive chain as one CUDA graph (`ASYNC.md`).
-- SIMD batches on the CPU lane (`ASYNC.md`).
-- Material-coherent shading on the GPU: on hold, since the profile says shadow rays dominate (`INDEXER.md` section 9).
+- Letting geometry and coarser texture levels go under memory pressure: past its ceiling a scene still goes to
+  MoonRay XPU (`ASYNC.md`).
+
+**Decided against**
+
+- The adaptive chain as one CUDA graph, and cellular generations on the GPU pass chain: the chain is off by default
+  and no artist's render takes it (`ASYNC.md`, "Decided, 30 October 2026").
+- SIMD batches on the CPU lane: measured on camera rays, 0.3 to 1.3% less time and images no longer byte-identical,
+  so not adopted (the same section).
+- Material-coherent shading on the GPU, a wavefront: ruled out on 2026-11-01, the GPU lane stays one kernel. The
+  profile gave it a tenth of the time at most, shadow rays being the work (`INDEXER.md` section 9).
 
 **MoonRay port**
 
