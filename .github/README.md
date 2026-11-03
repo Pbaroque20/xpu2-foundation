@@ -53,7 +53,7 @@ XPU. [Feature progress](/xpu2/interactive/FEATURE_PROGRESS.md) lists each featur
 
 ## Showcase: MoonRay for Modo
 
-XPU2 renders previews in MoonRay for Modo on real production scenes, as part of the standard kit since 0.5, a
+XPU2 renders previews in [MoonRay for Modo](https://www.github.com/pbaroque20/moonrayformodo/) on real production scenes, as part of the standard kit since 0.5, a
 pre-production release. Measured on an RTX 3090 and an i7-4930K (6 cores, 12 threads):
 
 | Scene | XPU2 (CPU + GPU) | MoonRay | Image vs MoonRay |
