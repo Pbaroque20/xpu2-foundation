@@ -1,9 +1,8 @@
 # xpu2-foundation
 
-<img width="800" height="450" alt="xpu2" src="https://github.com/user-attachments/assets/a8a8aae2-c499-450c-8113-390237a0cbe7" />
+![Cellular automata scheduling in XPU2](/xpu2/manual/xpu2-cellular-scheduling.gif)
 
-_Cellular Automata Scheduling_
-
+*Cellular automata scheduling in XPU2; both CPU/GPU contribute to the image without waiting. Footage Provided by Pixelwerk.*
 
 **XPU2** is an asynchronous CPU + GPU Monte Carlo path tracer. The CPU and GPU render collaborate on same image at once: each
 claims its own work, neither waits for the other, and any sample can be rendered on either device with the same
@@ -17,10 +16,6 @@ The mantra for XPU2 is: "Use your silicon!"
 ![XPU2 architecture](/xpu2/manual/xpu2_architecture.svg)
 
 ## Core ideas
-
-![Cellular automata scheduling in XPU2](/xpu2/manual/xpu2-cellular-scheduling.gif)
-
-*Cellular automata scheduling in XPU2; both CPU/GPU contribute to the image without waiting. Footage Provided by Pixelwerk.*
 
 - **Samples are defined by identity.** A sample is a pixel, a sample index and a frame seed, and its random numbers
   derive from those alone. Either device produces the same result, so work moves between them freely.
