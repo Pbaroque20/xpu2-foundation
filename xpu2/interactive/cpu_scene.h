@@ -204,6 +204,9 @@ struct Plan {
     unsigned mapRegisters=0;  // the most registers a map program has
     // A random-walk subsurface material, and then MoonRay's integrator sequences its walk draws from (walkSequences).
     bool randomWalk=false;std::shared_ptr<const std::vector<float>> walkSequences;
+    // A material that scatters under its surface (a DwaBase tree whose subsurface model is not none: its scattering radius
+    // and colour not zero, its diffuse on): only then does the GPU keep the subsurface code's deep stack (async_gpu.h's fitStack).
+    bool subsurface=false;
     // The textures the path tracer's maps read (shade_mapnodes.h): each file once, and its host mip pyramid.
     std::vector<std::shared_ptr<texture::File>> textures;std::vector<const tex::Image*> textureImages;
     // The render outputs and their AOVs (aov_plan.h), and the keys of the primitive attributes they read.
@@ -3338,6 +3341,7 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
    // The DwaBase family and its combinators (shade_dwabase.h, shade_dwalayer.h, dwa_admission.h): each material its
    // own tree, its inputs' trees inside it.
    shade::MaterialRecord rec=admitDwaTree(o,plan->materialPool,plan->dwaSlots,textureContext,&plan->glitter,&plan->randomWalk);
+   {shade::DwaTree tree;std::memcpy(&tree,plan->materialPool.data()+rec.offset,sizeof tree);if(tree.up.subsurface!=shade::SubsurfaceNone)plan->subsurface=true;}
    labelTable(o,rec);
    materialIds[o.getName()]=unsigned(plan->materials.size());plan->materials.push_back({V3{0,0,0},V3{0,0,0}});plan->materialRecords.push_back(rec);
   }else if(cls=="UsdPreviewSurface"){

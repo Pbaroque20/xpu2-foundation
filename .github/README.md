@@ -34,11 +34,13 @@ The mantra for XPU2 is: "Use your silicon!"
 - **Lean card memory.** The GPU's stack is sized from the program's real call chains and from what the scene contains,
   and each thread's scratch from what the scene uses. A launch is as wide as the card's cores can hold at once, and
   narrower only when the card is short of memory. On an RTX 3090 a simple scene went from 10.9 GB of the card to 4.5 GB
-  at the same speed and with the same picture, so smaller cards can render.
+  at the same speed and with the same picture, so smaller cards can render. The parked-sample queue and the subsurface
+  stack are made only for scenes that use them, and the texture cache grows as tiles are read.
 - **Tiered texture memory.** Host RAM holds the coarse mip levels and the fine tiles read so far, which are decoded on
   demand and let go under memory pressure. VRAM holds the coarse levels and a cache of fine tiles. A GPU sample that
   misses a fine tile shades from a coarser level and is re-rendered in full before the frame ends. A scene that does
-  not fit has its textures compressed (BC6H), then made smaller, and the preview says so.
+  not fit has its textures compressed (BC6H), then made smaller, and the preview says so. Texels are kept as half
+  floats, grey maps in one channel and flat tiles as one value, so textures take about a third of the memory.
 - **Sampling generations.** One sampler handles both uniform and adaptive sampling, spending samples where the error
   is highest. A frame runs for as long as uniform sampling would take, or to an exact sample count.
 - **Audited results.** Each device keeps its own film. When a frame ends the films merge and every pixel's sample

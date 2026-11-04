@@ -53,9 +53,18 @@ struct Driver {
  void drain(){thread();++synchronizations;check(cuCtxSynchronize_p());}
  ~Driver(){if(context){cuCtxDestroy_v2_p(context);if(previous)cuCtxSetCurrent_p(previous);}if(library)FreeLibrary(library);}
 };
+// What the lane is allocating, for the Terminal's memory lines (Buffer): named where a large allocation is made.
+inline thread_local const char* allocating=nullptr;
+struct Allocating {const char* before;explicit Allocating(const char* what):before(allocating){allocating=what;}~Allocating(){allocating=before;}
+ Allocating(const Allocating&)=delete;};
 struct Buffer {
  Driver& d;size_t bytes;bool pinned;CUdeviceptr pointer=0;
- Buffer(Driver& owner,size_t n,bool host=false):d(owner),bytes(n),pinned(host){d.thread();cpu::need(n>0,"Empty allocation");auto& used=host?d.pinnedBytes:d.deviceBytes;size_t cap=host?d.pinnedCap:d.deviceCap;if(used>cap||n>cap-used)cpu::need(false,std::string("GPU staging/residency budget: ")+(host?"pinned host":"device")+" memory, "+std::to_string(n>>20)+" MB asked with "+std::to_string(used>>20)+" MB of "+std::to_string(cap>>20)+" MB in use");if(host){void* p=nullptr;Driver::check(d.cuMemAllocHost_v2_p(&p,n));pointer=reinterpret_cast<CUdeviceptr>(p);}else Driver::check(d.cuMemAlloc_v2_p(&pointer,n));used+=n;++d.allocations;d.peakPinned=std::max(d.peakPinned,d.pinnedBytes);d.peakDevice=std::max(d.peakDevice,d.deviceBytes);}
+ Buffer(Driver& owner,size_t n,bool host=false):d(owner),bytes(n),pinned(host){d.thread();cpu::need(n>0,"Empty allocation");auto& used=host?d.pinnedBytes:d.deviceBytes;size_t cap=host?d.pinnedCap:d.deviceCap;if(used>cap||n>cap-used)cpu::need(false,std::string("GPU staging/residency budget: ")+(host?"pinned host":"device")+" memory, "+std::to_string(n>>20)+" MB asked with "+std::to_string(used>>20)+" MB of "+std::to_string(cap>>20)+" MB in use");if(host){void* p=nullptr;Driver::check(d.cuMemAllocHost_v2_p(&p,n));pointer=reinterpret_cast<CUdeviceptr>(p);}else Driver::check(d.cuMemAlloc_v2_p(&pointer,n));used+=n;
+  // Each allocation of 256 MB or more said in the MoonRay Terminal, what it is for and what the lane then holds
+  // (XPU2_SESSION_LOG_ALLOCATIONS=N: from N MB; 0: none).
+  static const size_t logAt=[]{const char* v=std::getenv("XPU2_SESSION_LOG_ALLOCATIONS");const int mb=v?std::atoi(v):256;return mb>0?size_t(mb)<<20:~size_t(0);}();
+  if(n>=logAt){std::printf("MoonRay XPU2: %s %zu MB for %s (XPU2 holds %zu MB of the card, %zu MB of pinned RAM)\n",host?"pinned RAM":"card memory",n>>20,
+                           allocating?allocating:"the scene",d.deviceBytes>>20,d.pinnedBytes>>20);std::fflush(stdout);}++d.allocations;d.peakPinned=std::max(d.peakPinned,d.pinnedBytes);d.peakDevice=std::max(d.peakDevice,d.deviceBytes);}
  void* host()const{return reinterpret_cast<void*>(pointer);}
  void release(){if(pointer){if(pinned)d.cuMemFreeHost_p(host());else d.cuMemFree_v2_p(pointer);(pinned?d.pinnedBytes:d.deviceBytes)-=bytes;pointer=0;++d.frees;}}
  ~Buffer(){release();}

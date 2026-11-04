@@ -104,13 +104,13 @@ void logTextures(const cpu::Plan& plan, const async::GpuLane* card, bool whole) 
     const texture::TextureReport r = texture::reportTextures(files, plan.realtime);
     const auto mb = [](uint64_t bytes) { return double(bytes) / (1 << 20); };
     if (whole) {
-        std::printf("MoonRay XPU2: textures: %zu files (%zu 8-bit, %zu half, %zu float), %zu of them grey; at most %u pixels a side%s; finest levels %.0f MB if all read, coarser levels %.0f MB\n",
-                    r.files, r.eightBit, r.half, r.floats, r.grey, r.largest, plan.realtime ? " in realtime" : "", mb(r.finest), mb(r.coarser));
-        std::printf("MoonRay XPU2: textures could save: grey maps as one channel %.0f MB, half-float maps as 16-bit %.0f MB, flat tiles about %.0f MB (read in %.3f s)\n",
+        std::printf("MoonRay XPU2: textures: %zu files (%zu 8-bit, %zu half, %zu float), %zu of them grey, %zu held in one channel, %zu float ones in half floats; at most %u pixels a side%s; finest levels %.0f MB if all read, coarser levels %.0f MB\n",
+                    r.files, r.eightBit, r.half, r.floats, r.grey, r.oneChannel, r.rounded, r.largest, plan.realtime ? " in realtime" : "", mb(r.finest), mb(r.coarser));
+        std::printf("MoonRay XPU2: textures could save: grey maps held in three channels as one %.0f MB, half-float maps held as floats as 16-bit %.0f MB, flat tiles of levels read whole about %.0f MB (read in %.3f s)\n",
                     mb(r.saveGrey), mb(r.saveHalf), mb(r.saveFlat), r.scanSeconds);
     }
-    std::printf("MoonRay XPU2: textures in RAM: coarser levels %.0f MB, %llu of %llu finest tiles decoded (%.0f MB)\n", mb(r.coarser),
-                (unsigned long long)r.tilesDecoded, (unsigned long long)r.tiles, mb(r.decoded));
+    std::printf("MoonRay XPU2: textures in RAM: coarser levels %.0f MB, %llu of %llu finest tiles decoded (%.0f MB; %llu of them flat, one value each; %llu in floats, past half floats' range)\n", mb(r.coarser),
+                (unsigned long long)r.tilesDecoded, (unsigned long long)r.tiles, mb(r.decoded), (unsigned long long)r.flatTiles, (unsigned long long)r.wideTiles);
     if (card) std::printf("MoonRay XPU2: textures on the card: %s\n", card->textureCardText().c_str());
     if (const std::string overflow = texture::overflowWords(); !overflow.empty()) std::printf("MoonRay XPU2: textures %s (texture overflow mode; %zu of %zu files compressed)\n", overflow.c_str(), r.compressed, r.files);
     std::fflush(stdout);

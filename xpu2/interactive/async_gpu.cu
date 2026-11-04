@@ -291,8 +291,8 @@ static __device__ void commit() {
     if (i >= params.updateCount) return;
     const TileUpdate u = params.updates[i];
     auto** entry = reinterpret_cast<const surface::V3**>(params.pageEntry[u.tile]);
-    *entry = u.slot == NoSlot ? nullptr : params.slab + size_t(u.slot) * params.slabTileTexels;
-    params.tileState[u.tile] = u.slot == NoSlot ? 0u : 2u;
+    *entry = reinterpret_cast<const surface::V3*>(u.address);
+    params.tileState[u.tile] = u.address ? 2u : 0u;
 }
 
 // The film's per-pixel adaptive errors, read by the host's error trees.

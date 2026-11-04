@@ -27,10 +27,13 @@ struct Parked {
 static_assert(sizeof(Parked) == 16, "Parked samples are 16 bytes");
 
 // A change to the fine-detail tile cache, applied on the device between
-// launches: the tile's page-table entry points at its slot, or is cleared.
+// launches: the tile's page-table entry points at its slot (a flat tile's at its
+// one value, the address's lowest bit set: tex::flatPage), or is cleared (0).
 struct TileUpdate {
-    U32 tile, slot;  // slot ~0u evicts
+    U32 tile, pad;
+    U64L address;
 };
+static_assert(sizeof(TileUpdate) == 16, "Tile updates are 16 bytes");
 constexpr U32 NoSlot = ~0u;
 
 struct DeviceState {

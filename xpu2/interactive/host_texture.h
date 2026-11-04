@@ -60,6 +60,25 @@ inline void texelChannels(const float* d,int n,int alphaChannel,surface::V3& c,f
 inline bool bytesExact(){static const bool exact=[]{unsigned char in[256];float out[256];for(int i=0;i<256;++i)in[i]=(unsigned char)i;
   if(!OIIO::convert_pixel_values(OIIO::TypeDesc::UINT8,in,OIIO::TypeDesc::FLOAT,out,256))return false;
   for(int i=0;i<256;++i)if(out[i]!=float(i)*(1.0f/255.0f))return false;return 255.0f*(1.0f/255.0f)==1.0f;}();return exact;}
+// A value as a half float, rounded to the nearest (ties to even), where it is within their range (halfFits).
+inline bool halfFits(float v){return surface::finite(v)&&std::fabs(v)<=65504.0f;}
+inline uint16_t halfRounded(float v){uint32_t u;std::memcpy(&u,&v,4);const uint16_t sign=uint16_t((u>>16)&0x8000u);u&=0x7FFFFFFFu;
+ if(u>=0x38800000u)return uint16_t(sign|((u+0x0FFFu+((u>>13)&1u)-0x38000000u)>>13));
+ return uint16_t(sign|unsigned(std::nearbyint(std::fabs(v)*16777216.0f)));}
+// Where it is one exactly (a half-float file's values, decoded by OpenImageIO, are).
+inline bool halfExactly(float v,uint16_t& h){if(!halfFits(v))return false;h=halfRounded(v);return tex::halfValue(h)==v;}
+// One texel as a level of this format holds it (tex::texel decodes it again to the same values), checked so: a value a format
+// cannot hold exactly is an error, never a rounding, but for a float file's values in half floats (round).
+inline void storeTexel(const surface::V3& c,unsigned format,unsigned char* to,bool round=false){
+ if(tex::oneChannel(format))need(c.x==c.y&&c.y==c.z,"Grey texel not grey");
+ const float v[3]={c.x,c.y,c.z};const int n=tex::oneChannel(format)?1:3;
+ if(format==1||format==5){for(int k=0;k<n;++k){const long b=std::lround(v[k]*255.0f);need(b>=0&&b<=255&&float(b)*(1.0f/255.0f)==v[k],"8-bit texel not its byte");to[k]=(unsigned char)b;}}
+ else if(format==3||format==6){for(int k=0;k<n;++k){uint16_t h=0;
+   if(round){need(halfFits(v[k]),"Texel past half floats' range");h=halfRounded(v[k]);}else need(halfExactly(v[k],h),"Half-float texel not a half float");
+   std::memcpy(to+2*k,&h,2);}}
+ else{need(surface::finite(c),"Invalid TX sample");std::memcpy(to,v,size_t(n)*4);}}
+// A texel as it reads back from half floats rounded so.
+inline surface::V3 halfRoundedTexel(const surface::V3& c){return {tex::halfValue(halfRounded(c.x)),tex::halfValue(halfRounded(c.y)),tex::halfValue(halfRounded(c.z))};}
 // The image cache the finest levels' tiles are read through (thread-safe; half a gigabyte of the files' own tiles).
 inline std::shared_ptr<OIIO::ImageCache> lazyCache(){static std::shared_ptr<OIIO::ImageCache> c=[]{auto s=OIIO::ImageCache::create(true);
   s->attribute("max_memory_MB",512.0f);return s;}();return c;}
@@ -107,19 +126,18 @@ struct Pyramid;
 inline std::mutex& spillLock(){static auto* m=new std::mutex;return *m;}
 inline std::vector<Pyramid*>& spillList(){static auto* l=new std::vector<Pyramid*>;return *l;}
 struct Pyramid {
- tex::Image image;std::vector<std::vector<surface::V3>> tiles;
- // An 8-bit file's tiles as bytes (tex::Mip::format 1); XPU2_SESSION_FLOAT_TEXTURES=1 keeps every file in floats.
- std::vector<std::vector<unsigned char>> byteTiles;
+ tex::Image image;
+ // Its tiles, each in the pyramid's format (tex::Mip::format): an 8-bit file's in bytes, a half-float file's in half floats, a
+ // grey one's in one channel (format below); XPU2_SESSION_FLOAT_TEXTURES=1 keeps every file in three floats.
+ std::vector<std::vector<unsigned char>> byteTiles;unsigned format=0;
  std::vector<std::vector<const surface::V3*>> pages;std::atomic<uint64_t> bytes{0};
  // The finest level on demand (lazyTextures): its tiles decoded when first read (loadTile), each into a block of its own.
- std::string file;int channels=0,alphaChannel=-1,fileBase=0;bool alphaOnly=false,lazyEight=false;std::mutex lazyLock;
+ std::string file;int channels=0,alphaChannel=-1,fileBase=0;bool alphaOnly=false;std::mutex lazyLock;
  // Loaded tiles, oldest first: under memory pressure the oldest are let go (letGo), and read again if asked for again.
  struct LazyTile {std::unique_ptr<unsigned char[]> block;unsigned level,tile;size_t size;};
- std::deque<LazyTile> lazyTiles;size_t lazyBytes=0;std::atomic<unsigned> lazyLoaded{0};
- // One texel of the file as kept (channels mapped, alpha as colour), into a float tile or three bytes.
- void keep(const float* d,surface::V3* toFloat,unsigned char* toBytes){surface::V3 c;float a;texelChannels(d,channels,alphaChannel,c,a);if(alphaOnly)c={a,a,a};
-  if(toBytes){const float v[3]={c.x,c.y,c.z};for(int k=0;k<3;++k){const long b=std::lround(v[k]*255.0f);need(b>=0&&b<=255&&float(b)*(1.0f/255.0f)==v[k],"8-bit texel not its byte");toBytes[k]=(unsigned char)b;}}
-  else{need(surface::finite(c),"Invalid TX sample");*toFloat=c;}}
+ std::deque<LazyTile> lazyTiles;size_t lazyBytes=0;std::atomic<unsigned> lazyLoaded{0},lazyFlat{0},lazyWide{0};
+ // One texel of the file as kept: channels mapped, alpha as colour.
+ surface::V3 kept(const float* d)const{surface::V3 c;float a;texelChannels(d,channels,alphaChannel,c,a);if(alphaOnly)c={a,a,a};return c;}
  // A finest-level tile decoded now (tex::Mip::load): the same values the whole level gave, through OIIO's conversion.
  static void loadTile(const void* self,unsigned level,unsigned tile){auto* p=const_cast<Pyramid*>(static_cast<const Pyramid*>(self));
   // Decoded outside the lock (tiles of one texture decode side by side); the first to finish publishes its page.
@@ -133,21 +151,30 @@ struct Pyramid {
   if(!lazyCache()->get_pixels(OIIO::ustring(p->file),0,int(level)+p->fileBase,int(tx*tex::Tile),int(tx*tex::Tile+tw),int(ty*tex::Tile),int(ty*tex::Tile+th),0,1,
                               OIIO::TypeDesc::FLOAT,decoded.data()))
    throw std::runtime_error("Texture tile read: "+p->file+", tile "+std::to_string(tile)+": "+lazyCache()->geterror());
-  const size_t size=p->compressed?size_t(tex::tileBytes(2,0)):size_t(tw)*th*(p->lazyEight?3u:unsigned(sizeof(surface::V3)));
+  std::vector<surface::V3> held(size_t(tw)*th);bool flat=true,fits=true;
+  for(size_t at=0;at<held.size();++at){held[at]=p->kept(&decoded[at*p->channels]);const surface::V3& c=held[at];
+   flat=flat&&c.x==held[0].x&&c.y==held[0].y&&c.z==held[0].z;if(p->rounds)fits=fits&&halfFits(c.x)&&halfFits(c.y)&&halfFits(c.z);}
+  // A tile with a value past half floats' range held in floats (tex::widePage), the level's other tiles in half floats.
+  const bool wide=p->rounds&&!fits;const unsigned format=wide?tex::wideFormat(p->format):p->format;
+  // A flat tile, all its texels one value (a mask's black, a normal map's untouched blue): that value alone, its page marked so
+  // (tex::flatPage), on the card too. Its value is the one its texels would read: checked to be one its format holds, or rounded
+  // as they would be.
+  surface::V3 value=held[0];
+  if(flat&&!p->compressed){unsigned char check[12];storeTexel(value,format,check,p->rounds);if(p->rounds&&!wide)value=halfRoundedTexel(value);}
+  const size_t size=flat?sizeof(surface::V3):p->compressed?size_t(tex::tileBytes(2,0)):size_t(tw)*th*tex::texelBytes(format);
   std::unique_ptr<unsigned char[]> block(new unsigned char[size]);
-  if(p->compressed){std::vector<surface::V3> held(size_t(tw)*th);
-   for(size_t at=0;at<held.size();++at)p->keep(&decoded[at*p->channels],&held[at],nullptr);
-   encodeTile(held.data(),tw,th,block.get());}
-  else for(unsigned j=0;j<th;++j)for(unsigned i=0;i<tw;++i){const size_t at=size_t(j)*tw+i;
-   p->keep(&decoded[at*p->channels],p->lazyEight?nullptr:reinterpret_cast<surface::V3*>(block.get())+at,p->lazyEight?block.get()+3*at:nullptr);}
+  if(flat)std::memcpy(block.get(),&value,sizeof(surface::V3));
+  else if(p->compressed)encodeTile(held.data(),tw,th,block.get());
+  else for(size_t at=0;at<held.size();++at)storeTexel(held[at],format,block.get()+at*tex::texelBytes(format),p->rounds);
   std::lock_guard<std::mutex> g(p->lazyLock);if(page)return;
   std::atomic_thread_fence(std::memory_order_release);
-  page=reinterpret_cast<const surface::V3*>(block.get());p->lazyTiles.push_back({std::move(block),level,tile,size});p->lazyBytes+=size;p->bytes+=size;p->lazyLoaded++;}
+  page=reinterpret_cast<const surface::V3*>(reinterpret_cast<uintptr_t>(block.get())|(flat?1u:wide?2u:0u));
+  p->lazyTiles.push_back({std::move(block),level,tile,size});p->lazyBytes+=size;p->bytes+=size;p->lazyLoaded++;if(flat)p->lazyFlat++;else if(wide)p->lazyWide++;}
  size_t lazyHeld(){std::lock_guard<std::mutex> g(lazyLock);return lazyBytes;}
  // The oldest tiles, up to want bytes: their pages cleared, their blocks handed over to free once no reader has them.
  size_t letGo(size_t want,std::vector<std::unique_ptr<unsigned char[]>>& out){
   std::lock_guard<std::mutex> g(lazyLock);size_t freed=0;
-  while(freed<want&&!lazyTiles.empty()){auto& t=lazyTiles.front();pages[t.level][t.tile]=nullptr;freed+=t.size;out.push_back(std::move(t.block));lazyTiles.pop_front();lazyLoaded--;}
+  while(freed<want&&!lazyTiles.empty()){auto& t=lazyTiles.front();if(tex::flatPage(pages[t.level][t.tile]))lazyFlat--;else if(tex::widePage(pages[t.level][t.tile]))lazyWide--;pages[t.level][t.tile]=nullptr;freed+=t.size;out.push_back(std::move(t.block));lazyTiles.pop_front();lazyLoaded--;}
   lazyBytes-=freed;bytes-=freed;return freed;}
  ~Pyramid();
  // Texture overflow mode: this pyramid's levels as BC6H (tex::Mip format 2). Not a map with negative values, BC6H's unsigned.
@@ -155,6 +182,10 @@ struct Pyramid {
  // What the file holds (reportTextures): 0 8-bit, 1 half, 2 float, 3 another; and, read once from a decoded level, whether its
  // three channels are one and how much of it is flat.
  unsigned sourceFormat=3;mutable bool scanned=false,grey=false;mutable double flatShare=0;
+ // A float file held in half floats, each value rounded to the nearest: a relative error of at most 1/2048, a twentieth of an
+ // 8-bit image's step; tiles or coarser levels with a value past their range stay in floats. XPU2_SESSION_FLOAT_TEXTURES=1
+ // keeps every file in floats, as MoonRay reads them.
+ bool rounds=false;
  Pyramid(const Pyramid&)=delete;
  explicit Pyramid(const std::string& name,bool alpha=false):file(name),alphaOnly(alpha){auto in=OIIO::ImageInput::open(name);need(bool(in),"Pyramid read");pages.reserve(tex::MaxLevels);
   // Whether it is to be compressed, by a small level's values.
@@ -169,13 +200,17 @@ struct Pyramid {
    // Texture overflow mode: the levels over its side left out, the first one under it this pyramid's finest.
    if(const unsigned side=overflowSide().load();side&&std::max(w,h)>side&&!image.count){fileBase=int(level)+1;continue;}
    static const bool floats=[]{const char* v=std::getenv("XPU2_SESSION_FLOAT_TEXTURES");return v&&v[0]=='1';}();
-   const bool eight=spec.format==OIIO::TypeDesc::UINT8&&bytesExact()&&!floats&&!compressed;
    channels=spec.nchannels;alphaChannel=spec.alpha_channel;
    sourceFormat=spec.format==OIIO::TypeDesc::UINT8?0u:spec.format==OIIO::TypeDesc::HALF?1u:spec.format==OIIO::TypeDesc::FLOAT?2u:3u;
+   // Held as the file holds it: bytes, half floats or floats, one channel where it is grey (texelChannels gives grey to all three:
+   // one channel, grey and alpha, or the alpha alone), each read back as the same value (storeTexel's check).
+   const bool grey=channels==1||(channels==2&&alphaChannel==1)||alpha;
+   format=floats?0u:compressed?2u:sourceFormat==0&&bytesExact()?(grey?5u:1u):sourceFormat==1||sourceFormat==2?(grey?6u:3u):grey?4u:0u;
+   rounds=sourceFormat==2&&(format==3||format==6);
    if(!image.count&&lazyTextures()&&spec.tile_width>0){
     // The finest level read when first used (loadTile): its pages empty for now.
-    lazyEight=eight;pages.emplace_back(size_t(nx)*ny,nullptr);
-    image.levels[image.count]={w,h,pages.back().data(),0,compressed?2u:eight?1u:0u,&Pyramid::loadTile,this};++image.count;continue;}
+    pages.emplace_back(size_t(nx)*ny,nullptr);
+    image.levels[image.count]={w,h,pages.back().data(),0,format,&Pyramid::loadTile,this};++image.count;continue;}
    std::vector<float> decoded(size_t(w)*h*spec.nchannels);
    need(in->read_image(0,int(level),0,spec.nchannels,OIIO::TypeDesc::FLOAT,decoded.data()),"Stored mip decode");pages.emplace_back(nx*ny,nullptr);auto& page=pages.back();
    if(compressed){
@@ -193,22 +228,17 @@ struct Pyramid {
     work();for(auto& t:pool)t.join();if(failed)std::rethrow_exception(failed);
     for(unsigned i=0;i<nx*ny;++i){page[i]=reinterpret_cast<const surface::V3*>(byteTiles[base+i].data());bytes+=byteTiles[base+i].size();}
     image.levels[image.count]={w,h,page.data(),0,2u};++image.count;continue;}
+   // A coarser level of a float file with a value past half floats' range stays in floats.
+   bool fits=true;if(rounds)for(float v:decoded)if(!halfFits(v)){fits=false;break;}
+   const unsigned levelFormat=fits?format:tex::wideFormat(format),size=tex::texelBytes(levelFormat);
    for(unsigned y=0;y<ny;++y)for(unsigned x=0;x<nx;++x){unsigned tw=std::min(tex::Tile,w-x*tex::Tile),th=std::min(tex::Tile,h-y*tex::Tile);
-    if(eight){
-     // Three bytes a texel: each value's byte again (an 8-bit file's values are its bytes times 1/255, its fill 0 or 1).
-     byteTiles.emplace_back(size_t(tw)*th*3);auto& tile=byteTiles.back();
-     for(unsigned j=0;j<th;++j)for(unsigned i=0;i<tw;++i){size_t idx=(size_t(y*tex::Tile+j)*w+x*tex::Tile+i)*spec.nchannels;surface::V3 c;float a;
-      texelChannels(&decoded[idx],spec.nchannels,spec.alpha_channel,c,a);if(alpha)c={a,a,a};
-      unsigned char* to=&tile[size_t(j*tw+i)*3];const float v[3]={c.x,c.y,c.z};
-      for(int k=0;k<3;++k){const long b=std::lround(v[k]*255.0f);need(b>=0&&b<=255&&float(b)*(1.0f/255.0f)==v[k],"8-bit texel not its byte");to[k]=(unsigned char)b;}}
-     page[y*nx+x]=reinterpret_cast<const surface::V3*>(tile.data());bytes+=tile.size();continue;}
-    tiles.emplace_back(tw*th);auto& tile=tiles.back();
-    for(unsigned j=0;j<th;++j)for(unsigned i=0;i<tw;++i){size_t idx=(size_t(y*tex::Tile+j)*w+x*tex::Tile+i)*spec.nchannels;surface::V3 c;float a;
-     texelChannels(&decoded[idx],spec.nchannels,spec.alpha_channel,c,a);
-     // Negative values are kept, as MoonRay's texture sampler keeps them (a signed displacement or vector map).
-     if(alpha)c={a,a,a};need(surface::finite(c),"Invalid TX sample");tile[j*tw+i]=c;}
-    page[y*nx+x]=tile.data();bytes+=tile.size()*sizeof(surface::V3);
-   }image.levels[image.count]={w,h,page.data(),0,eight?1u:0u};++image.count;
+    // Each texel in the pyramid's format (an 8-bit file's values are its bytes times 1/255, its fill 0 or 1). Negative values are
+    // kept, as MoonRay's texture sampler keeps them (a signed displacement or vector map).
+    byteTiles.emplace_back(size_t(tw)*th*size);auto& tile=byteTiles.back();
+    for(unsigned j=0;j<th;++j)for(unsigned i=0;i<tw;++i){size_t idx=(size_t(y*tex::Tile+j)*w+x*tex::Tile+i)*spec.nchannels;
+     storeTexel(kept(&decoded[idx]),levelFormat,&tile[size_t(j*tw+i)*size],rounds);}
+    page[y*nx+x]=reinterpret_cast<const surface::V3*>(tile.data());bytes+=tile.size();
+   }image.levels[image.count]={w,h,page.data(),0,levelFormat};++image.count;
   }need(image.count&&image.levels[image.count-1].width==1&&image.levels[image.count-1].height==1,"Software mip level bound");
   // Realtime's view: the pyramid from its first level no wider or taller than realtimeSide() on.
   const unsigned side=realtimeSide();
@@ -305,8 +335,8 @@ struct File {
 // way of holding them would save. Greyness and flatness are read from a level of at most 1024 pixels, the first decoded, once
 // a texture: an estimate of its finest level, flat tiles more so.
 struct TextureReport {
- size_t files=0,eightBit=0,half=0,floats=0,grey=0,compressed=0;unsigned largest=0;
- uint64_t finest=0,coarser=0,decoded=0,tiles=0,tilesDecoded=0;
+ size_t files=0,eightBit=0,half=0,floats=0,grey=0,compressed=0,oneChannel=0,rounded=0;unsigned largest=0;
+ uint64_t finest=0,coarser=0,decoded=0,tiles=0,tilesDecoded=0,flatTiles=0,wideTiles=0;
  uint64_t saveGrey=0,saveHalf=0,saveFlat=0;double scanSeconds=0;
 };
 inline void scanPyramid(const Pyramid& p){
@@ -318,10 +348,9 @@ inline void scanPyramid(const Pyramid& p){
  bool grey=true;uint64_t flat=0;
  for(unsigned i=0;i<nx*ny;++i){
   const unsigned tw=std::min(tex::Tile,m.width-(i%nx)*tex::Tile),th=std::min(tex::Tile,m.height-(i/nx)*tex::Tile),n=tw*th;bool same=true;
-  if(m.format==1){const auto* t=reinterpret_cast<const unsigned char*>(m.pages[i]);
-   for(unsigned q=0;q<n;++q){const unsigned char* c=t+size_t(q)*3;if(c[0]!=c[1]||c[1]!=c[2])grey=false;if(c[0]!=t[0]||c[1]!=t[1]||c[2]!=t[2])same=false;if(!grey&&!same)break;}}
-  else{const surface::V3* t=m.pages[i];
-   for(unsigned q=0;q<n;++q){const surface::V3& c=t[q];if(c.x!=c.y||c.y!=c.z)grey=false;if(c.x!=t[0].x||c.y!=t[0].y||c.z!=t[0].z)same=false;if(!grey&&!same)break;}}
+  const unsigned tx=i%nx,x0=tx*tex::Tile,y0=(i/nx)*tex::Tile;surface::V3 first{};
+  for(unsigned q=0;q<n;++q){surface::V3 c;tex::texel(m.pages[i],m.width,tx,x0+q%tw,y0+q/tw,c,m.format);if(!q)first=c;
+   if(c.x!=c.y||c.y!=c.z)grey=false;if(c.x!=first.x||c.y!=first.y||c.z!=first.z)same=false;if(!grey&&!same)break;}
   if(same)++flat;}
  p.grey=grey;p.flatShare=double(flat)/double(nx*ny);
 }
@@ -329,7 +358,7 @@ inline TextureReport reportTextures(const std::vector<std::shared_ptr<File>>& fi
  TextureReport r;const auto began=std::chrono::steady_clock::now();
  for(const auto& f:files){if(!f||!f->pyramid)continue;const Pyramid& p=*f->pyramid;++r.files;
   if(p.sourceFormat==0)++r.eightBit;else if(p.sourceFormat==1)++r.half;else ++r.floats;
-  scanPyramid(p);if(p.grey)++r.grey;if(p.compressed)++r.compressed;
+  scanPyramid(p);if(p.grey)++r.grey;if(p.compressed)++r.compressed;if(tex::oneChannel(p.format))++r.oneChannel;if(p.rounds)++r.rounded;
   const tex::Image& view=p.view(realtime);if(!view.count)continue;
   const tex::Mip& m=view.levels[0];r.largest=std::max(r.largest,std::max(m.width,m.height));
   const unsigned nx=(m.width+tex::Tile-1)/tex::Tile,ny=(m.height+tex::Tile-1)/tex::Tile;
@@ -338,10 +367,11 @@ inline TextureReport reportTextures(const std::vector<std::shared_ptr<File>>& fi
   uint64_t coarse=0;for(unsigned l=1;l<view.count;++l)coarse+=levelBytes(view.levels[l]);
   const uint64_t held=const_cast<Pyramid&>(p).lazyHeld();
   r.finest+=level;r.coarser+=coarse;r.tiles+=uint64_t(nx)*ny;
-  if(m.load){r.decoded+=held;for(unsigned i=0;i<nx*ny;++i)if(m.pages[i])++r.tilesDecoded;}
-  if(p.grey)r.saveGrey+=(level+coarse)/3*2;
-  if(p.sourceFormat==1)r.saveHalf+=(p.grey?(level+coarse)/3:level+coarse)/2;
-  r.saveFlat+=uint64_t(double(level)*p.flatShare);
+  if(m.load){r.decoded+=held;for(unsigned i=0;i<nx*ny;++i)if(m.pages[i]){++r.tilesDecoded;if(tex::flatPage(m.pages[i]))++r.flatTiles;else if(tex::widePage(m.pages[i]))++r.wideTiles;}}
+  // What is still to be had: grey maps held in three channels, half-float ones in floats, flat tiles of a level read whole.
+  if(p.grey&&!tex::oneChannel(p.format)&&p.format!=2)r.saveGrey+=(level+coarse)/3*2;
+  if(p.sourceFormat==1&&(p.format==0||p.format==4))r.saveHalf+=(p.format==4?(level+coarse):(p.grey?(level+coarse)/3:level+coarse))/2;
+  if(!m.load)r.saveFlat+=uint64_t(double(level)*p.flatShare);
  }
  r.scanSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count();return r;
 }

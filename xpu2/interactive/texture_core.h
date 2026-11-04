@@ -39,14 +39,33 @@ enum Status:unsigned {Invalid=0,Ready=1,Miss=2};
 // tileBase numbers this level's tiles in a scene-wide tile space, so a miss can
 // name the tile it needs (async_gpu.h); zero where nothing listens for misses.
 // format: 0, three floats a texel; 1, three bytes, an 8-bit file's values (texel decodes each as OpenImageIO does, v
-// times 1/255: host_texture.h checks it is so before it stores bytes), a quarter of the memory.
+// times 1/255: host_texture.h checks it is so before it stores bytes), a quarter of the memory; 2, BC6H (below); 3, three
+// half floats, a half-float file's values as they are; 4, 5 and 6, one float, one byte or one half float, a grey file's
+// (one channel, or grey and alpha, or its alpha alone) in all three channels, as MoonRay's gray_to_rgb reads it. A float
+// file's levels are held in half floats too, each value rounded to the nearest (host_texture.h's Pyramid::rounds).
+// A flat page: a tile whose texels are all one value is held as that value alone, three floats, its page's address with its
+// lowest bit set (host_texture.h's loadTile; the card's fine-detail cache, async_gpu.h), whatever the level's format.
+// A wide page: a tile of a level in half floats with a value past their range (a sun in an HDR), held in floats instead
+// (format 0, or 4 for one channel), its address's second bit set.
 // load, loader: on the host, a level whose tiles are decoded when first read (host_texture.h's Pyramid, level 0): a page
 // not there yet is loaded by load(loader, level, page) and read then. Never on the device (its own descriptors leave it
 // null; the GPU's misses go to its tile cache).
 struct Mip {unsigned width=0,height=0;const V3* const* pages=nullptr;unsigned tileBase=0;unsigned format=0;
  void (*load)(const void*,unsigned,unsigned)=nullptr;const void* loader=nullptr;};
 // Bytes a texel of a level of this format.
-X2_HD inline unsigned texelBytes(unsigned format){return format==1?3u:format==2?1u:unsigned(sizeof(V3));}
+X2_HD inline unsigned texelBytes(unsigned format){constexpr unsigned bytes[7]={unsigned(sizeof(V3)),3u,1u,6u,4u,1u,2u};return format<7?bytes[format]:unsigned(sizeof(V3));}
+X2_HD inline bool oneChannel(unsigned format){return format>=4&&format<=6;}
+// A half float's value (IEEE binary16), exactly.
+X2_HD inline float halfValue(unsigned short h){const unsigned s=(h&0x8000u)<<16,e=(h>>10)&31u,m=h&1023u;
+ if(e==0){const float v=float(m)*(1.0f/16777216.0f);return s?-v:v;}
+ const unsigned u=s|(e==31?0x7F800000u|(m<<13):((e+112u)<<23)|(m<<13));float f;
+ const unsigned char* from=reinterpret_cast<const unsigned char*>(&u);unsigned char* to=reinterpret_cast<unsigned char*>(&f);
+ to[0]=from[0];to[1]=from[1];to[2]=from[2];to[3]=from[3];return f;}
+X2_HD inline bool flatPage(const void* page){return (reinterpret_cast<unsigned long long>(page)&1ull)!=0;}
+X2_HD inline bool widePage(const void* page){return (reinterpret_cast<unsigned long long>(page)&2ull)!=0;}
+X2_HD inline unsigned wideFormat(unsigned format){return format==6?4u:0u;}
+X2_HD inline const V3* pageAddress(const void* page){return reinterpret_cast<const V3*>(reinterpret_cast<unsigned long long>(page)&~3ull);}
+X2_HD inline const V3* flatValue(const void* page){return pageAddress(page);}
 // Bytes a tile of count texels takes. Format 2, BC6H (texture overflow mode; bc6h_core.h): a whole tile's blocks, whatever its size,
 // its texels padded to 32 x 32.
 X2_HD inline unsigned tileBytes(unsigned format,unsigned count){return format==2?bc6h::TileBytes:count*texelBytes(format);}
@@ -77,12 +96,19 @@ X2_HD inline float exp(float a){float x=clamp(a*1.4426950408889634f,-126,126);in
 X2_HD inline int address(int x,int n,bool wrap){if(wrap){int v=x%n;return v<0?v+n:v;}return x<0?0:x>=n?n-1:x;}
 // A resident page's texel.
 X2_HD inline Status texel(const V3* page,unsigned width,unsigned tx,unsigned x,unsigned y,V3& out,unsigned format=0){
+ if(flatPage(page)){out=*flatValue(page);return surface::finite(out)?Ready:Invalid;}
+ if(widePage(page)){page=pageAddress(page);format=wideFormat(format);}
  if(format==2){const unsigned lx=x%Tile,ly=y%Tile;float rgb[3];
   bc6h::texel(reinterpret_cast<const unsigned*>(reinterpret_cast<const unsigned char*>(page)+((ly/4u)*bc6h::BlocksAcross+lx/4u)*bc6h::BlockBytes),(ly%4u)*4u+lx%4u,rgb);
   out=V3{rgb[0],rgb[1],rgb[2]};return Ready;}
  unsigned stride=width-tx*Tile;if(stride>Tile)stride=Tile;const unsigned i=(y%Tile)*stride+x%Tile;
  if(format==1){const unsigned char* b=reinterpret_cast<const unsigned char*>(page)+3u*i;const float k=1.0f/255.0f;
   out=V3{float(b[0])*k,float(b[1])*k,float(b[2])*k};return Ready;}
+ if(format==3){const unsigned short* h=reinterpret_cast<const unsigned short*>(page)+3u*i;out=V3{halfValue(h[0]),halfValue(h[1]),halfValue(h[2])};
+  return surface::finite(out)?Ready:Invalid;}
+ if(format==4){const float v=reinterpret_cast<const float*>(page)[i];out=V3{v,v,v};return surface::finite(out)?Ready:Invalid;}
+ if(format==5){const float v=float(reinterpret_cast<const unsigned char*>(page)[i])*(1.0f/255.0f);out=V3{v,v,v};return Ready;}
+ if(format==6){const float v=halfValue(reinterpret_cast<const unsigned short*>(page)[i]);out=V3{v,v,v};return surface::finite(out)?Ready:Invalid;}
  out=page[i];return surface::finite(out)?Ready:Invalid;  // negative values as MoonRay keeps them
 }
 // Partial shading: a texel's parent a level up (texel x, y of level - 1 halved), where that level's page is here.
