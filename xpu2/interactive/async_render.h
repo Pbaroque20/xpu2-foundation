@@ -756,7 +756,15 @@ public:
             }
             if (cpuLane.counters.failures.load()) {
                 failure = cpuLane.failure();
-                if (failure.empty()) failure = "CPU sample failure; whole epoch must use fallback";
+                if (failure.empty()) {
+                    // Which sample: its status (1 a texture miss, 2 an error, 4 deferred) and pixel.
+                    const U64 first = cpuLane.counters.firstFailure.load();
+                    char where[96] = "";
+                    if (first != ~0ull)
+                        std::snprintf(where, sizeof where, " (status %u at pixel %u, %u)", U32(first >> 32), U32(first) % plan_->width,
+                                      U32(first) / plan_->width);
+                    failure = std::string("CPU sample failure") + where + "; whole epoch must use fallback";
+                }
             }
             if (adaptive && !draining) {
                 const U64 before = useGpu ? gpu_->launchCount() : 0;
@@ -804,6 +812,12 @@ public:
         if (cancelled) {
             result.cancelled = true;
             result.seconds = at();
+            // The frame's report as far as it went (the session's summary line read 0 samples a second and no tiles).
+            result.gpuItemsPerSecond = gpuRate;
+            if (useGpu) {
+                result.fineLoaded = gpu_->fineLoaded();
+                result.fineEvicted = gpu_->fineEvicted();
+            }
             return result;
         }
         result.drained = drained;

@@ -218,6 +218,12 @@ Design: `ASYNC.md` ("How a frame runs"), `INDEXER.md` section 7.
   reaches a light (`GpuBackend::movedLight`), however many lights move.
 - **Stand-ins.** Objects classified `Cpu` are in the GPU scene as bounding stand-ins (a VDB's box, a mesh the card's
   budget left to the CPU). A sample that meets one is deferred to the CPU lane through the deferred-samples ring.
+- **Several cards** (`multi_device.h`, `interactive/MULTI_DEVICE.md`). Each card past the first is a follower lane
+  (`GpuLane::follow`) with its own context, scene and film, fed by the same feeder from the same grid at its own rate.
+  Followers' films are added into the first card's as they are read; a card that fails to take a scene is left out.
+  With followers, partial shading and the adaptive pass chain are off. Realtime denoising goes to the first lane whose
+  OptiX denoiser works, else to Open Image Denoise on the CPU (`DenoiseEngine`). `--list-devices` lists the cards and
+  processor groups; `XPU2_CARD_LIST` and `XPU2_GROUP_LIST` choose among them; `--compile-shaders` compiles for every card.
 - **The program in modules.** OptiX compiles each module separately and in parallel, but a module's call graph
   compiles as a whole, so the program is split until no module is large. Today it has nine modules (section 12 lists
   them). Direct callables can't trace rays in OptiX 7.6, so anything that traces is a continuation callable or stays
@@ -236,7 +242,9 @@ traverses triangles, and user geometry handles curves and points. The CPU lane:
   volumes);
 - works through the retry queue: deferred GPU samples, each re-rendered whole from its identity;
 - re-renders provisional samples in full: every texture level is in RAM, so the CPU never misses;
-- keeps its own film, merged with the GPU's when the frame ends.
+- keeps its own film, merged with the GPU's when the frame ends;
+- places its workers over every chosen processor group and, on a NUMA machine, a share on each node, each thread
+  knowing its node (`multi::places`, `multi::currentNode`).
 
 Some features keep a whole scene on the CPU lane because the GPU programs lack them and they affect every sample
 (`GpuLane::cpuOnly`): today, light filters, shadow linking, lobe light sets and emissive volumes.
@@ -300,6 +308,11 @@ differ: presence shadows, shadow linking, volumes, a minimum shadow distance and
   `XPU2_SESSION_LOG_ALLOCATIONS=N` logs each allocation of N MB or more (256 by default, 0 off).
 - **Under memory pressure** the oldest decoded level-0 tiles are let go, and a scene that still does not load has its
   textures compressed (BC6H), then limited, for the session (texture overflow mode, `ASYNC.md`, "Limits a scene can meet").
+- **NUMA.** A decoded tile is kept in the heap of the node that decoded it; a card's misses are decoded on the node
+  nearest the card (`gpu::cardNode`). The pressure watch looks at each node: one short of memory moves its oldest
+  tiles to the node with the most room (`relieveNodes`, `migrate`), pointing their pages at the copies and freeing the
+  old blocks once no reader holds them, and lets go only what no node has room for. The coarse levels are not copied
+  per node (`interactive/MULTI_DEVICE.md`).
 - **A tile that cannot be read** fails the frame with its file and reason, and the scene goes to the reference renderer.
 - **The cache's budget** (`GpuLane::fineBudget`) is measured at each preparation, and again as a frame starts if the card has filled up (`fineCacheTooBig`): what the scene's level-0 tiles need,
   up to the card's free memory minus a fifth of the card (at least 1.5 GB left for the frame and the host's own use),
@@ -458,8 +471,8 @@ What the session does besides rendering:
 - **Settings from Modo.** The kit's render settings for sampling generations (Generation Samples, Halting Rule,
   Halt at Noise, First Look, Most Samples, CPU Workers) reach the scene as UserData `/modo/xpu2/generations`. Its
   form 2 says they rule: a scene's adaptive sampling is then MoonRay's alone, and XPU2 samples from Pixel Samples and
-  these settings (form 1 left an adaptive scene its own minimum, maximum and target error). The kit's Devices
-  preference sets `XPU2_SESSION_MODE`. The kit's Source Overrides (`MOONRAY_MODO_*`) apply to XPU2 as to MoonRay.
+  these settings (form 1 left an adaptive scene its own minimum, maximum and target error). The kit's Device
+  Management page (`devices.py`) sets `XPU2_SESSION_MODE`, `XPU2_CARD_LIST` and `XPU2_GROUP_LIST`. The kit's Source Overrides (`MOONRAY_MODO_*`) apply to XPU2 as to MoonRay.
 - **Limits.** Prepared geometry up to what the machine has room for, measured from the free RAM as each scene is
   prepared, between 256 MB and 64 GB (`geometryBudget`; `XPU2_SESSION_GEOMETRY_MB` fixes it), and a memory ceiling.
 - **The frame report** in the log: when the grid ran out of chunks, the GPU's launches and rate, parked samples,
@@ -556,6 +569,10 @@ Environment variables read by the session or the renderer. The defaults are the 
 | Variable | Effect |
 |---|---|
 | `XPU2_SESSION_MODE` | `0` CPU only, `1` GPU only, `2` both (default) |
+| `XPU2_CARD_LIST`, `XPU2_GROUP_LIST` | the cards (CUDA's numbers) and processor groups to use, comma-separated; unset, all |
+| `XPU2_CARDS` | the first N cards only |
+| `XPU2_SIMULATE_CARDS`, `_GROUPS`, `_NODES` | N lanes on the first card, K processor groups or K NUMA nodes from one machine's (`tools/simulate_devices.py`) |
+| `XPU2_SIMULATE_CARD_THREADS`, `_CARD_FAIL`, `_CARD_NODES`, `_NODE_MB`, `_DENOISE_FAIL`, `_SEED` | a narrower card, a card failing, cards' nodes, nodes' memory, denoisers failing, another seed (`interactive/MULTI_DEVICE.md`) |
 | `XPU2_SESSION_COARSE_FIRST` | `0` leaves out the coarse first pass of a heavy scene |
 | `XPU2_SESSION_PREP_ITEMS` | `1` logs each mesh made, its time and triangles |
 | `XPU2_SESSION_SPILL_MB` | Holds decoded texture tiles to this many MB, for tests |

@@ -148,6 +148,10 @@ public:
                     while (width < options_.launchThreads && U64(width) * 2 < U64(sms) * U64(perSm)) width *= 2;
                     options_.launchThreads = width;
                 }
+                // XPU2_SESSION_LAUNCH_THREADS caps it (a power of two from MinLaunchThreads), to measure a narrower launch.
+                if (const char* cap = std::getenv("XPU2_SESSION_LAUNCH_THREADS"))
+                    while (options_.launchThreads > MinLaunchThreads && options_.launchThreads > U32(std::max(0, std::atoi(cap))))
+                        options_.launchThreads /= 2;
                 cardThreads_ = options_.launchThreads;
             }
             lowFlags_ = device(size_t(options_.launchThreads) * sizeof(U32));

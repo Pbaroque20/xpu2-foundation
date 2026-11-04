@@ -887,11 +887,19 @@ struct CpuBackend {
         motion(data, attributes);
         instanceInto(mesh, attributes);
         const surface::V3 a = vertexOf(h.geom, data, t.a), b = vertexOf(h.geom, data, t.b), c = vertexOf(h.geom, data, t.c);
-        if (!shade::hitState(attributes, h.prim, t.a, t.b, t.c, a, b, c, h.u, h.v, h.point, ray.direction, st)) return tex::Invalid;
+        if (!shade::hitState(attributes, h.prim, t.a, t.b, t.c, a, b, c, h.u, h.v, h.point, ray.direction, st)) {
+            if (debugFailures()) std::printf("XPU2 debug: no hit state on %s (prim %u, uv %g %g, epsilon %g)\n", data.name.c_str(), h.prim, h.u, h.v, h.epsilon);
+            return tex::Invalid;
+        }
         st.geom = h.geom;
         st.worldToRender = plan.worldToRender;
         st.worldToObject = worldToObjectOf(mesh);
-        if (mesh.material >= plan.materialRecords.size()) return tex::Invalid;
+        if (mesh.material >= plan.materialRecords.size()) {
+            if (debugFailures()) std::printf("XPU2 debug: %s has material %u of %zu\n", data.name.c_str(), mesh.material, plan.materialRecords.size());
+            return tex::Invalid;
+        }
+        static std::atomic<int> epsilonTold{0};
+        if (h.epsilon > 0.0f && debugFailures() && epsilonTold.fetch_add(1) < 4) std::printf("XPU2 debug: mesh hit on %s with epsilon %g\n", data.name.c_str(), h.epsilon);
         const auto& record = plan.materialRecords[mesh.material];
         shade::hitDifferentials(attributes, h.prim, t.a, t.b, t.c, a, b, c, ray, st.pixelSamples ? st.pixelSamples : plan.spp, st);
         // Host RAM holds every level of every texture, so the CPU never misses.
@@ -1494,6 +1502,29 @@ private:
 struct CpuCounters {
     std::atomic<U64> samples{0}, chunks{0}, retried{0}, steals{0}, moves{0}, idleSpins{0}, refined{0};
     std::atomic<U32> failures{0};
+    // The frame's first failed sample: its status and pixel (status << 32 | pixel), for the fallback's message.
+    std::atomic<U64> firstFailure{~0ull};
+    void failed(SampleStatus status, U32 pixel, U32 index = 0, const mixed::Config* c = nullptr) {
+        if (failures.fetch_add(1, std::memory_order_relaxed) == 0) {
+            firstFailure.store(U64(U32(status)) << 32 | pixel, std::memory_order_relaxed);
+            if (c && std::getenv("XPU2_SESSION_DEBUG_FAILURES")) explain(*c, pixel, index);
+        }
+    }
+    // A diagnostic: the failed sample's first steps again (its filter draws and camera ray), said.
+    static void explain(const mixed::Config& c, U32 pixel, U32 index) {
+        const sample::Identity root{pixel, index, c.seed, 0};
+        float x = 0, y = 0;
+        const bool fx = surface::filter(c.filter, c.filterWidth, sample::draw(root, 0, c.sampling), x);
+        const bool fy = surface::filter(c.filter, c.filterWidth, sample::draw(root, 1, c.sampling), y);
+        const float lensU = c.camera.dof ? sample::draw(root, 2, c.sampling) : 0.0f, lensV = c.camera.dof ? sample::draw(root, 3, c.sampling) : 0.0f;
+        const float time = c.motionBlur ? sample::draw(root, 4, c.sampling) : 0.0f;
+        surface::Ray ray;
+        const auto made = surface::cameraSample(c.camera, float(pixel % c.width) + x, float(pixel / c.width) + y, lensU, lensV, time, ray);
+        std::printf("XPU2 debug: failed sample pixel %u, %u index %u: filter %d %d (%g %g), lens %g %g, time %g, camera %u, ray %g %g %g -> %g %g %g\n",
+                    pixel % c.width, pixel / c.width, index, int(fx), int(fy), x, y, lensU, lensV, time, unsigned(made), ray.origin.x,
+                    ray.origin.y, ray.origin.z, ray.direction.x, ray.direction.y, ray.direction.z);
+        std::fflush(stdout);
+    }
     // Telemetry (TEL-01), microseconds from the lane's start.
     std::atomic<U64> busyMicros{0}, slowestChunkMicros{0}, firstClaimMicros{~0ull}, lastClaimMicros{0};
 };
@@ -1560,7 +1591,7 @@ inline U64 renderChunk(const CpuScene& scene, const mixed::Config& config, const
                 continue;
             }
             if (status != SampleStatus::Done) {
-                counters.failures.fetch_add(1, std::memory_order_relaxed);
+                counters.failed(status, pixels[p], index, &config);
                 continue;
             }
             if (timing) heat[p] += std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
@@ -1624,6 +1655,7 @@ public:
         counters.samples = counters.chunks = counters.retried = counters.steals = counters.moves = counters.idleSpins = 0;
         counters.refined = 0;
         counters.failures = 0;
+        counters.firstFailure = ~0ull;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             failure_.clear();
@@ -1736,7 +1768,7 @@ private:
                         const SampleStatus status = integrateCpu(config_, retry[i].pixel, retry[i].index, backend, r);
                         if (status == SampleStatus::Skip) continue;
                         if (status != SampleStatus::Done) {
-                            counters.failures.fetch_add(1, std::memory_order_relaxed);
+                            counters.failed(status, retry[i].pixel);
                             continue;
                         }
                         film.addOne(retry[i].pixel, retry[i].index, r);
@@ -1775,7 +1807,7 @@ private:
                         film.settle(refine[i].pixel, refine[i].rgba);
                         if (status == SampleStatus::Skip) continue;
                         if (status != SampleStatus::Done) {
-                            counters.failures.fetch_add(1, std::memory_order_relaxed);
+                            counters.failed(status, refine[i].pixel);
                             continue;
                         }
                         film.addOne(refine[i].pixel, refine[i].index, r);

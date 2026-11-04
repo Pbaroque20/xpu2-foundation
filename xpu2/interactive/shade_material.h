@@ -125,8 +125,19 @@ X2_CALL bool hitState(const MeshAttributes& m, U32 prim, U32 ia, U32 ib, U32 ic,
     // A reflected instance: its reference's face normal through the transform (transformNormal), which is the placed
     // triangle's turned over.
     if (m.instance == 2) ng = -ng;
-    const float l = length(ng);
-    if (!(l > 0)) return false;
+    float l = length(ng);
+    if (!(l > 0)) {
+        // A sliver the ray still hits (Embree and OptiX test it their own way) whose edges' cross product rounds to zero
+        // in float: in double, else facing the ray. Before, the sample failed and the whole frame fell back to MoonRay.
+        const double ux = double(b.x) - a.x, uy = double(b.y) - a.y, uz = double(b.z) - a.z;
+        const double vx = double(c.x) - a.x, vy = double(c.y) - a.y, vz = double(c.z) - a.z;
+        const double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const double dl = sqrt(nx * nx + ny * ny + nz * nz);
+        ng = dl > 0 ? V3{float(nx / dl), float(ny / dl), float(nz / dl)} : -rayDir;
+        if (dl > 0 && m.instance == 2) ng = -ng;
+        l = length(ng);
+        if (!(l > 0)) return false;
+    }
     st.Ng = ng / l;
     float st1[2] = {0, 0}, st2[2] = {1, 0}, st3[2] = {1, 1};
     if (m.uvRate != RateNone && m.uvs) {
