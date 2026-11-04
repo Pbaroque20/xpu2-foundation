@@ -198,12 +198,15 @@ Design: `ASYNC.md` ("How a frame runs"), `INDEXER.md` section 7.
     which counted the largest callable twice. The map callable reports 24 bytes, below its PTX frames, so it is given
     at least 4 KB.
   - The continuation stack covers the volume module's callables only where the scene can call them (`fitStack`, as
-    a frame begins): volume ones with volumes, subsurface with a DwaBase-family material, the only ones with subsurface.
+    a frame begins): volume ones with volumes, subsurface where a material scatters under its surface (a DwaBase-family
+    material whose subsurface model is not none, `cpu::Plan::subsurface`). Any DwaBase material kept it before, some
+    3.5 GB of a 24 GB card.
   - A map program's registers live in each thread's scratch, sized by the scene's largest program
     (`X2_MAP_REGISTERS`), not 3 KB on the stack at every material call.
   - The rest of the scratch is the scene's: AOVs, Cryptomatte, DwaBase slots, glitter and moving lights only where used.
     The Bsdf (10.6 KB) and the pending rays (8 KB) are fixed: smaller ones would change the picture.
-  - The parked-sample queue is sized by the frame, and is a token where the scene has no textures (`sizeParked`).
+  - The parked-sample queue is sized by the frame, and is a token where no sample can park: a scene with no fine-detail
+    tiles, or a frame with partial shading, which shades a missed tile from a coarser level instead (`sizeParked`).
   On an RTX 3090 a scene with plain materials went from 10.9 GB to 4.5 GB, subsurface and normal maps from 11.1 to
   5.7–6.6 GB, fog 11.1 to 5.7 GB and 9 Spheres 12.1 to 7.5 GB, at the same speed, the pictures within each build's own
   run-to-run noise, and no OptiX exception on eight scenes in the exceptions build. `XPU2_ASYNC_STACKS=1` logs each
@@ -287,9 +290,14 @@ differ: presence shadows, shadow linking, volumes, a minimum shadow distance and
   files on disk are the system of record. The CPU lane reads RAM
   directly. Since 2026-10-26 the finest level (level 0) is decoded tile by tile the first time it is read
   (`Pyramid::loadTile`, through an OpenImageIO ImageCache), the coarser levels as the scene is prepared;
-  `XPU2_SESSION_EAGER_TEXTURES=1` decodes them all at once. 8-bit files are kept as bytes (`tex::Mip::format`).
+  `XPU2_SESSION_EAGER_TEXTURES=1` decodes them all at once. Texels are kept small (`tex::Mip::format`, `texture_core.h`):
+  8-bit files as bytes, float files in half floats (each value rounded to the nearest; a tile with a value past their
+  range, such as a sun, stays in floats), grey files in one channel, and a tile of one value as that value alone. A
+  scene's textures take about a third of the memory they did as floats.
 - **VRAM** holds every texture's levels 1 and up for the whole session, plus a cache of level-0 (fine-detail) tiles,
-  loaded on demand and evicted least recently used.
+  loaded on demand and evicted least recently used. The cache gives each tile size the scene's formats have slots of
+  their own, and grows as tiles are read, up to its budget, rather than taking the budget at once.
+  `XPU2_SESSION_LOG_ALLOCATIONS=N` logs each allocation of N MB or more (256 by default, 0 off).
 - **Under memory pressure** the oldest decoded level-0 tiles are let go, and a scene that still does not load has its
   textures compressed (BC6H), then limited, for the session (texture overflow mode, `ASYNC.md`, "Limits a scene can meet").
 - **A tile that cannot be read** fails the frame with its file and reason, and the scene goes to the reference renderer.
