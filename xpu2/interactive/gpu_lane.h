@@ -30,7 +30,7 @@ struct Driver {
  // Allocation caps guard against runaway use; the asynchronous lane raises them for its tile cache.
  size_t deviceBytes=0,pinnedBytes=0,peakDevice=0,peakPinned=0,deviceCap=256ull<<20,pinnedCap=64ull<<20;unsigned synchronizations=0;uint64_t allocations=0,frees=0;std::thread::id owner=std::this_thread::get_id();
 #define API(n) decltype(&n) n##_p=nullptr;
- API(cuInit) API(cuDeviceGet) API(cuDeviceGetName) API(cuCtxGetCurrent) API(cuCtxSetCurrent) API(cuCtxCreate_v2) API(cuCtxDestroy_v2) API(cuCtxSynchronize)
+ API(cuInit) API(cuDeviceGet) API(cuDeviceGetCount) API(cuDeviceGetName) API(cuCtxGetCurrent) API(cuCtxSetCurrent) API(cuCtxCreate_v2) API(cuCtxDestroy_v2) API(cuCtxSynchronize)
  API(cuMemAlloc_v2) API(cuMemFree_v2) API(cuMemAllocHost_v2) API(cuMemFreeHost) API(cuMemcpyHtoDAsync_v2) API(cuMemcpyDtoHAsync_v2)
  API(cuStreamCreate) API(cuStreamDestroy_v2) API(cuStreamWaitEvent) API(cuEventCreate) API(cuEventRecord) API(cuEventQuery) API(cuEventDestroy_v2)
  API(cuMemsetD8Async) API(cuMemsetD32Async) API(cuDeviceGetAttribute) API(cuEventElapsedTime) API(cuMemcpyDtoDAsync_v2)
@@ -38,21 +38,28 @@ struct Driver {
 #undef API
  static void check(CUresult e){if(e!=CUDA_SUCCESS)throw std::runtime_error("CUDA error "+std::to_string(e));}
  void thread()const{cpu::need(std::this_thread::get_id()==owner,"GPU context requires feeder owner");}
- Driver(){auto start=StartClock::now();try{
+ // ordinal: the graphics card (CUDA's numbering; multi_device.h), the first by default.
+ int ordinal=0;
+ explicit Driver(int card=0):ordinal(card){auto start=StartClock::now();try{
   wchar_t path[MAX_PATH];auto n=GetSystemDirectoryW(path,MAX_PATH);cpu::need(n&&n<MAX_PATH-12,"System DLL path");std::wstring file(path);file+=L"\\nvcuda.dll";library=LoadLibraryW(file.c_str());cpu::need(library,"CUDA driver unavailable");
 #define LOAD(n) n##_p=reinterpret_cast<decltype(n##_p)>(GetProcAddress(library,#n));cpu::need(n##_p,#n);
- LOAD(cuInit) LOAD(cuDeviceGet) LOAD(cuDeviceGetName) LOAD(cuCtxGetCurrent) LOAD(cuCtxSetCurrent) LOAD(cuCtxCreate_v2) LOAD(cuCtxDestroy_v2) LOAD(cuCtxSynchronize)
+ LOAD(cuInit) LOAD(cuDeviceGet) LOAD(cuDeviceGetCount) LOAD(cuDeviceGetName) LOAD(cuCtxGetCurrent) LOAD(cuCtxSetCurrent) LOAD(cuCtxCreate_v2) LOAD(cuCtxDestroy_v2) LOAD(cuCtxSynchronize)
  LOAD(cuMemAlloc_v2) LOAD(cuMemFree_v2) LOAD(cuMemAllocHost_v2) LOAD(cuMemFreeHost) LOAD(cuMemcpyHtoDAsync_v2) LOAD(cuMemcpyDtoHAsync_v2)
  LOAD(cuStreamCreate) LOAD(cuStreamDestroy_v2) LOAD(cuStreamWaitEvent) LOAD(cuEventCreate) LOAD(cuEventRecord) LOAD(cuEventQuery) LOAD(cuEventDestroy_v2)
  LOAD(cuMemsetD8Async) LOAD(cuMemsetD32Async) LOAD(cuDeviceGetAttribute) LOAD(cuEventElapsedTime) LOAD(cuMemcpyDtoDAsync_v2)
  LOAD(cuModuleLoadData) LOAD(cuModuleGetFunction) LOAD(cuModuleUnload) LOAD(cuLaunchKernel)
 #undef LOAD
-  check(cuInit_p(0));CUdevice dev;check(cuDeviceGet_p(&dev,0));check(cuCtxGetCurrent_p(&previous));check(cuCtxCreate_v2_p(&context,0,dev));startupSeconds=startLap(start);
+  check(cuInit_p(0));CUdevice dev;check(cuDeviceGet_p(&dev,ordinal));check(cuCtxGetCurrent_p(&previous));check(cuCtxCreate_v2_p(&context,0,dev));startupSeconds=startLap(start);
  }catch(...){if(context)cuCtxDestroy_v2_p(context);if(library)FreeLibrary(library);throw;}}
  // Blocking is restricted to startup, shutdown or aborting a failed epoch.
  void drain(){thread();++synchronizations;check(cuCtxSynchronize_p());}
  ~Driver(){if(context){cuCtxDestroy_v2_p(context);if(previous)cuCtxSetCurrent_p(previous);}if(library)FreeLibrary(library);}
 };
+// The graphics cards CUDA finds (0: none, or no driver), without making a context.
+inline int cardCount(){HMODULE library=nullptr;wchar_t path[MAX_PATH];auto n=GetSystemDirectoryW(path,MAX_PATH);if(!n||n>=MAX_PATH-12)return 0;
+ std::wstring file(path);file+=L"\\nvcuda.dll";library=LoadLibraryW(file.c_str());if(!library)return 0;
+ auto init=reinterpret_cast<decltype(&cuInit)>(GetProcAddress(library,"cuInit"));auto count=reinterpret_cast<decltype(&cuDeviceGetCount)>(GetProcAddress(library,"cuDeviceGetCount"));
+ int cards=0;if(!init||!count||init(0)!=CUDA_SUCCESS||count(&cards)!=CUDA_SUCCESS)cards=0;FreeLibrary(library);return cards;}
 // What the lane is allocating, for the Terminal's memory lines (Buffer): named where a large allocation is made.
 inline thread_local const char* allocating=nullptr;
 struct Allocating {const char* before;explicit Allocating(const char* what):before(allocating){allocating=what;}~Allocating(){allocating=before;}

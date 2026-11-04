@@ -16,6 +16,7 @@
 // the work as @@MODO_TILES, the work grid's cells being rendered (its cellular rules move the CPU's workers from cell
 // to cell), @@MODO_WORKERS: each CPU worker's 8-pixel tile, and @@MODO_GPU_WORKERS: the cells the GPU's queued
 // launches hold (the private kit draws them in a colour of their own).
+#include <OpenImageDenoise/oidn.h>  // types only: the library is loaded at run time (CpuDenoiser)
 #include "async_render.h"
 #include "../../native-port/modo_protocol_line.h"
 #include "../../native-port/modo_scene_memory.h"
@@ -235,8 +236,15 @@ Programs programs(const fs::path& folder) {
             fileText(folder / "dwalobes" / "async_dwalobes.ptx"), fileText(folder / "extras" / "async_extras.ptx")};
 }
 
-std::unique_ptr<async::GpuLane> gpuLane(const Programs& p, std::function<void(unsigned, unsigned)> progress = {}) {
+// card: the graphics card, CUDA's numbering (multi_device.h).
+// lane: its place among the lanes (0 the first); XPU2_SIMULATE_CARD_THREADS narrows it as a smaller card would be.
+std::unique_ptr<async::GpuLane> gpuLane(const Programs& p, std::function<void(unsigned, unsigned)> progress = {}, int card = 0,
+                                        int lane = 0) {
     async::GpuOptions options;
+    options.device = card;
+    options.lane = lane;
+    if (const unsigned threads = multi::simulatedEntry("XPU2_SIMULATE_CARD_THREADS", size_t(lane)))
+        options.launchThreads = std::min(options.launchThreads, threads);
     options.compileProgress = std::move(progress);
     options.mapsPtx = p.maps;
     options.lightsPtx = p.lights;
@@ -305,12 +313,20 @@ int compileShaders(const fs::path& folder) {
         std::cout << "MoonRay XPU2 shaders: compiling (about an hour the first time; at once when OptiX's cache has them)"
                   << std::endl;
         double last = 0;
-        gpuLane(p, [&](unsigned done, unsigned waiting) {
+        auto progress = [&](unsigned done, unsigned waiting) {
             if (seconds() - last < 10) return;
             last = seconds();
             std::printf("MoonRay XPU2 shaders: %u compile tasks done, %u waiting, %.0f s\n", done, waiting, last);
             std::fflush(stdout);
-        });
+        };
+        // Each graphics card used (multi_device.h): OptiX's cache holds the programs for each kind of card.
+        const std::vector<int> cards = multi::cardOrdinals(gpu::cardCount());
+        gpuLane(p, progress, cards.empty() ? 0 : cards[0]);
+        for (size_t k = 1; k < cards.size(); ++k)
+            if (cards[k] != cards[0]) {
+                std::printf("MoonRay XPU2 shaders: graphics card %d\n", cards[k]);
+                gpuLane(p, progress, cards[k]);
+            }
         markCompiled(p);
         std::printf("MoonRay XPU2 shaders: compiled in %.0f s\n", seconds());
         return 0;
@@ -1182,6 +1198,184 @@ bool envOn(const char* name, bool otherwise) {
     return v ? std::string(v) == "1" : otherwise;
 }
 
+// Open Image Denoise on the processor, for a machine none of whose graphics cards runs OptiX's denoiser: its RT filter
+// at its fast quality, loaded from MoonRay's runtime beside XPU2's (libOpenImageDenoise-2.dll and its CPU device). The
+// guides as the GPU's denoiser takes them (XPU2_SESSION_RT_GUIDES; clean: the albedo denoised on its own first).
+class CpuDenoiser {
+public:
+    CpuDenoiser() {
+        const char* guides = std::getenv("XPU2_SESSION_RT_GUIDES");
+        const char* cleaned = std::getenv("MOONRAY_MODO_DENOISE_CLEAN_GUIDES");
+        mode_ = guides ? std::string(guides) : cleaned && cleaned[0] == '0' ? "raw" : "clean";
+    }
+    ~CpuDenoiser() {
+        if (device_ && releaseDevice_) releaseDevice_(device_);
+        if (library_) FreeLibrary(library_);
+    }
+    CpuDenoiser(const CpuDenoiser&) = delete;
+    bool run(const float* color, const float* albedo, const float* normal, float* out, U32 w, U32 h, std::string& error) {
+        if (!load(error)) return false;
+        const size_t n = size_t(w) * h * 3;
+        const bool withAlbedo = mode_ == "raw" || mode_ == "clean", withNormal = mode_ != "none";
+        std::vector<float> cleanAlbedo;
+        if (withAlbedo && mode_ == "clean") {
+            cleanAlbedo.resize(n);
+            if (!filter(albedo, nullptr, nullptr, cleanAlbedo.data(), w, h, false, error)) return false;
+        }
+        const float* a = withAlbedo ? (cleanAlbedo.empty() ? albedo : cleanAlbedo.data()) : nullptr;
+        return filter(color, a, withNormal ? normal : nullptr, out, w, h, true, error);
+    }
+
+private:
+    bool filter(const float* color, const float* albedo, const float* normal, float* out, U32 w, U32 h, bool hdr, std::string& error) {
+        OIDNFilter f = newFilter_(device_, "RT");
+        auto image = [&](const char* name, const float* data) {
+            setImage_(f, name, const_cast<float*>(data), OIDN_FORMAT_FLOAT3, w, h, 0, 3 * sizeof(float), size_t(w) * 3 * sizeof(float));
+        };
+        image("color", color);
+        if (albedo) image("albedo", albedo);
+        if (normal) image("normal", normal);
+        image("output", out);
+        setBool_(f, "hdr", hdr);
+        if (albedo || normal) setBool_(f, "cleanAux", mode_ == "clean");
+        setInt_(f, "quality", OIDN_QUALITY_FAST);
+        commitFilter_(f);
+        executeFilter_(f);
+        releaseFilter_(f);
+        const char* message = nullptr;
+        if (deviceError_(device_, &message) != OIDN_ERROR_NONE) {
+            error = std::string("Open Image Denoise: ") + (message ? message : "failed");
+            return false;
+        }
+        return true;
+    }
+    bool load(std::string& error) {
+        if (device_) return true;
+        if (tried_) {
+            error = loadError_;
+            return false;
+        }
+        tried_ = true;
+        wchar_t exe[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        const fs::path here = n && n < MAX_PATH ? fs::path(exe).parent_path() : fs::current_path();
+        // Beside XPU2, in MoonRay's runtime beside XPU2's (an installed kit), or where XPU2_SESSION_OIDN_DIR says.
+        std::vector<fs::path> places{here / "libOpenImageDenoise-2.dll", here.parent_path() / "runtime" / "libOpenImageDenoise-2.dll"};
+        if (const char* dir = std::getenv("XPU2_SESSION_OIDN_DIR")) places.push_back(fs::path(dir) / "libOpenImageDenoise-2.dll");
+        for (const fs::path& dll : places)
+            if (!library_ && fs::exists(dll)) library_ = LoadLibraryExW(dll.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!library_) {
+            error = loadError_ = "Open Image Denoise not found beside XPU2 or in MoonRay's runtime";
+            return false;
+        }
+#define OIDN_LOAD(field, name) field = reinterpret_cast<decltype(field)>(GetProcAddress(library_, #name)); if (!field) { error = loadError_ = "Open Image Denoise lacks " #name; return false; }
+        OIDN_LOAD(newDevice_, oidnNewDevice)
+        OIDN_LOAD(commitDevice_, oidnCommitDevice)
+        OIDN_LOAD(releaseDevice_, oidnReleaseDevice)
+        OIDN_LOAD(deviceError_, oidnGetDeviceError)
+        OIDN_LOAD(newFilter_, oidnNewFilter)
+        OIDN_LOAD(setImage_, oidnSetSharedFilterImage)
+        OIDN_LOAD(setBool_, oidnSetFilterBool)
+        OIDN_LOAD(setInt_, oidnSetFilterInt)
+        OIDN_LOAD(commitFilter_, oidnCommitFilter)
+        OIDN_LOAD(executeFilter_, oidnExecuteFilter)
+        OIDN_LOAD(releaseFilter_, oidnReleaseFilter)
+#undef OIDN_LOAD
+        device_ = newDevice_(OIDN_DEVICE_TYPE_CPU);
+        if (!device_) {
+            error = loadError_ = "Open Image Denoise has no processor device";
+            return false;
+        }
+        commitDevice_(device_);
+        const char* message = nullptr;
+        if (deviceError_(device_, &message) != OIDN_ERROR_NONE) {
+            error = loadError_ = std::string("Open Image Denoise: ") + (message ? message : "no device");
+            releaseDevice_(device_);
+            device_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+    std::string mode_, loadError_;
+    bool tried_ = false;
+    HMODULE library_ = nullptr;
+    OIDNDevice device_ = nullptr;
+    decltype(&oidnNewDevice) newDevice_ = nullptr;
+    decltype(&oidnCommitDevice) commitDevice_ = nullptr;
+    decltype(&oidnReleaseDevice) releaseDevice_ = nullptr;
+    decltype(&oidnGetDeviceError) deviceError_ = nullptr;
+    decltype(&oidnNewFilter) newFilter_ = nullptr;
+    decltype(&oidnSetSharedFilterImage) setImage_ = nullptr;
+    decltype(&oidnSetFilterBool) setBool_ = nullptr;
+    decltype(&oidnSetFilterInt) setInt_ = nullptr;
+    decltype(&oidnCommitFilter) commitFilter_ = nullptr;
+    decltype(&oidnExecuteFilter) executeFilter_ = nullptr;
+    decltype(&oidnReleaseFilter) releaseFilter_ = nullptr;
+};
+
+// Realtime's denoiser on whichever device can (multi_device.h): OptiX's on the first graphics card that runs it, the
+// first card first and then the others, and Open Image Denoise on the processor where none does. A device that fails
+// hands its pictures on to the next for the rest of the session, and the Terminal says where they went.
+class DenoiseEngine {
+public:
+    DenoiseEngine(async::GpuLane* first, bool upscale) {
+        if (first) {
+            cards_.push_back(std::make_unique<async::GpuLane::Denoiser>(*first, upscale));
+            names_.push_back(first->lane());
+            for (const auto& f : first->followers()) {
+                keep_.push_back(f);  // the card's lane outlives its denoiser, should the card be left out meanwhile
+                cards_.push_back(std::make_unique<async::GpuLane::Denoiser>(*f, upscale));
+                names_.push_back(f->lane());
+            }
+        }
+    }
+    // Whether the last picture came out twice its size each way (OptiX's upscaling model).
+    bool upscaled() const { return upscaled_; }
+    bool run(const float* color, const float* albedo, const float* normal, float* out, U32 w, U32 h, std::string& error) {
+        while (at_ < cards_.size()) {
+            std::string failed;
+            // Simulation: XPU2_SIMULATE_DENOISE_FAIL=N, the first N cards' OptiX denoisers fail (multi_device.h).
+            if (at_ < multi::simulated("XPU2_SIMULATE_DENOISE_FAIL")) failed = "failed (simulated, XPU2_SIMULATE_DENOISE_FAIL)";
+            else if (cards_[at_]->run(color, albedo, normal, out, w, h, failed)) {
+                upscaled_ = cards_[at_]->upscales();
+                said("OptiX on lane " + std::to_string(names_[at_]));
+                return true;
+            }
+            ++at_;
+            std::printf("MoonRay XPU2: OptiX's denoiser on lane %d: %s; realtime pictures are denoised %s\n", names_[at_ - 1],
+                        failed.c_str(), at_ < cards_.size() ? ("on lane " + std::to_string(names_[at_])).c_str()
+                                                             : "by Open Image Denoise on the processor");
+            std::fflush(stdout);
+        }
+        upscaled_ = false;
+        const bool ok = cpu_.run(color, albedo, normal, out, w, h, error);
+        if (ok) said("Open Image Denoise on the processor");
+        else if (!cpuFailed_) {
+            cpuFailed_ = true;
+            std::printf("MoonRay XPU2: Open Image Denoise on the processor: %s; realtime pictures are not denoised\n", error.c_str());
+            std::fflush(stdout);
+        }
+        return ok;
+    }
+
+private:
+    // Once a device: the Terminal says which denoises realtime's pictures.
+    void said(const std::string& where) {
+        if (where == saidWhere_) return;
+        saidWhere_ = where;
+        std::printf("MoonRay XPU2: realtime pictures denoised by %s\n", where.c_str());
+        std::fflush(stdout);
+    }
+    std::string saidWhere_;
+    bool cpuFailed_ = false;
+    std::vector<std::shared_ptr<async::GpuLane>> keep_;  // before cards_: let go after the denoisers on them
+    std::vector<std::unique_ptr<async::GpuLane::Denoiser>> cards_;
+    std::vector<int> names_;
+    size_t at_ = 0;
+    bool upscaled_ = false;
+    CpuDenoiser cpu_;
+};
+
 // Realtime's pictures denoised in the session, where the kit's Denoised Beauty is chosen with RT on: OptiX's denoiser
 // on the GPU (async::GpuLane::Denoiser), with the first hits' albedo and normal (the kit's denoiser guides), on a
 // thread of its own so that the GPU is fed meanwhile. The newest picture wins: one asked for while another is being
@@ -1204,7 +1398,8 @@ public:
     };
     using Publish = std::function<void(const Picture&, const std::vector<float>&)>;
     // The half-size pictures denoised by OptiX's upscaling model, made at their own size (Denoiser upscale).
-    RealtimeDenoiser(async::GpuLane& lane, Publish publish) : engine_(lane), half_(lane, true), publish_(std::move(publish)) {
+    // lane: the first graphics card's (null: none); the pictures go to whichever device can (DenoiseEngine).
+    RealtimeDenoiser(async::GpuLane* lane, Publish publish) : engine_(lane, false), half_(lane, true), publish_(std::move(publish)) {
         thread_ = std::thread([this] { loop(); });
     }
     ~RealtimeDenoiser() {
@@ -1291,10 +1486,12 @@ private:
             return true;
         }
         auto& engine = p.shownWidth ? half_ : engine_;
-        // Upscaled by the denoiser itself: twice the half size each way, cut to the size shown (an odd side's pixel over).
-        const bool twice = p.shownWidth && half_.upscales();
-        if (twice) out.resize(size_t(p.width) * p.height * 12);
+        // Upscaled by the denoiser itself: twice the half size each way, cut to the size shown (an odd side's pixel over),
+        // where the device that took it has OptiX's upscaling model.
+        if (p.shownWidth) out.resize(size_t(p.width) * p.height * 12);
         if (!engine.run(p.color.data(), p.albedo.data(), p.normal.data(), out.data(), p.width, p.height, error_)) return false;
+        const bool twice = p.shownWidth && engine.upscaled();
+        if (p.shownWidth && !twice) out.resize(n);
         if (twice) out = cut(out, 2 * p.width, p.shownWidth, p.shownHeight);
         if (p.shownWidth && !said_) {
             // Once a session: how realtime's pictures from a quarter of their pixels are made full size.
@@ -1337,7 +1534,7 @@ private:
         return out;
     }
 
-    async::GpuLane::Denoiser engine_, half_;
+    DenoiseEngine engine_, half_;
     bool said_ = false;
     Publish publish_;
     std::thread thread_;
@@ -1501,6 +1698,22 @@ int session(const Args& args, const fs::path& directory) {
                     });
                     try {
                         gpu = gpuLane(p);
+                        // The other graphics cards (multi_device.h), each a lane following the first; a card that
+                        // cannot make one is left out.
+                        const std::vector<int> cards = multi::cardOrdinals(gpu::cardCount());
+                        for (size_t k = 1; k < cards.size(); ++k) {
+                            try {
+                                gpu->follow(gpuLane(p, {}, cards[k], int(k)));
+                                std::printf("MoonRay XPU2: graphics card %d (lane %zu) renders with the first%s\n", cards[k], k,
+                                            cards[k] == cards[0] ? " (simulated, XPU2_SIMULATE_CARDS)" : "");
+                            } catch (const std::exception& e) {
+                                gpu->use();
+                                std::printf("MoonRay XPU2: graphics card %d left out: %s\n", cards[k], e.what());
+                            }
+                        }
+                        if (multi::spread())
+                            std::printf("MoonRay XPU2: %zu processor groups, %u logical processors%s\n", multi::groups().size(),
+                                        multi::logicalProcessors(), multi::simulated("XPU2_SIMULATE_GROUPS") > 1 ? " (simulated, XPU2_SIMULATE_GROUPS)" : "");
                     } catch (...) {
                         loaded.store(true);
                         guard.join();
@@ -1750,8 +1963,10 @@ int session(const Args& args, const fs::path& directory) {
                     }
                     return p;
                 };
-                if (rtAlbedo && rtNormal && gpu && gpuUsable && !denoiser)
-                    denoiser = std::make_unique<RealtimeDenoiser>(*gpu, [&](const RealtimeDenoiser::Picture& p, const std::vector<float>& out) {
+                // On whichever device can denoise (DenoiseEngine): a scene the graphics cards leave to the processor
+                // is denoised on a card all the same, and a machine with none, on the processor.
+                if (rtAlbedo && rtNormal && !denoiser)
+                    denoiser = std::make_unique<RealtimeDenoiser>(gpu.get(), [&](const RealtimeDenoiser::Picture& p, const std::vector<float>& out) {
                         std::lock_guard<std::mutex> lock(sharedMutex);
                         if (p.id != liveId || !useShared) return;
                         shared.publish(p.id, p.view, p.shownWidth ? p.shownWidth : p.width, p.shownWidth ? p.shownHeight : p.height,
@@ -1812,7 +2027,7 @@ int session(const Args& args, const fs::path& directory) {
                     }
                 };
                 async::RenderOptions options;
-                options.threads = args.threads ? args.threads : std::max(1u, std::thread::hardware_concurrency());
+                options.threads = args.threads ? args.threads : multi::logicalProcessors();  // every processor group's (multi_device.h)
                 options.mode = gpu && gpuUsable ? mode : 0;  // a scene the GPU leaves to the CPU (cpuOnly): the CPU alone
                 options.deviceChain = deviceChain;
                 options.cellular = cellular;

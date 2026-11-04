@@ -118,7 +118,7 @@ struct RenderResult {
     std::shared_ptr<aov::CryptoBuffer> crypto;
     // The display filter outputs' pixels by output name (aov_display.h), three floats a pixel, rows from the bottom.
     std::map<std::string, std::vector<float>> displayFilters;
-    U64 cpuSamples = 0, gpuSamples = 0, parkedRun = 0, launches = 0, cpuSteals = 0, cpuMoves = 0,
+    U64 cpuSamples = 0, gpuSamples = 0, parkedRun = 0, launches = 0, cardLaunches = 0 /* the other graphics cards' (multi_device.h) */, cpuSteals = 0, cpuMoves = 0,
         gpuStolenChunks = 0, fineLoaded = 0, fineEvicted = 0;
     double seconds = 0, gpuItemsPerSecond = 0, cpuSamplesPerSecond = 0;
     unsigned cpuWorkers = 0;
@@ -312,7 +312,7 @@ public:
         RefineQueue refines;
         const U32 itemsPerChunk = gridOptions.samplesPerChunk * TilePixels;
         const bool chainFrame = adaptive && useGpu && o.deviceChain && !o.cellular && !plan_->sampleBudget && !standIns && gpu_->hasChain();
-        const bool partial = o.partial && useGpu && !chainFrame;
+        const bool partial = o.partial && useGpu && !chainFrame && gpu_->followers().empty();  // one card's alone
         if (partial) film.initSettled();
         if (useGpu) gpu_->begin(gridOptions.samplesPerChunk, adaptive, partial);
         Adaptive state(*plan_, gridOptions.samplesPerChunk, o.cellular);
@@ -357,9 +357,16 @@ public:
         } pin;
         unsigned workers = !useCpu ? 0 : (useGpu && o.reserveFeederCore && o.threads > 1 ? o.threads - 1 : o.threads);
         // Low latency: a processor thread left free for Modo besides the feeder's.
-        if (workers && modest) workers = std::min(workers, std::max(1u, std::thread::hardware_concurrency() - (useGpu ? 2u : 1u)));
+        if (workers && modest) workers = std::min(workers, std::max(1u, multi::logicalProcessors() - (useGpu ? 2u : 1u)));
         result.cpuWorkers = workers;
-        if (useGpu && useCpu && o.reserveFeederCore && GetProcessAffinityMask(GetCurrentProcess(), &process, &system) &&
+        // With more than one processor group the process's mask is none once its workers sit in several: the feeder's
+        // own group's processors stand for it (multi_device.h).
+        if (multi::spread()) {
+            const WORD home = multi::currentGroup();
+            for (const auto& g : multi::groups())
+                if (g.number == home) system = process |= DWORD_PTR(g.mask);  // several where groups are simulated
+        }
+        if (useGpu && useCpu && o.reserveFeederCore && (multi::spread() || GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) &&
             process && (process & (process - 1))) {
             DWORD_PTR feeder = DWORD_PTR(1) << (8 * sizeof(DWORD_PTR) - 1);  // the highest allowed processor
             while (!(process & feeder)) feeder >>= 1;
@@ -448,6 +455,7 @@ public:
             }
             if (previewState == PreviewCopying && !gpu_->previewReady()) return;
             if (previewOfAov || checkpointNow) {
+                if (useGpu) addCardAovs(film);
                 RenderResult sofar;
                 const U64 seen = snapshotResult(film, sofar, adaptive, useGpu ? gpu_ : nullptr, checkpointNow);
                 if (previewOfAov) watch->previewResult(sofar, std::min(1.0, double(seen) / plannedSamples));
@@ -495,6 +503,28 @@ public:
         for (U32 w = 0; w < gpuCells.size(); ++w) gpuCells[w] = grid.seed(Device::Gpu, w, U32(gpuCells.size()));
         std::vector<Chunk> claim;
         std::vector<U64> cellSamples(grid.cellCount(), 0);  // the GPU's claims, for the ownership accounting
+        // The other graphics cards (multi_device.h): their rates, queued samples and cellular workers' cells.
+        struct Card {
+            GpuLane* lane;
+            double rate = 0;
+            U64 queued = 0;
+            std::vector<U32> cells;
+            U32 salt = 0;
+        };
+        std::vector<Card> cards;
+        if (useGpu)
+            for (const auto& f : gpu_->followers()) {
+                Card card{f.get()};
+                const U32 k = U32(cards.size() + 1), workers = U32(gpuCells.size());
+                card.salt = k * workers;
+                for (U32 w = 0; w < workers; ++w) card.cells.push_back(grid.seed(Device::Gpu, card.salt + w, (U32(gpu_->followers().size()) + 1) * workers));
+                cards.push_back(std::move(card));
+            }
+        auto cardsQuiet = [&] {
+            for (const Card& card : cards)
+                if (card.lane->inFlight() || card.lane->parkedOutstanding()) return false;
+            return true;
+        };
         // Partial shading: the provisional samples a launch renders again, and a guard against a cache too small for
         // them (the queue no lower over many launches that took them whether or not their tiles had landed).
         std::vector<Refine> refineBatch(partial ? GpuLane::RefineInCapacity : 0);
@@ -569,7 +599,9 @@ public:
                 {
                     const double elapsed = at();
                     const unsigned workers = std::max(1u, cpuLane.threads());
-                    grid.setRates(gpuRate, elapsed > 0.05 && cpuLane.threads() ? double(cpuLane.counters.samples.load()) / elapsed / workers : 0.0,
+                    double cardsRate = gpuRate;
+                    for (const Card& card : cards) cardsRate += card.rate;
+                    grid.setRates(cardsRate, elapsed > 0.05 && cpuLane.threads() ? double(cpuLane.counters.samples.load()) / elapsed / workers : 0.0,
                                   workers, o.windowMs / 1000.0);
                 }
                 while (failure.empty() && gpu_->ready()) {
@@ -644,6 +676,75 @@ public:
                         failure = "Fine-detail cache cannot hold the working set; use fallback";
                     lastParked = gpu_->parkedOutstanding();
                 }
+
+            // The multi-device extension (multi_device.h): each other graphics card is fed as the first is, from the same
+            // grid, each in its own context; its deferred samples go to the CPU lane as the first card's do.
+            for (Card& card : cards) {
+                if (!failure.empty()) break;
+                GpuLane& g = *card.lane;
+                g.use();
+                Completion c;
+                while (g.poll(c)) {
+                    std::vector<Parked> deferred;
+                    g.takeDeferred(deferred);
+                    if (!deferred.empty()) {
+                        std::vector<Retry> moved(deferred.size());
+                        const U32 tilesX = (plan_->width + TileSize - 1) / TileSize;
+                        for (size_t k = 0; k < deferred.size(); ++k) {
+                            moved[k] = Retry{deferred[k].pixel, deferred[k].index, deferred[k].pass};
+                            const U32 x = deferred[k].pixel % plan_->width, y = deferred[k].pixel / plan_->width;
+                            grid.deferredToCpu((y / TileSize) * tilesX + x / TileSize);
+                        }
+                        retries.push(moved.data(), moved.size());
+                        result.deferred += deferred.size();
+                    }
+                    card.queued -= std::min(card.queued, c.samples);
+                    if (c.deviceSeconds > 0 && c.samples > 0) g.noteRate(double(c.samples + c.parkedRun) / c.deviceSeconds);
+                    if (c.deviceSeconds > 0 && c.samples >= U64(g.launchThreads())) {
+                        const double rate = double(c.samples + c.parkedRun) / c.deviceSeconds;
+                        card.rate = card.rate ? 0.7 * card.rate + 0.3 * rate : rate;
+                    }
+                    if (c.errors) failure = "GPU sample failure on card " + std::to_string(g.card()) + "; whole epoch must use fallback";
+                    result.parkedRun += c.parkedRun;
+                    ++result.cardLaunches;
+                }
+                while (failure.empty() && g.ready()) {
+                    const double realtimeItems = sparseStart(*plan_) && adaptive && state.retired < 2 ? (state.retired == 0 ? 16.0 : 48.0) : 0.0;
+                    const U32 want = std::min(launchSize(o, grid, card.rate, cpuLane, card.queued, start, realtimeItems, &g), g.chunkRoom(0));
+                    claim.resize(want);
+                    U32 got = 0;
+                    if (want) {
+                        const U32 share = (want + U32(card.cells.size()) - 1) / U32(card.cells.size());
+                        for (U32 w = 0; w < card.cells.size() && got < want; ++w)
+                            for (U32 need = std::min(share, want - got), moves = 0; need && moves < 8; ++moves) {
+                                const U32 cell = grid.choose(Device::Gpu, card.cells[w], card.salt + w);
+                                if (cell == ~0u) break;
+                                card.cells[w] = cell;
+                                const U32 n = grid.claim(cell, need, claim.data() + got, Device::Gpu);
+                                if (n && grid.owner(cell) != Device::Gpu) result.gpuStolenChunks += n;
+                                got += n;
+                                need -= n;
+                            }
+                        if (got) grid.gpuClaimed();
+                    }
+                    U64 launchSamples = 0;
+                    for (U32 i = 0; i < got; ++i) {
+                        const Chunk& k = claim[i];
+                        const U64 pixels = adaptive ? U64(__builtin_popcountll(state.tables.masks[chunkPass(k) % PassSlots][k.tile]))
+                                                    : grid.tilePixels(k.tile);
+                        cellSamples[k.cell] += pixels * k.count;
+                        launchSamples += pixels * k.count;
+                    }
+                    for (U32 cell = 0; cell < cellSamples.size(); ++cell)
+                        if (cellSamples[cell]) {
+                            grid.rendered(cell, Device::Gpu, cellSamples[cell]);
+                            cellSamples[cell] = 0;
+                        }
+                    if (!g.launch(claim.data(), got, nullptr, 0, launchSamples)) break;
+                    card.queued += launchSamples;
+                }
+            }
+            if (!cards.empty()) gpu_->use();
             }
             if (cpuLane.counters.failures.load()) {
                 failure = cpuLane.failure();
@@ -662,7 +763,7 @@ public:
             if (empty && result.timeline.gridEmpty < 0) result.timeline.gridEmpty = at();
             const bool cpuQuiet = cpuLane.idle() == cpuLane.threads() && !retries.size() && !refines.size();
             if (empty && cpuQuiet && result.timeline.cpuDone < 0) result.timeline.cpuDone = at();
-            const bool gpuQuiet = !useGpu || (gpu_->inFlight() == 0 && gpu_->parkedOutstanding() == 0);
+            const bool gpuQuiet = !useGpu || (gpu_->inFlight() == 0 && gpu_->parkedOutstanding() == 0 && cardsQuiet());
             if (empty && gpuQuiet && cpuQuiet) {
                 drained = draining;
                 break;
@@ -685,6 +786,12 @@ public:
             Completion c;
             while (gpu_->inFlight())
                 if (!gpu_->poll(c)) std::this_thread::yield();
+            for (Card& card : cards) {
+                card.lane->use();
+                while (card.lane->inFlight())
+                    if (!card.lane->poll(c)) std::this_thread::yield();
+            }
+            if (!cards.empty()) gpu_->use();
         }
         if (cancelled) {
             result.cancelled = true;
@@ -695,6 +802,7 @@ public:
         if (useGpu) {
             gpu_->downloadFilm();
             while (!gpu_->filmReady()) std::this_thread::yield();
+            addCardAovs(film);
             result.timeline.filmLanded = at();
         }
         result.seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -866,6 +974,30 @@ private:
     // The film's AOV accumulators as MoonRay's snapshots resolve them (snapshotAovBuffer): an average over the pixel's
     // samples (its weight), the force-consistent filter over the frame's consistent sample count (getNumConsistentSamples),
     // the rest as they are (an untouched min or max infinite, as MoonRay leaves it).
+    // The other graphics cards' AOV films merged into the first card's host copy, by each output's filter, once their
+    // films have landed (GpuLane::filmReady and previewReady add their sums and counts).
+    void addCardAovs(const HostFilm& film) const {
+        if (!gpu_ || gpu_->followers().empty()) return;
+        const aov::Tables& t = film.aovTables();
+        float* values = const_cast<float*>(gpu_->aovs());
+        if (!t.channels || !values) return;
+        float* depths = const_cast<float*>(gpu_->aovDepths());
+        const size_t pixels = size_t(plan_->width) * plan_->height;
+        std::vector<double> acc(t.channels);
+        std::vector<float> near(std::max<U32>(t.closestCount, 1));
+        for (const auto& f : gpu_->followers()) {
+            const float* v = f->aovs();
+            const float* d = f->aovDepths();
+            if (!v) continue;
+            for (size_t p = 0; p < pixels; ++p) {
+                for (U32 c = 0; c < t.channels; ++c) acc[c] = values[p * t.channels + c];
+                for (U32 k = 0; k < t.closestCount; ++k) near[k] = depths ? depths[p * t.closestCount + k] : 0.0f;
+                mergeAovPixel(t, acc.data(), near.data(), v + p * t.channels, d ? d + p * t.closestCount : near.data());
+                for (U32 c = 0; c < t.channels; ++c) values[p * t.channels + c] = float(acc[c]);
+                for (U32 k = 0; k < t.closestCount && depths; ++k) depths[p * t.closestCount + k] = near[k];
+            }
+        }
+    }
     void resolveAovs(HostFilm& film, RenderResult& result, bool adaptive, const GpuLane* gpu) const {
         const aov::Tables& t = film.aovTables();
         const size_t pixels = size_t(plan_->width) * plan_->height;
@@ -1148,7 +1280,7 @@ private:
             priceBudget();
             const bool needTrees = !stop && generated < passes.size() && !uniformStage(generated) && evaluated < generated;
             if (needTrees && gpu) {
-                if (!asked && grid.empty() && !gpu->parkedOutstanding()) {
+                if (!asked && grid.empty() && !gpu->parkedAll() && gpu->canAsk()) {
                     gpu->requestErrors();
                     asked = true;
                     askedLaunch = gpu->launchCount();
@@ -1317,28 +1449,29 @@ private:
     // queuedSamples in samples; a chunk of the range at the frontier holds a
     // tile's pixels times its samples.
     U32 launchSize(const RenderOptions& o, const Grid& grid, double gpuRate, const CpuLane& cpuLane, U64 queuedSamples,
-                   std::chrono::steady_clock::time_point start, double realtimeItems = 0) const {
+                   std::chrono::steady_clock::time_point start, double realtimeItems = 0, const GpuLane* lane = nullptr) const {
+        const GpuLane* const card = lane ? lane : gpu_;  // another graphics card's (multi_device.h), else the first
         U64 remainingChunks = 0;
         for (U32 i = 0; i < grid.cellCount(); ++i) remainingChunks += grid.remaining(i);
         if (!remainingChunks) return 0;
         const auto& ranges = grid.ranges();
         const U32 front = grid.frontier(Device::Gpu);
         const U32 itemsPerChunk = TilePixels * (ranges.empty() || front >= ranges.size() ? o.grid.samplesPerChunk : ranges[front].count);
-        const U64 cap = gpu_->maxChunksPerLaunch();
+        const U64 cap = card->maxChunksPerLaunch();
         // An adaptive pass is on the frame's critical path, but goes out in launches of about windowMs (the first
         // ones firstChunks) as a uniform frame's do: the progressive pictures are copied behind the queued launches,
         // so a pass sent whole showed nothing until it ended (a whole first pass of a large frame takes many seconds).
         // Never below two samples a launch thread: a launch with fewer leaves most of the GPU's threads idle, its time
         // the slowest path's, and its rate (which sizes the next ones) far under the GPU's.
-        const U64 least = (U64(gpu_->launchThreads()) * 2 + itemsPerChunk - 1) / itemsPerChunk;
+        const U64 least = (U64(card->launchThreads()) * 2 + itemsPerChunk - 1) / itemsPerChunk;
         // Realtime: launches of about 15 ms at the GPU's rate (this frame's, else as earlier frames found it), so that an
         // edit cancels the frame within a launch or two and pictures go out between them: the GPU less full, the
         // answer sooner. Between one sample a launch thread and 128K samples (or the threads, where more): a launch with
         // fewer leaves most of the GPU idle, and its rate, which sizes the next ones, is never the GPU's (a heavy scene's
         // launches stayed at 8K samples, the GPU at a third of its rate, 570 launches for a frame).
         if (plan_->realtime) {
-            const double rate = gpuRate ? gpuRate : gpu_->rateHint();
-            const double threads = double(gpu_->launchThreads());
+            const double rate = gpuRate ? gpuRate : card->rateHint();
+            const double threads = double(card->launchThreads());
             const double samples = std::clamp(rate > 0 ? rate * 0.015 : 32768.0, threads, std::max(131072.0, threads));
             const U64 chunks = std::max<U64>(1, U64(samples / (realtimeItems > 0 ? realtimeItems : double(itemsPerChunk))));
             return U32(std::min<U64>({chunks, cap, remainingChunks}));

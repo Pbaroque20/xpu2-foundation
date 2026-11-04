@@ -19,6 +19,7 @@
 #include "async_gpu_abi.h"
 #include <chrono>
 #include "gpu_lane.h"
+#include "multi_device.h"
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,8 @@ struct GpuOptions {
     std::string dwaPtx, dwaLobesPtx;
     // The extras module (async_extras.cu): the camera's ray and the AOVs' accumulation, called by the path tracer.
     std::string extrasPtx;
+    int device = 0;  // the graphics card, CUDA's numbering (multi_device.h)
+    int lane = 0;    // its place among the lanes, the first 0 (multi_device.h's simulation switches)
 };
 
 
@@ -81,7 +84,7 @@ public:
     // none: adaptive passes are made on the host).
     explicit GpuLane(const std::string& ptx, const std::string& materialPtx = {}, const std::string& chainPtx = {},
                      GpuOptions options = {})
-        : options_(options) {
+        : driver(options.device), options_(options) {
         driver.deviceCap = 20ull << 30;
         {
             // The allocation cap: the card's own memory where it has more than that.
@@ -135,7 +138,7 @@ public:
             // smaller one is as full. prepare narrows it further where the card has no room for its scratch.
             {
                 CUdevice dev;
-                gpu::Driver::check(driver.cuDeviceGet_p(&dev, 0));
+                gpu::Driver::check(driver.cuDeviceGet_p(&dev, driver.ordinal));
                 int sms = 0, perSm = 0;
                 if (driver.cuDeviceGetAttribute_p(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) == CUDA_SUCCESS &&
                     driver.cuDeviceGetAttribute_p(&perSm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev) == CUDA_SUCCESS &&
@@ -155,7 +158,29 @@ public:
             throw;
         }
     }
-    ~GpuLane() { cleanup(); }
+    ~GpuLane() {
+        for (auto& f : followers_) {  // each in its own context
+            f->use();
+            f.reset();
+        }
+        if (driver.context) use();
+        cleanup();
+    }
+    // The multi-device extension (multi_device.h). The lanes of the other graphics cards follow this one: each takes
+    // the scene, its edits and each frame's tables as this one does (forward), and its film is added into this one's
+    // host copy as that lands; the renderer claims and launches on each itself (async_render.h). Every lane is made
+    // and used on the one feeder thread, each call in its own context (use). With no follower nothing here runs.
+    void follow(std::unique_ptr<GpuLane> lane) {
+        lane->countsWithErrors_ = true;
+        followers_.push_back(std::shared_ptr<GpuLane>(std::move(lane)));
+        countsWithErrors_ = true;
+        use();
+    }
+    const std::vector<std::shared_ptr<GpuLane>>& followers() const { return followers_; }
+    // This lane's context current on the calling thread.
+    void use() const { gpu::Driver::check(driver.cuCtxSetCurrent_p(driver.context)); }
+    int card() const { return driver.ordinal; }
+    int lane() const { return options_.lane; }
     GpuLane(const GpuLane&) = delete;
 
     // Bytes of scratch per launch thread: a Bsdf, the pending rays and the DwaBase parameter slots
@@ -201,6 +226,46 @@ public:
     }
     // Whether the GPU hands samples to the CPU lane: stand-in meshes, or volumes its programs do not render (VDB,
     // heterogeneous, emissive: volumeCrossings defers them), which need the CPU lane and the deferred samples' ring.
+    // Each follower in its context, then this lane's again. Between frames (the scene, its edits, a frame's begin) a
+    // follower that fails is let go and the others go on (forwardOrDrop); within a frame its failure is the frame's
+    // (forward), which goes to the fallback as any GPU failure does.
+    template <class F>
+    void forwardOrDrop(F&& call) {
+        for (size_t i = 0; i < followers_.size();) {
+            try {
+                followers_[i]->use();
+                call(*followers_[i]);
+                ++i;
+            } catch (const std::exception& e) {
+                std::printf("MoonRay XPU2: graphics card %d left out: %s\n", followers_[i]->card(), e.what());
+                std::fflush(stdout);
+                followers_[i]->use();
+                followers_.erase(followers_.begin() + std::ptrdiff_t(i));
+            }
+        }
+        use();
+    }
+    template <class F>
+    void forward(F&& call) {
+        try {
+            for (const auto& f : followers_) {
+                f->use();
+                call(*f);
+            }
+        } catch (...) {
+            use();
+            throw;
+        }
+        use();
+    }
+    // Whether the errors may be asked for now: a launch slot free on every card (requestErrors takes one on each).
+    bool canAsk() const {
+        if (followers_.empty()) return true;
+        if (!paramsFree()) return false;
+        for (const auto& f : followers_)
+            if (!f->paramsFree()) return false;
+        return true;
+    }
     bool standIns() const { return scene_.standInTraversable != 0 || scene_.defersVolumes; }
     // The samples the GPU deferred since the last call, for the CPU lane.
     void takeDeferred(std::vector<Parked>& out) {
@@ -252,6 +317,7 @@ public:
     // A camera-only edit (the session's fast path, realtime): the plan is the one prepared, with only its camera, render
     // space and render origin made again (cpu::updateCamera). Its configuration goes to the device; the rest stays.
     void updateCamera(const cpu::PlanView& plan) {
+        if (!followers_.empty()) forwardOrDrop([&](GpuLane& f) { f.updateCamera(plan); });
         plan_ = plan;
         // The volumes' records again: a mapped one's settings at the render origin, where the camera now is.
         if (scene_.volumes && !plan->volumes.empty()) scene_.volumes = upload(plan->volumes.data(), plan->volumes.size() * sizeof(volume::Shader));
@@ -263,6 +329,11 @@ public:
     // and the lights' records go again. False where it cannot (a moved stand-in or curve, a light whose tables are not
     // on the card), and the lane is as it was: prepare the plan then.
     bool updatePlacements(const cpu::PlanView& plan) {
+        if (!followers_.empty()) {  // a follower that cannot is prepared again with the rest (the caller's prepare)
+            bool all = true;
+            forwardOrDrop([&](GpuLane& f) { all = f.updatePlacements(plan) && all; });
+            if (!all) return false;
+        }
         if (!plan_ || !scene_.traversable || plan->meshes.size() != plan_->meshes.size() || instances_.size() != plan->meshes.size() ||
             meshAttributesHost_.size() != plan->meshes.size())
             return false;
@@ -340,6 +411,14 @@ public:
     double rateHint() const { return rateHint_; }
     // The lane's pinned host and device memory now and at its peak, in MB (gpu::Driver's counts).
     std::string memoryText() const {
+        if (!followers_.empty()) {
+            std::string all = memoryTextOwn();
+            for (const auto& f : followers_) all += "; card " + std::to_string(f->card()) + " " + f->memoryTextOwn();
+            return all;
+        }
+        return memoryTextOwn();
+    }
+    std::string memoryTextOwn() const {
         char text[260];
         std::snprintf(text, sizeof text, "pinned %zu MB (at most %zu, of %zu), device %zu MB (at most %zu); structures %zu MB compacted from %zu",
                       driver.pinnedBytes >> 20, driver.peakPinned >> 20, driver.pinnedCap >> 20, driver.deviceBytes >> 20, driver.peakDevice >> 20,
@@ -566,6 +645,21 @@ public:
 private:
 public:
     void prepare(const cpu::PlanView& plan) {
+        prepareOwn(plan);
+        if (followers_.empty()) return;
+        forwardOrDrop([&](GpuLane& f) {
+            if (multi::simulated("XPU2_SIMULATE_CARD_FAIL") == unsigned(f.options_.lane) && f.options_.lane)
+                throw std::runtime_error("failed (simulated, XPU2_SIMULATE_CARD_FAIL)");
+            f.prepare(plan);
+        });
+        // The card's memory as every lane left it: lanes sharing a card (XPU2_SIMULATE_CARDS) did not take it since.
+        size_t freeBytes = 0, totalBytes = 0;
+        forwardOrDrop([&](GpuLane& f) {
+            if (f.freeAfterPrepare_ && f.memoryInfo(freeBytes, totalBytes)) f.freeAfterPrepare_ = freeBytes;
+        });
+        if (freeAfterPrepare_ && memoryInfo(freeBytes, totalBytes)) freeAfterPrepare_ = freeBytes;
+    }
+    void prepareOwn(const cpu::PlanView& plan) {
         cpu::need(plan && cpu::isSpatial(plan->domain), "Asynchronous GPU lane requires a spatial plan");
         cpu::need(plan->paths, "The GPU programs carry the path tracer only");
         {const std::string why = cpuOnly(plan); if (!why.empty()) throw cpu::Unsupported("the GPU leaves " + why + " to the CPU");}
@@ -1148,7 +1242,7 @@ public:
             scene_.heat = device(pixels * sizeof(double));
             scene_.hostHeat = pinned(pixels * sizeof(double));
             CUdevice dev;
-            gpu::Driver::check(driver.cuDeviceGet_p(&dev, 0));
+            gpu::Driver::check(driver.cuDeviceGet_p(&dev, driver.ordinal));
             int kilohertz = 0;
             gpu::Driver::check(driver.cuDeviceGetAttribute_p(&kilohertz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev));
             secondsPerTick_ = kilohertz > 0 ? 1.0 / (double(kilohertz) * 1000.0) : 0.0;
@@ -1203,6 +1297,7 @@ public:
     // Starts a frame: an empty film and empty queues. partial: texture misses finish from a coarser level as
     // provisional samples (never in the pass chain, which runs on the device alone).
     void begin(U32 samplesPerChunk, bool adaptive = false, bool partial = false) {
+        if (!followers_.empty()) forwardOrDrop([&](GpuLane& f) { f.begin(samplesPerChunk, adaptive, partial); });
         cpu::need(plan_ && inFlight_.empty(), "GPU frame overlap");
         cpu::need(!adaptive || single_ || programs_[1].pipeline, "No adaptive GPU program");
         program_ = &programs_[adaptive && !single_ ? 1 : 0];
@@ -1387,6 +1482,8 @@ public:
 
     // Queues the device film's download; filmReady() says when it has landed.
     void downloadFilm() {
+        if (!followers_.empty()) forward([&](GpuLane& f) { f.downloadFilm(); });
+        filmAdded_ = false;
         cpu::need(inFlight_.empty(), "Film download before the last launch was collected");
         const size_t pixels = size_t(plan_->width) * plan_->height;
         copyOut(scene_.hostSums, scene_.sums, pixels * 4 * sizeof(double));
@@ -1400,11 +1497,20 @@ public:
         if (chainsLaunched_) copyOut(chain_.hostPlanned, chain_.planned, pixels * sizeof(U32));
         gpu::Driver::check(driver.cuEventRecord_p(scene_.filmDone->value, stream_));
     }
-    bool filmReady() { return scene_.filmDone->ready(); }
+    bool filmReady() {
+        if (!scene_.filmDone->ready()) return false;
+        if (followers_.empty() || filmAdded_) return true;
+        if (!followersReady([](GpuLane& f) { return f.filmReady(); })) return false;
+        addFollowers(true);
+        filmAdded_ = true;
+        return true;
+    }
     // A copy of the device film as it will stand once the launches queued so far have finished, for a progressive
     // picture; previewReady() says when it has landed. Read through sums() and counts(); the frame's own download
     // (downloadFilm) writes the same copy.
     void downloadPreview(bool aovs = false) {
+        if (!followers_.empty()) forward([&](GpuLane& f) { f.downloadPreview(aovs); });
+        previewAdded_ = false;
         const size_t pixels = size_t(plan_->width) * plan_->height;
         copyOut(scene_.hostSums, scene_.sums, pixels * 4 * sizeof(double));
         copyOut(scene_.hostCounts, scene_.counts, pixels * sizeof(U32));
@@ -1417,7 +1523,48 @@ public:
         }
         gpu::Driver::check(driver.cuEventRecord_p(scene_.previewDone->value, stream_));
     }
-    bool previewReady() { return scene_.previewDone->ready(); }
+    bool previewReady() {
+        if (!scene_.previewDone->ready()) return false;
+        if (followers_.empty() || previewAdded_) return true;
+        if (!followersReady([](GpuLane& f) { return f.previewReady(); })) return false;
+        addFollowers(false);
+        previewAdded_ = true;
+        return true;
+    }
+    template <class F>
+    bool followersReady(F&& ready) {
+        bool all = true;
+        for (const auto& f : followers_) {
+            f->use();
+            all = ready(*f) && all;
+        }
+        use();
+        return all;
+    }
+    // The followers' downloaded films added into this lane's host copy: sums, counts, the odd sums of a whole film
+    // (adaptive) and the render times. Their AOVs are merged by the renderer, which holds the outputs' filters
+    // (async_render.h, addCardAovs).
+    void addFollowers(bool whole) {
+        const size_t pixels = size_t(plan_->width) * plan_->height;
+        double* sums = static_cast<double*>(scene_.hostSums->host());
+        U32* counts = static_cast<U32*>(scene_.hostCounts->host());
+        for (const auto& f : followers_) {
+            const double* s = f->sums();
+            const U32* c = f->counts();
+            for (size_t i = 0; i < pixels * 4; ++i) sums[i] += s[i];
+            for (size_t i = 0; i < pixels; ++i) counts[i] += c[i];
+            if (whole && adaptive_ && scene_.hostOdd && f->scene_.hostOdd) {
+                double* odd = static_cast<double*>(scene_.hostOdd->host());
+                const double* o = f->odd();
+                for (size_t i = 0; i < pixels * 4; ++i) odd[i] += o[i];
+            }
+            if (whole && scene_.hostHeat && f->scene_.hostHeat) {
+                double* heat = static_cast<double*>(scene_.hostHeat->host());
+                const double* h = f->heat();
+                for (size_t i = 0; i < pixels; ++i) heat[i] += h[i];
+            }
+        }
+    }
     // The closest filter's words downloaded with the AOV film; read apart into its values and depths when the film is
     // next read (landClosest): a word's high half the depth's ordered bits (mergeAovs), its low half the value's.
     void downloadClosest() {
@@ -1495,6 +1642,7 @@ public:
     const double* heat() const { return scene_.hostHeat ? static_cast<const double*>(scene_.hostHeat->host()) : nullptr; }
     // The device's Cryptomatte fragments into the host's buffer (after the film has landed; waits for the copies).
     void mergeCrypto(aov::CryptoBuffer& into) {
+        if (!followers_.empty()) forward([&](GpuLane& f) { f.mergeCrypto(into); });
         if (!cryptoEvents_ || into.empty()) return;
         const size_t pixels = size_t(plan_->width) * plan_->height;
         B countHost = pinned(sizeof(U32)), headsHost = pinned(pixels * cryptoCategories_ * sizeof(U32));
@@ -1548,11 +1696,64 @@ public:
         auto& slot = takeParams(p);
         ox(optixLaunch(program_->pipeline, stream_, slot.device->pointer, sizeof(LaunchParams), &program_->sbt, p.pixels, 1, 1));
         copyOut(scene_.hostErrors, scene_.errors, size_t(p.pixels) * sizeof(float));
+        if (countsWithErrors_) {  // to pool them: the film's sums, odd sums and counts, apart from the pictures' copy
+            const size_t pixels = p.pixels;
+            if (!errorCounts_ || errorCounts_->bytes != pixels * sizeof(U32)) {
+                errorSums_ = pinned(pixels * 4 * sizeof(double));
+                errorOdd_ = pinned(pixels * 4 * sizeof(double));
+                errorCounts_ = pinned(pixels * sizeof(U32));
+            }
+            copyOut(errorSums_, scene_.sums, pixels * 4 * sizeof(double));
+            copyOut(errorOdd_, scene_.odd, pixels * 4 * sizeof(double));
+            copyOut(errorCounts_, scene_.counts, pixels * sizeof(U32));
+        }
         gpu::Driver::check(driver.cuEventRecord_p(scene_.errorsDone->value, stream_));
         slot.done = scene_.errorsDone;
+        if (!followers_.empty()) {
+            forward([&](GpuLane& f) { f.requestErrors(); });
+            errorsPooled_ = false;
+        }
     }
-    bool errorsReady() { return scene_.errorsDone->ready(); }
-    const float* errors() const { return static_cast<const float*>(scene_.hostErrors->host()); }
+    bool errorsReady() {
+        if (!scene_.errorsDone->ready()) return false;
+        if (followers_.empty() || errorsPooled_) return true;
+        if (!followersReady([](GpuLane& f) { return f.errorsReady(); })) return false;
+        poolErrors();
+        errorsPooled_ = true;
+        return true;
+    }
+    // The cards' errors as one card's: each pixel's sums, odd sums and counts added over the cards, and its error worked
+    // out from them as the device works out its own (pixelError), so it is the error one card with all the samples
+    // would have found. (Pooling each card's error by its count was noisier: each card's error rests on its share of a
+    // pixel's samples alone, and the samples went to the wrong places; three simulated cards came out past the noise.)
+    void poolErrors() {
+        const size_t pixels = size_t(plan_->width) * plan_->height;
+        pooled_.resize(pixels);
+        const double* sums = static_cast<const double*>(errorSums_->host());
+        const double* odd = static_cast<const double*>(errorOdd_->host());
+        const U32* counts = errorCounts();
+        for (size_t i = 0; i < pixels; ++i) {
+            double total[4], halves[4];
+            U32 n = counts[i];
+            for (int c = 0; c < 4; ++c) {
+                total[c] = sums[i * 4 + c];
+                halves[c] = odd[i * 4 + c];
+            }
+            for (const auto& f : followers_) {
+                const double* s = static_cast<const double*>(f->errorSums_->host());
+                const double* o = static_cast<const double*>(f->errorOdd_->host());
+                for (int c = 0; c < 4; ++c) {
+                    total[c] += s[i * 4 + c];
+                    halves[c] += o[i * 4 + c];
+                }
+                n += f->errorCounts()[i];
+            }
+            pooled_[i] = pixelError(total, halves, n);
+        }
+    }
+    const U32* errorCounts() const { return static_cast<const U32*>(errorCounts_->host()); }
+    const float* errorsOwn() const { return static_cast<const float*>(scene_.hostErrors->host()); }
+    const float* errors() const { return followers_.empty() ? errorsOwn() : pooled_.data(); }
     // A pass's tables, ahead of any launch that reads them: its tile masks, and
     // each pixel's sample-index base, made on the device. A pass of the uniform
     // stage gives every pixel the same base (NoSlot: none); a later pass starts
@@ -1560,6 +1761,7 @@ public:
     // completed. A slot's staging is reused only once its earlier pass has
     // completed, so its upload has.
     void uploadPass(U32 slot, const std::vector<std::uint64_t>& masks, U32 uniformBase) {
+        if (!followers_.empty()) forward([&](GpuLane& f) { f.uploadPass(slot, masks, uniformBase); });
         void* staging = scene_.passStaging[slot]->host();
         const size_t maskBytes = masks.size() * sizeof(U64L), pixels = size_t(plan_->width) * plan_->height;
         std::memcpy(staging, masks.data(), maskBytes);
@@ -1569,7 +1771,17 @@ public:
                                                                pixels * sizeof(U32), stream_));
     }
     // Launches queued so far, render or otherwise.
-    U64 launchCount() const { return launches_; }
+    U64 launchCount() const {  // the followers' too (multi_device.h)
+        U64 n = launches_;
+        for (const auto& f : followers_) n += f->launches_;
+        return n;
+    }
+    // Samples parked on this card and its followers.
+    U64 parkedAll() const {
+        U64 n = parkedOutstanding();
+        for (const auto& f : followers_) n += f->parkedOutstanding();
+        return n;
+    }
 
     // The adaptive pass chain (async_adaptive.cu): a frame's passes queued at
     // once, each made on the device from the trees of the passes before it.
@@ -1577,7 +1789,7 @@ public:
         U32 pass, size;  // the pass's index in the schedule and its samples a pixel
         bool uniform;    // every pixel, no trees: the passes below the minimum sample count
     };
-    bool hasChain() const { return chain_.module != nullptr; }
+    bool hasChain() const { return chain_.module != nullptr && followers_.empty(); }  // one card's alone
     // Sets up a frame's chain: the region trees' bounds and room, the tiles in the
     // work grid's cell order, and empty planned counts. After begin().
     void beginChain(const adaptive::Regions& regions, const std::vector<std::uint64_t>& inImage,
@@ -1743,7 +1955,13 @@ public:
     // Each pixel's planned samples after the frame's chain, once the film has landed.
     const U32* chainPlanned() const { return static_cast<const U32*>(chain_.hostPlanned->host()); }
     // Samples each pass has completed on the GPU, as of the last collected launch.
-    const std::vector<U32>& passDone() const { return passDone_; }
+    const std::vector<U32>& passDone() const {
+        if (followers_.empty()) return passDone_;
+        passSum_ = passDone_;
+        for (const auto& f : followers_)
+            for (size_t i = 0; i < passSum_.size() && i < f->passDone_.size(); ++i) passSum_[i] += f->passDone_[i];
+        return passSum_;
+    }
 
     size_t fineTiles() const { return fine_.tiles; }
     // The card's free and total memory (cuMemGetInfo); false where the driver does not say.
@@ -1762,6 +1980,11 @@ public:
     // Whether the card has come to hold much less than the fine-detail cache was sized for (something else took it, Modo's
     // viewport or another application): prepare again makes the cache to fit, meshes and all else kept. Read as a frame starts.
     bool fineCacheTooBig() {
+        bool any = false;
+        if (!followers_.empty()) forwardOrDrop([&](GpuLane& f) { any = f.fineCacheTooBig() || any; });
+        return fineCacheTooBigOwn() || any;
+    }
+    bool fineCacheTooBigOwn() {
         size_t freeBytes = 0, totalBytes = 0;
         if (std::getenv("XPU2_SESSION_FINE_BUDGET_MB") || options_.fineBudget || !fine_.slots || !memoryInfo(freeBytes, totalBytes)) return false;
         const size_t held = fine_.slabBytes, reserve = cardReserve(totalBytes);
@@ -1772,6 +1995,7 @@ public:
     size_t freeAfterPrepare_ = 0;
     // All that is held of the scene let go, the lane left ready for prepare.
     void dropScene() {
+        if (!followers_.empty()) forwardOrDrop([&](GpuLane& f) { f.dropScene(); });
         driver.drain();
         plan_.reset();
         scene_ = {};
@@ -1783,8 +2007,10 @@ public:
     }
     // Whether the card is short of even what is kept back.
     bool cardTight() {
+        bool any = false;
+        if (!followers_.empty()) forwardOrDrop([&](GpuLane& f) { any = f.cardTight() || any; });
         size_t freeBytes = 0, totalBytes = 0;
-        return memoryInfo(freeBytes, totalBytes) && freeBytes < cardReserve(totalBytes) / 2;
+        return any || (memoryInfo(freeBytes, totalBytes) && freeBytes < cardReserve(totalBytes) / 2);
     }
     // The fine-detail cache's VRAM: what the scene's level-0 tiles need, up to what the card has free less a reserve
     // for the rest of the frame and for Modo's own viewport (a fifth of the card, a gigabyte and a half at least), and
@@ -2964,6 +3190,12 @@ private:
     size_t cryptoScratch_ = 0;
     double secondsPerTick_ = 0.0;
     std::vector<U32> passDone_;
+    // The multi-device extension (follow).
+    std::vector<std::shared_ptr<GpuLane>> followers_;  // shared: a denoiser on one keeps it (xpu2_session.cc)
+    mutable std::vector<U32> passSum_;
+    std::vector<float> pooled_;
+    gpu::B errorSums_, errorOdd_, errorCounts_;  // the film read back with the errors, to pool them (poolErrors)
+    bool countsWithErrors_ = false, filmAdded_ = false, previewAdded_ = false, errorsPooled_ = false;
     U64 published_ = 0, launches_ = 0;
     U64 parkedTail_ = 0, parkedIssued_ = 0;
     Completion completed_;

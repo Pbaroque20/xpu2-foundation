@@ -10,6 +10,7 @@
 #include "async_grid.h"
 #include "points_core.h"
 #include "cpu_jobs.h"
+#include "multi_device.h"
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -1590,14 +1591,17 @@ inline U64 renderChunk(const CpuScene& scene, const mixed::Config& config, const
 // worker holds no work, so a frame may end without waiting for workers to sleep.
 class CpuLane {
 public:
-    // affinity: the logical processors the workers may run on (0 for any).
+    // affinity: the logical processors the workers may run on (0 for any). With more than one processor group the
+    // workers are spread over them (multi_device.h), affinity holding in the maker's own group.
     CpuLane(const CpuScene& scene, unsigned threads, DWORD_PTR affinity = 0)
         : scene_(scene), active_(new std::atomic<U32>[std::max(1u, threads)]) {
         for (unsigned w = 0; w < std::max(1u, threads); ++w) active_[w].store(~0u, std::memory_order_relaxed);
         workers_.reserve(threads);
+        const WORD home = multi::spread() ? multi::currentGroup() : 0;
         for (unsigned w = 0; w < threads; ++w)
-            workers_.emplace_back([this, w, threads, affinity] {
-                if (affinity) SetThreadAffinityMask(GetCurrentThread(), affinity);
+            workers_.emplace_back([this, w, threads, affinity, home] {
+                if (multi::spread()) multi::placeWorker(w, threads, home, affinity);
+                else if (affinity) SetThreadAffinityMask(GetCurrentThread(), affinity);
                 loop(w, threads);
             });
     }

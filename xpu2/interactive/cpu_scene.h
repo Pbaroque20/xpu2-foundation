@@ -3163,6 +3163,9 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
  // lights_visible_in_camera: each light's visible_in_camera reads it (lightVisibleInCamera).
  float frameNumber=get<rdl::Float>(sv,"frame");need(std::isfinite(frameNumber)&&frameNumber>=0&&double(frameNumber)<=4294967295.&&std::floor(frameNumber)==frameNumber,"Invalid integer frame");
  plan->seed=surface::frameSeed(unsigned(frameNumber),0,get<rdl::Bool>(sv,"lock_frame_noise"));
+ // Simulation (multi_device.h): XPU2_SIMULATE_SEED=n renders the frame's other samples, for the simulation app's measure of
+ // a scene's noise (two renders with the one seed are all but the same picture: a sample is its pixel, index and seed).
+ if(const char* s=std::getenv("XPU2_SIMULATE_SEED"))if(const unsigned n=unsigned(std::strtoul(s,nullptr,10)))plan->seed^=0x9E3779B9u*n;
  int filter=get<rdl::Int>(sv,"pixel_filter");plan->filterWidth=get<rdl::Float>(sv,"pixel_filter_width");need(filter>=0&&filter<=5&&surface::finite(plan->filterWidth)&&plan->filterWidth>0&&plan->filterWidth<=64,"Unsupported pixel filter");plan->filter=surface::Filter(filter);
  auto* camera=get<rdl::SceneObject*>(sv,"camera");auto* layerObject=get<rdl::SceneObject*>(sv,"layer");
  need(camera&&(paths||camera->getSceneClass().getName()=="PerspectiveCamera"),"Perspective camera required");need(layerObject&&layerObject->isA<rdl::Layer>(),"Layer required");auto& layer=*layerObject->asA<rdl::Layer>();
