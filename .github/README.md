@@ -45,6 +45,10 @@ The mantra for XPU2 is: "Use your silicon!"
   is highest. A frame runs for as long as uniform sampling would take, or to an exact sample count.
 - **Audited results.** Each device keeps its own film. When a frame ends the films merge and every pixel's sample
   count is checked.
+- **Every device in the machine.** Extra graphics cards follow the first, each with its own scene and film, taking
+  cells from the same grid at their own rate. CPU workers span every Windows processor group. Realtime denoising goes
+  to the first card that can run OptiX's denoiser, then to Open Image Denoise on the CPU. A simulation app tests it all
+  on one card.
 
 ## Reference renderer: MoonRay
 
