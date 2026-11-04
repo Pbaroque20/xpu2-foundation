@@ -13,6 +13,11 @@
 #include <optix_stubs.h>
 #include <optix_stack_size.h>
 #include "cpu_jobs.h"
+#include "multi_device.h"
+#include <cfgmgr32.h>
+#include <devpropdef.h>
+#include <cstdio>
+#include <cwchar>
 #include <fstream>
 #include <sstream>
 #include <mutex>
@@ -60,6 +65,47 @@ inline int cardCount(){HMODULE library=nullptr;wchar_t path[MAX_PATH];auto n=Get
  std::wstring file(path);file+=L"\\nvcuda.dll";library=LoadLibraryW(file.c_str());if(!library)return 0;
  auto init=reinterpret_cast<decltype(&cuInit)>(GetProcAddress(library,"cuInit"));auto count=reinterpret_cast<decltype(&cuDeviceGetCount)>(GetProcAddress(library,"cuDeviceGetCount"));
  int cards=0;if(!init||!count||init(0)!=CUDA_SUCCESS||count(&cards)!=CUDA_SUCCESS)cards=0;FreeLibrary(library);return cards;}
+// The graphics cards CUDA finds, for --list-devices: each one's name, memory and UUID (none without a driver).
+struct CardInfo {std::string name,uuid;size_t bytes=0;};
+inline std::vector<CardInfo> cardInfos(){std::vector<CardInfo> out;HMODULE library=nullptr;wchar_t path[MAX_PATH];auto n=GetSystemDirectoryW(path,MAX_PATH);if(!n||n>=MAX_PATH-12)return out;
+ std::wstring file(path);file+=L"\\nvcuda.dll";library=LoadLibraryW(file.c_str());if(!library)return out;
+ auto init=reinterpret_cast<decltype(&cuInit)>(GetProcAddress(library,"cuInit"));auto count=reinterpret_cast<decltype(&cuDeviceGetCount)>(GetProcAddress(library,"cuDeviceGetCount"));
+ auto get=reinterpret_cast<decltype(&cuDeviceGet)>(GetProcAddress(library,"cuDeviceGet"));auto name=reinterpret_cast<decltype(&cuDeviceGetName)>(GetProcAddress(library,"cuDeviceGetName"));
+ auto total=reinterpret_cast<decltype(&cuDeviceTotalMem_v2)>(GetProcAddress(library,"cuDeviceTotalMem_v2"));auto uuid=reinterpret_cast<CUresult(CUDAAPI*)(CUuuid*,CUdevice)>(GetProcAddress(library,"cuDeviceGetUuid"));
+ int cards=0;if(init&&count&&get&&name&&init(0)==CUDA_SUCCESS&&count(&cards)==CUDA_SUCCESS)
+  for(int k=0;k<cards;++k){CUdevice dev{};if(get(&dev,k)!=CUDA_SUCCESS)continue;CardInfo c;char text[256]={};if(name(text,int(sizeof(text))-1,dev)==CUDA_SUCCESS)c.name=text;
+   size_t bytes=0;if(total&&total(&bytes,dev)==CUDA_SUCCESS)c.bytes=bytes;CUuuid id{};
+   if(uuid&&uuid(&id,dev)==CUDA_SUCCESS){static const char* hex="0123456789abcdef";for(int b=0;b<16;++b){c.uuid+=hex[(unsigned char)id.bytes[b]>>4];c.uuid+=hex[(unsigned char)id.bytes[b]&15];}}
+   else c.uuid="card"+std::to_string(k);out.push_back(c);}
+ FreeLibrary(library);return out;}
+// The NUMA node nearest a graphics card (multi_device.h), -1 where it is not known: CUDA's host NUMA ID, else the node
+// Windows gives the card's PCI device. With one node, or simulated ones, it is not asked (XPU2_SIMULATE_CARD_NODES gives
+// lane's node there).
+inline int pciNode(unsigned bus,unsigned device,unsigned function){
+ // DEVPKEY_Device_BusNumber, DEVPKEY_Device_Address and DEVPKEY_Device_Numa_Node, spelt out (devpkey.h's need INITGUID once).
+ static const DEVPROPKEY busKey{{0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}},23};
+ static const DEVPROPKEY addressKey{{0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}},30};
+ static const DEVPROPKEY nodeKey{{0x540b947e,0x8b40,0x45bc,{0xa8,0xa2,0x6a,0x0b,0x89,0x4c,0xbd,0xa2}},3};
+ ULONG length=0;if(CM_Get_Device_ID_List_SizeW(&length,L"PCI",CM_GETIDLIST_FILTER_ENUMERATOR|CM_GETIDLIST_FILTER_PRESENT)!=CR_SUCCESS||!length)return -1;
+ std::vector<wchar_t> ids(length);if(CM_Get_Device_ID_ListW(L"PCI",ids.data(),length,CM_GETIDLIST_FILTER_ENUMERATOR|CM_GETIDLIST_FILTER_PRESENT)!=CR_SUCCESS)return -1;
+ for(const wchar_t* id=ids.data();*id;id+=wcslen(id)+1){DEVINST inst{};if(CM_Locate_DevNodeW(&inst,const_cast<wchar_t*>(id),CM_LOCATE_DEVNODE_NORMAL)!=CR_SUCCESS)continue;
+  auto get=[&](const DEVPROPKEY& key,ULONG& value){DEVPROPTYPE type{};ULONG size=sizeof value;value=0;return CM_Get_DevNode_PropertyW(inst,&key,&type,reinterpret_cast<PBYTE>(&value),&size,0)==CR_SUCCESS;};
+  ULONG b=0,a=0,n=0;if(get(busKey,b)&&get(addressKey,a)&&b==bus&&(a>>16)==device&&(a&0xffff)==function)return get(nodeKey,n)?int(n):-1;}
+ return -1;}
+inline int cardNode(int ordinal,int lane){
+ if(!multi::numa())return -1;
+ if(multi::simulated("XPU2_SIMULATE_NODES")>1)return int(multi::simulatedEntry("XPU2_SIMULATE_CARD_NODES",size_t(std::max(0,lane))));
+ HMODULE library=nullptr;wchar_t path[MAX_PATH];auto n=GetSystemDirectoryW(path,MAX_PATH);if(!n||n>=MAX_PATH-12)return -1;
+ std::wstring file(path);file+=L"\\nvcuda.dll";library=LoadLibraryW(file.c_str());if(!library)return -1;
+ auto init=reinterpret_cast<decltype(&cuInit)>(GetProcAddress(library,"cuInit"));auto get=reinterpret_cast<decltype(&cuDeviceGet)>(GetProcAddress(library,"cuDeviceGet"));
+ auto attribute=reinterpret_cast<decltype(&cuDeviceGetAttribute)>(GetProcAddress(library,"cuDeviceGetAttribute"));auto bus=reinterpret_cast<decltype(&cuDeviceGetPCIBusId)>(GetProcAddress(library,"cuDeviceGetPCIBusId"));
+ int node=-1;CUdevice dev{};char id[32]={};
+ if(init&&get&&init(0)==CUDA_SUCCESS&&get(&dev,ordinal)==CUDA_SUCCESS){
+  int v=-1;if(attribute&&attribute(&v,CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,dev)==CUDA_SUCCESS&&v>=0)node=v;
+  else if(bus&&bus(id,int(sizeof(id))-1,dev)==CUDA_SUCCESS){unsigned domain=0,b=0,d=0,f=0;if(std::sscanf(id,"%x:%x:%x.%x",&domain,&b,&d,&f)==4)node=pciNode(b,d,f);}}
+ FreeLibrary(library);
+ // A node the workers are not on (its processors switched off) is no use to place on.
+ const auto& on=multi::nodes();return node>=0&&std::find(on.begin(),on.end(),unsigned(node))!=on.end()?node:-1;}
 // What the lane is allocating, for the Terminal's memory lines (Buffer): named where a large allocation is made.
 inline thread_local const char* allocating=nullptr;
 struct Allocating {const char* before;explicit Allocating(const char* what):before(allocating){allocating=what;}~Allocating(){allocating=before;}

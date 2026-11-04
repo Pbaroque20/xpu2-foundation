@@ -58,6 +58,39 @@ runtime beside XPU2's). A device that fails hands its pictures on to the next fo
 Terminal says where they went. A scene the cards leave to the processor is still denoised on a card. Open Image Denoise
 has no upscaling model: pictures from a quarter of their pixels are denoised at half size and enlarged.
 
+## NUMA nodes
+
+A machine with more than one NUMA node (two sockets, or a processor of several dies) reaches its own node's memory
+quicker than another's. `multi_device.h` places the CPU lane's workers a share on each node (`places`, by node within
+each chosen group) and each thread knows its node (`currentNode`). Each card has a nearest node (`gpu::cardNode`:
+CUDA's host NUMA ID, else the node Windows gives the card's PCI device); its lane is made there, its scene's pinned
+buffers are allocated there (`multi::OnNode` around `prepare` and the followers' calls), the tiles it misses are
+decoded by threads there, and the feeder is pinned on the first card's node.
+
+Texture tiles (`host_texture.h`) are kept in the heap of the node that decodes them. The pressure watch looks at
+each node: a node short of memory (free below a tenth of its share of RAM) moves its oldest tiles to the node with
+the most room, pointing their pages at the copies and freeing the old blocks once no reader holds them, as letting
+go does. Read from the other node they cost a hop across the sockets, far less than decoding them from the file
+again; only what no node has room for is let go. The machine-wide watch then works as before.
+
+Not done: a copy of the coarse mip levels on each node. The CPU reads a texture through one image a binding
+(`tex::Binding`), so copies would mean a lookup by node in the sampling path; worth it only if a two-socket machine
+shows remote reads of the coarse levels costing time.
+
+Simulation: `XPU2_SIMULATE_NODES=K` splits the chosen processors into K nodes, `XPU2_SIMULATE_CARD_NODES=a,b`
+gives each lane its node, and `XPU2_SIMULATE_NODE_MB=a,b` holds each node's tiles to that many MB (0: no limit), so
+the move to another node runs on one socket. Speed can only be measured on a machine with real nodes.
+
+## Choosing devices
+
+`moonray_xpu2 --list-devices` prints a line for each processor group (`group`, its number, its processors, the
+processor's name) and each card (`card`, CUDA's number, its UUID, its memory in bytes, its name), simulated ones as
+they render. `XPU2_CARD_LIST=0,2` and `XPU2_GROUP_LIST=0,1` use only those (a list that leaves nothing keeps
+everything); `--compile-shaders` compiles for every card whatever the list says, so a card switched on later renders
+at once. A host application lists the devices this way, keeps a switch for each (a card by its UUID, a group by its
+number, as the numbering can change) and starts XPU2 with the lists and the matching `XPU2_SESSION_MODE`, keeping one
+device at least on.
+
 ## Simulation
 
 For a machine with one group and one card:

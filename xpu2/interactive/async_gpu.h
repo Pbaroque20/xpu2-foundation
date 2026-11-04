@@ -50,6 +50,7 @@ struct GpuOptions {
     std::string extrasPtx;
     int device = 0;  // the graphics card, CUDA's numbering (multi_device.h)
     int lane = 0;    // its place among the lanes, the first 0 (multi_device.h's simulation switches)
+    int node = -1;   // the NUMA node nearest the card, -1 where there is one or it is not known (gpu::cardNode)
 };
 
 
@@ -181,6 +182,7 @@ public:
     void use() const { gpu::Driver::check(driver.cuCtxSetCurrent_p(driver.context)); }
     int card() const { return driver.ordinal; }
     int lane() const { return options_.lane; }
+    int node() const { return options_.node; }
     GpuLane(const GpuLane&) = delete;
 
     // Bytes of scratch per launch thread: a Bsdf, the pending rays and the DwaBase parameter slots
@@ -234,7 +236,10 @@ public:
         for (size_t i = 0; i < followers_.size();) {
             try {
                 followers_[i]->use();
-                call(*followers_[i]);
+                {
+                    multi::OnNode near(followers_[i]->node());
+                    call(*followers_[i]);
+                }
                 ++i;
             } catch (const std::exception& e) {
                 std::printf("MoonRay XPU2: graphics card %d left out: %s\n", followers_[i]->card(), e.what());
@@ -645,7 +650,11 @@ public:
 private:
 public:
     void prepare(const cpu::PlanView& plan) {
-        prepareOwn(plan);
+        {
+            // The scene's pinned buffers on the node nearest the card (multi_device.h).
+            multi::OnNode near(options_.node);
+            prepareOwn(plan);
+        }
         if (followers_.empty()) return;
         forwardOrDrop([&](GpuLane& f) {
             if (multi::simulated("XPU2_SIMULATE_CARD_FAIL") == unsigned(f.options_.lane) && f.options_.lane)
@@ -2855,7 +2864,11 @@ private:
             };
             std::vector<std::thread> pool;
             try {
-                for (unsigned k = 1; k < threads; ++k) pool.emplace_back(work);
+                for (unsigned k = 1; k < threads; ++k)
+                    pool.emplace_back([&] {
+                        multi::OnNode near(options_.node);
+                        work();
+                    });
             } catch (const std::system_error&) {
                 // No more threads to be had: those there are, and this one, do the work.
             }

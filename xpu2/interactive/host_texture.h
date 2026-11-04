@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include "surface_core.h"
 #include "texture_core.h"
+#include "multi_device.h"
 #include <vector>
 // ISPC Texture Compressor's BC6H encoder (xpu2_bc6h.cc), weak: a program built without it just does not compress.
 extern "C" {
@@ -119,6 +120,21 @@ inline void encodeTile(const surface::V3* rgb,unsigned tw,unsigned th,unsigned c
  Surface surface{reinterpret_cast<uint8_t*>(texels),tex::Tile,tex::Tile,tex::Tile*8};
  CompressBlocksBC6H(reinterpret_cast<const rgba_surface*>(&surface),out,reinterpret_cast<bc6h_enc_settings*>(&settings));
 }
+// A decoded tile's block, in the heap of the node that decoded it (multi_device.h): each node's tiles in its own memory,
+// read there by its workers without crossing to the other socket. With one node, the process's heap, as before.
+struct NodeFree {HANDLE heap=nullptr;void operator()(unsigned char* p)const{if(p)HeapFree(heap,0,p);}};
+using Block=std::unique_ptr<unsigned char[],NodeFree>;
+constexpr unsigned MaxNodes=64;
+inline HANDLE nodeHeap(unsigned node){
+ if(!multi::numa()||node>=MaxNodes)return GetProcessHeap();
+ static std::atomic<HANDLE> heaps[MaxNodes]{};
+ HANDLE h=heaps[node].load(std::memory_order_acquire);if(h)return h;
+ HANDLE made=HeapCreate(0,0,0);if(!made)return GetProcessHeap();
+ HANDLE none=nullptr;if(!heaps[node].compare_exchange_strong(none,made)){HeapDestroy(made);return none;}
+ return made;}
+inline Block nodeBlock(size_t size,unsigned node){HANDLE h=nodeHeap(node);auto* p=static_cast<unsigned char*>(HeapAlloc(h,0,size));if(!p)throw std::bad_alloc();return Block(p,NodeFree{h});}
+// The decoded tiles each node holds, in bytes.
+inline std::atomic<size_t>& nodeTileBytes(unsigned node){static std::atomic<size_t> held[MaxNodes]{};return held[std::min(node,MaxNodes-1)];}
 // Set by the pressure watch where tiles were let go, all of them, and memory did not come back (RAM still short).
 inline std::atomic<bool>& pressureShort(){static std::atomic<bool> s{false};return s;}
 struct Pyramid;
@@ -134,7 +150,7 @@ struct Pyramid {
  // The finest level on demand (lazyTextures): its tiles decoded when first read (loadTile), each into a block of its own.
  std::string file;int channels=0,alphaChannel=-1,fileBase=0;bool alphaOnly=false;std::mutex lazyLock;
  // Loaded tiles, oldest first: under memory pressure the oldest are let go (letGo), and read again if asked for again.
- struct LazyTile {std::unique_ptr<unsigned char[]> block;unsigned level,tile;size_t size;};
+ struct LazyTile {Block block;unsigned level,tile;size_t size;unsigned node;};
  std::deque<LazyTile> lazyTiles;size_t lazyBytes=0;std::atomic<unsigned> lazyLoaded{0},lazyFlat{0},lazyWide{0};
  // One texel of the file as kept: channels mapped, alpha as colour.
  surface::V3 kept(const float* d)const{surface::V3 c;float a;texelChannels(d,channels,alphaChannel,c,a);if(alphaOnly)c={a,a,a};return c;}
@@ -162,20 +178,36 @@ struct Pyramid {
   surface::V3 value=held[0];
   if(flat&&!p->compressed){unsigned char check[12];storeTexel(value,format,check,p->rounds);if(p->rounds&&!wide)value=halfRoundedTexel(value);}
   const size_t size=flat?sizeof(surface::V3):p->compressed?size_t(tex::tileBytes(2,0)):size_t(tw)*th*tex::texelBytes(format);
-  std::unique_ptr<unsigned char[]> block(new unsigned char[size]);
+  const unsigned node=multi::currentNode();Block block=nodeBlock(size,node);
   if(flat)std::memcpy(block.get(),&value,sizeof(surface::V3));
   else if(p->compressed)encodeTile(held.data(),tw,th,block.get());
   else for(size_t at=0;at<held.size();++at)storeTexel(held[at],format,block.get()+at*tex::texelBytes(format),p->rounds);
   std::lock_guard<std::mutex> g(p->lazyLock);if(page)return;
   std::atomic_thread_fence(std::memory_order_release);
   page=reinterpret_cast<const surface::V3*>(reinterpret_cast<uintptr_t>(block.get())|(flat?1u:wide?2u:0u));
-  p->lazyTiles.push_back({std::move(block),level,tile,size});p->lazyBytes+=size;p->bytes+=size;p->lazyLoaded++;if(flat)p->lazyFlat++;else if(wide)p->lazyWide++;}
- size_t lazyHeld(){std::lock_guard<std::mutex> g(lazyLock);return lazyBytes;}
- // The oldest tiles, up to want bytes: their pages cleared, their blocks handed over to free once no reader has them.
- size_t letGo(size_t want,std::vector<std::unique_ptr<unsigned char[]>>& out){
+  p->lazyTiles.push_back({std::move(block),level,tile,size,node});nodeTileBytes(node)+=size;p->lazyBytes+=size;p->bytes+=size;p->lazyLoaded++;if(flat)p->lazyFlat++;else if(wide)p->lazyWide++;}
+ // The decoded tiles it holds, in bytes: all, or those on one node.
+ size_t lazyHeld(int node=-1){std::lock_guard<std::mutex> g(lazyLock);if(node<0)return lazyBytes;size_t n=0;for(const auto& t:lazyTiles)if(int(t.node)==node)n+=t.size;return n;}
+ // The oldest tiles (of one node, or of any), up to want bytes: their pages cleared, their blocks handed over to free once
+ // no reader has them.
+ size_t letGo(size_t want,std::vector<Block>& out,int node=-1){
   std::lock_guard<std::mutex> g(lazyLock);size_t freed=0;
-  while(freed<want&&!lazyTiles.empty()){auto& t=lazyTiles.front();if(tex::flatPage(pages[t.level][t.tile]))lazyFlat--;else if(tex::widePage(pages[t.level][t.tile]))lazyWide--;pages[t.level][t.tile]=nullptr;freed+=t.size;out.push_back(std::move(t.block));lazyTiles.pop_front();lazyLoaded--;}
+  for(auto it=lazyTiles.begin();freed<want&&it!=lazyTiles.end();){if(node>=0&&int(it->node)!=node){++it;continue;}auto& t=*it;
+   if(tex::flatPage(pages[t.level][t.tile]))lazyFlat--;else if(tex::widePage(pages[t.level][t.tile]))lazyWide--;pages[t.level][t.tile]=nullptr;freed+=t.size;
+   nodeTileBytes(t.node)-=t.size;out.push_back(std::move(t.block));it=lazyTiles.erase(it);lazyLoaded--;}
   lazyBytes-=freed;bytes-=freed;return freed;}
+ // The oldest tiles of node from, up to want bytes, copied into node to's memory (the calling thread on to: multi::OnNode),
+ // their pages pointed at the copies and the old blocks handed over to free once no reader has them. A reader holding a
+ // page reads the same texels in either.
+ size_t moveTo(unsigned from,unsigned to,size_t want,std::vector<Block>& out){
+  std::lock_guard<std::mutex> g(lazyLock);size_t moved=0;
+  for(auto& t:lazyTiles){if(moved>=want)break;if(t.node!=from)continue;
+   auto& page=pages[t.level][t.tile];const uintptr_t tag=reinterpret_cast<uintptr_t>(page)&3u;
+   Block copy=nodeBlock(t.size,to);std::memcpy(copy.get(),t.block.get(),t.size);
+   std::atomic_thread_fence(std::memory_order_release);
+   page=reinterpret_cast<const surface::V3*>(reinterpret_cast<uintptr_t>(copy.get())|tag);
+   out.push_back(std::move(t.block));t.block=std::move(copy);nodeTileBytes(from)-=t.size;nodeTileBytes(to)+=t.size;t.node=to;moved+=t.size;}
+  return moved;}
  ~Pyramid();
  // Texture overflow mode: this pyramid's levels as BC6H (tex::Mip format 2). Not a map with negative values, BC6H's unsigned.
  bool compressed=false;
@@ -261,15 +293,52 @@ inline size_t tilesHeld(){std::lock_guard<std::mutex> listed(spillLock());size_t
 // Lets go of up to want bytes of decoded tiles, each texture's oldest, in proportion to what it holds, and returns what
 // went. A tile asked for again is decoded again from its file (the disk is its record; the card's copy, where it has
 // one, stays). Freed once every reader that may have seen one has left it (tex::spill).
-inline size_t relieve(size_t want){
- std::vector<std::unique_ptr<unsigned char[]>> grave;size_t freed=0;
- {std::lock_guard<std::mutex> listed(spillLock());size_t held=0;for(auto* p:spillList())held+=p->lazyHeld();if(!held)return 0;
-  for(auto* p:spillList()){const size_t mine=p->lazyHeld();if(mine)freed+=p->letGo(size_t(double(want)*double(mine)/double(held))+1,grave);}}
- if(grave.empty())return 0;
+// Blocks freed once every reader that may have seen one has left it (tex::spill).
+inline void bury(std::vector<Block>& grave){
+ if(grave.empty())return;
  std::atomic_thread_fence(std::memory_order_seq_cst);
  const unsigned long long stamp=tex::spill::epoch.fetch_add(1,std::memory_order_seq_cst);
  for(auto& r:tex::spill::readers){for(;;std::this_thread::yield()){const auto in=r.in.load(std::memory_order_seq_cst);if(!in||in>stamp)break;}}
- grave.clear();HeapCompact(GetProcessHeap(),0);return freed;
+ grave.clear();
+}
+inline size_t relieve(size_t want,int node=-1){
+ std::vector<Block> grave;size_t freed=0;
+ {std::lock_guard<std::mutex> listed(spillLock());size_t held=0;for(auto* p:spillList())held+=p->lazyHeld(node);if(!held)return 0;
+  for(auto* p:spillList()){const size_t mine=p->lazyHeld(node);if(mine)freed+=p->letGo(size_t(double(want)*double(mine)/double(held))+1,grave,node);}}
+ if(grave.empty())return 0;
+ bury(grave);HeapCompact(node<0?GetProcessHeap():nodeHeap(unsigned(node)),0);return freed;
+}
+// NUMA (multi_device.h): a node short of memory first moves its oldest tiles to the node with the most room, read from
+// there across the sockets, far quicker than decoding them again from their files; only what no node has room for is
+// let go. A node's reserve is a tenth of its share of the machine's RAM, 1 GB at least; XPU2_SIMULATE_NODE_MB=a,b,...
+// holds each node's tiles to that many MB instead (0: no limit).
+inline size_t migrate(unsigned from,unsigned to,size_t want){
+ std::vector<Block> grave;size_t moved=0;
+ {multi::OnNode there(int(to));
+  std::lock_guard<std::mutex> listed(spillLock());size_t held=0;for(auto* p:spillList())held+=p->lazyHeld(int(from));if(!held)return 0;
+  for(auto* p:spillList()){const size_t mine=p->lazyHeld(int(from));if(mine)moved+=p->moveTo(from,to,size_t(double(want)*double(mine)/double(held))+1,grave);}}
+ bury(grave);if(moved)HeapCompact(nodeHeap(from),0);return moved;
+}
+inline size_t nodeCap(unsigned node){return size_t(multi::simulatedEntry("XPU2_SIMULATE_NODE_MB",node))<<20;}
+inline size_t nodeReserve(){MEMORYSTATUSEX s{};s.dwLength=sizeof s;GlobalMemoryStatusEx(&s);
+ return std::max<size_t>(size_t(s.ullTotalPhys/std::max<size_t>(1,multi::nodes().size())/10),1ull<<30);}
+// What a node asks to be let go of or moved now, in bytes.
+inline size_t nodePressure(unsigned node){
+ if(std::getenv("XPU2_SIMULATE_NODE_MB")){const size_t cap=nodeCap(node),held=nodeTileBytes(node).load();return cap&&held>cap?held-cap:0;}
+ ULONGLONG free=0;if(!GetNumaAvailableMemoryNodeEx(USHORT(node),&free))return 0;
+ const size_t reserve=nodeReserve();return free<reserve?reserve-size_t(free):0;}
+// The room a node has for tiles from another, in bytes: what it has past twice its reserve.
+inline size_t nodeRoom(unsigned node){
+ if(std::getenv("XPU2_SIMULATE_NODE_MB")){const size_t cap=nodeCap(node),held=nodeTileBytes(node).load();return !cap?(size_t(1)<<40):held<cap?cap-held:0;}
+ ULONGLONG free=0;if(!GetNumaAvailableMemoryNodeEx(USHORT(node),&free))return 0;
+ const size_t keep=2*nodeReserve();return free>keep?size_t(free)-keep:0;}
+// Each node short of memory: its tiles moved to the node with the most room, the rest let go. What was moved and let go.
+inline void relieveNodes(size_t& moved,size_t& freed,unsigned& lastTo){
+ if(!multi::numa())return;
+ for(unsigned node:multi::nodes()){size_t want=nodePressure(node);if(!want)continue;
+  unsigned to=node;size_t room=0;for(unsigned other:multi::nodes())if(other!=node){const size_t r=nodeRoom(other);if(r>room){room=r;to=other;}}
+  if(room){const size_t m=migrate(node,to,std::min(want,room));moved+=m;want-=std::min(want,m);lastTo=to;}
+  if(want)freed+=relieve(want,int(node));}
 }
 // What memory pressure asks to be let go now, in bytes: the machine's free RAM below its reserve (a tenth of it, 2 GB at
 // least), or the session's committed memory past 92% of its ceiling (ceiling 0: none; commit is not RAM: the graphics driver
@@ -294,7 +363,12 @@ inline void watchPressure(size_t ceiling){
   // that helped nothing is not repeated at once: the wait doubles, from 2 s to a minute, until the pressure has passed. And tiles
   // that could not make much of what is asked for are left alone. Past that the texture overflow mode is what can help.
   const size_t floor=std::getenv("XPU2_SESSION_SPILL_MB")?0:(1ull<<30);int wait=2;
+  size_t nodeMoved=0,nodeFreed=0;unsigned nodeTo=0;auto nodeSaid=said;
   for(;;std::this_thread::sleep_for(std::chrono::milliseconds(250))){
+   relieveNodes(nodeMoved,nodeFreed,nodeTo);
+   if((nodeMoved||nodeFreed)&&std::chrono::steady_clock::now()-nodeSaid>std::chrono::seconds(5)){
+    std::printf("MoonRay XPU2: NUMA node short of memory: %zu MB of decoded texture tiles moved to node %u, %zu MB let go\n",nodeMoved>>20,nodeTo,nodeFreed>>20);
+    std::fflush(stdout);nodeSaid=std::chrono::steady_clock::now();nodeMoved=nodeFreed=0;}
    const size_t want=pressure(ceiling);if(!want){wait=2;continue;}
    const auto now=std::chrono::steady_clock::now();
    if(floor&&now<next)continue;

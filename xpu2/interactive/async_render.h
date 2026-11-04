@@ -368,8 +368,16 @@ public:
         }
         if (useGpu && useCpu && o.reserveFeederCore && (multi::spread() || GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) &&
             process && (process & (process - 1))) {
+            // On the first card's node where there are several (multi_device.h): it feeds that card.
+            DWORD_PTR near = process;
+            if (multi::numa() && gpu_->node() >= 0) {
+                DWORD_PTR node = 0;
+                for (const auto& p : multi::places())
+                    if (int(p.node) == gpu_->node() && p.group == multi::currentGroup()) node |= DWORD_PTR(p.mask);
+                if (process & node) near = process & node;
+            }
             DWORD_PTR feeder = DWORD_PTR(1) << (8 * sizeof(DWORD_PTR) - 1);  // the highest allowed processor
-            while (!(process & feeder)) feeder >>= 1;
+            while (!(near & feeder)) feeder >>= 1;
             workerMask = process & ~feeder;
             pin.to(feeder);
         }

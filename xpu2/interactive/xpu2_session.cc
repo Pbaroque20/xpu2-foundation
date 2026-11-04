@@ -8,6 +8,7 @@
 //       Compiles the GPU programs into OptiX's disk cache, printing progress: about an hour the first time, then
 //       cached for every session after. A mark of it is left (shaderMark) for this driver and these programs.
 //   moonray_xpu2 --shaders-compiled
+//   moonray_xpu2 --list-devices   (the processor groups and graphics cards, one a line, for Device Management)
 //       Exits 0 when the mark is there, 3 when it is not.
 //
 // Where XPU2 does not render a scene (PATH_TRACER.md says what it renders), its GPU programs are not compiled yet,
@@ -243,6 +244,9 @@ std::unique_ptr<async::GpuLane> gpuLane(const Programs& p, std::function<void(un
     async::GpuOptions options;
     options.device = card;
     options.lane = lane;
+    // Made on the node nearest the card, where there are several (multi_device.h).
+    options.node = gpu::cardNode(card, lane);
+    multi::OnNode near(options.node);
     if (const unsigned threads = multi::simulatedEntry("XPU2_SIMULATE_CARD_THREADS", size_t(lane)))
         options.launchThreads = std::min(options.launchThreads, threads);
     options.compileProgress = std::move(progress);
@@ -319,8 +323,9 @@ int compileShaders(const fs::path& folder) {
             std::printf("MoonRay XPU2 shaders: %u compile tasks done, %u waiting, %.0f s\n", done, waiting, last);
             std::fflush(stdout);
         };
-        // Each graphics card used (multi_device.h): OptiX's cache holds the programs for each kind of card.
-        const std::vector<int> cards = multi::cardOrdinals(gpu::cardCount());
+        // Every graphics card, switched on or not (multi_device.h): OptiX's cache holds the programs for each kind of
+        // card, so a card switched on later renders at once.
+        const std::vector<int> cards = multi::cardOrdinals(gpu::cardCount(), true);
         gpuLane(p, progress, cards.empty() ? 0 : cards[0]);
         for (size_t k = 1; k < cards.size(); ++k)
             if (cards[k] != cards[0]) {
@@ -334,6 +339,28 @@ int compileShaders(const fs::path& folder) {
         std::cerr << "MoonRay XPU2 shaders: " << e.what() << std::endl;
         return 1;
     }
+}
+
+// --list-devices: a line for each processor group (group, its number or simulated place, its processors, the
+// processor's name) and each graphics card (card, CUDA's number or simulated lane, its UUID, its memory in bytes, its
+// name), tab-separated. Simulated groups and lanes (XPU2_SIMULATE_GROUPS, XPU2_SIMULATE_CARDS) are listed as
+// they render, so Device Management can be tried on a machine without them.
+int listDevices() {
+    const std::string cpu = multi::processorName();
+    const bool simulatedGroups = multi::simulated("XPU2_SIMULATE_GROUPS") > 1;
+    const auto& groups = multi::allGroups();
+    for (size_t i = 0; i < groups.size(); ++i)
+        std::printf("group\t%u\t%u\t%s\n", simulatedGroups ? unsigned(i) : unsigned(groups[i].number), groups[i].processors, cpu.c_str());
+    const std::vector<gpu::CardInfo> cards = gpu::cardInfos();
+    if (const unsigned n = multi::simulated("XPU2_SIMULATE_CARDS"); n > 1 && !cards.empty()) {
+        for (unsigned k = 0; k < n; ++k)
+            std::printf("card\t%u\t%s-%u\t%zu\t%s (simulated %u)\n", k, cards[0].uuid.c_str(), k, cards[0].bytes, cards[0].name.c_str(), k + 1);
+    } else {
+        for (size_t k = 0; k < cards.size(); ++k)
+            std::printf("card\t%zu\t%s\t%zu\t%s\n", k, cards[k].uuid.c_str(), cards[k].bytes, cards[k].name.c_str());
+    }
+    std::fflush(stdout);
+    return 0;
 }
 
 int shadersCompiled(const fs::path& folder) {
@@ -1697,15 +1724,17 @@ int session(const Args& args, const fs::path& directory) {
                         TerminateProcess(GetCurrentProcess(), 0);
                     });
                     try {
-                        gpu = gpuLane(p);
-                        // The other graphics cards (multi_device.h), each a lane following the first; a card that
-                        // cannot make one is left out.
+                        // The first chosen graphics card's lane, then the others (multi_device.h), each a lane
+                        // following the first; a card that cannot make one is left out.
                         const std::vector<int> cards = multi::cardOrdinals(gpu::cardCount());
+                        gpu = gpuLane(p, {}, cards.empty() ? 0 : cards[0]);
                         for (size_t k = 1; k < cards.size(); ++k) {
                             try {
                                 gpu->follow(gpuLane(p, {}, cards[k], int(k)));
                                 std::printf("MoonRay XPU2: graphics card %d (lane %zu) renders with the first%s\n", cards[k], k,
                                             cards[k] == cards[0] ? " (simulated, XPU2_SIMULATE_CARDS)" : "");
+                                if (gpu->followers().back()->node() >= 0)
+                                    std::printf("MoonRay XPU2: graphics card %d (lane %zu) near node %d\n", cards[k], k, gpu->followers().back()->node());
                             } catch (const std::exception& e) {
                                 gpu->use();
                                 std::printf("MoonRay XPU2: graphics card %d left out: %s\n", cards[k], e.what());
@@ -1714,6 +1743,9 @@ int session(const Args& args, const fs::path& directory) {
                         if (multi::spread())
                             std::printf("MoonRay XPU2: %zu processor groups, %u logical processors%s\n", multi::groups().size(),
                                         multi::logicalProcessors(), multi::simulated("XPU2_SIMULATE_GROUPS") > 1 ? " (simulated, XPU2_SIMULATE_GROUPS)" : "");
+                        if (multi::numa())
+                            std::printf("MoonRay XPU2: %zu NUMA nodes, the first graphics card near node %d%s\n", multi::nodes().size(), gpu->node(),
+                                        multi::simulated("XPU2_SIMULATE_NODES") > 1 ? " (simulated, XPU2_SIMULATE_NODES)" : "");
                     } catch (...) {
                         loaded.store(true);
                         guard.join();
@@ -2367,6 +2399,7 @@ int main(int argc, char** argv) {
     const fs::path folder = executableFolder();
     if (argc == 2 && std::string(argv[1]) == "--compile-shaders") return compileShaders(folder);
     if (argc == 2 && std::string(argv[1]) == "--shaders-compiled") return shadersCompiled(folder);
+    if (argc == 2 && std::string(argv[1]) == "--list-devices") return listDevices();
     const char* directory = std::getenv("MOONRAY_MODO_SESSION");
     if (!directory) return passThrough(argc, argv);
     memoryCeiling();
