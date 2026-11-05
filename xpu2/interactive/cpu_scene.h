@@ -3440,7 +3440,7 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
   for(const auto& [name,index]:materialIds){auto& rec=plan->materialRecords[index];rec.flags|=global;
    const auto found=sorted.find(name);
    if(found!=sorted.end()&&found->second->getSceneClass().getName()=="DwaToonMaterial"&&on("MOONRAY_MODO_TOON_TERMINATOR"))rec.flags|=shade::MatModoToonMaterial;}
-  plan->modoSwitches=(on("MOONRAY_MODO_TOON_ALBEDO")?1u:0u)|(on("MOONRAY_MODO_FOG_ALPHA")?2u:0u)|(on("MOONRAY_MODO_CRYPTO_VOLUMES")?4u:0u)|(on("MOONRAY_MODO_CAMERA_LIGHT_LPE")?8u:0u);}
+  plan->modoSwitches=(on("MOONRAY_MODO_TOON_ALBEDO")?1u:0u)|(on("MOONRAY_MODO_FOG_ALPHA")?2u:0u)|(on("MOONRAY_MODO_CRYPTO_VOLUMES")?4u:0u)|(on("MOONRAY_MODO_CAMERA_LIGHT_LPE")?8u:0u)|(on("MOONRAY_MODO_MIRRORED_MESHES")?16u:0u);}
  // The switches' records: copies of their materials' (a switch's switch first; a material not shaded fails the scene).
  {std::map<const rdl::SceneObject*,int> state;
   std::function<void(const rdl::SceneObject*)> fill=[&](const rdl::SceneObject* s){
@@ -3823,15 +3823,20 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
    prepLaps().add("made: positions",double(nowNs()-pieceBegan)*1e-9);
    PolygonSplit split;
    const bool reversed=paths&&get<rdl::Bool>(o,"reverse_normals");
+   // MOONRAY_MODO_MIRRORED_MESHES (tools/port_mirrored_meshes.py): a mesh its own placement mirrors has its winding
+   // reversed, as MoonRay's PolyMesh then does, so the geometric normal agrees with its own normals; a mesh both mirrored
+   // and reversed is not reversed. Its own normals are negated for reverse_normals alone.
+   const bool mirrored=paths&&spatial&&!shareInstance&&!item.instancer&&(plan->modoSwitches&16u)&&
+                       transform[0][0]*(transform[1][1]*transform[2][2]-transform[1][2]*transform[2][1])-transform[0][1]*(transform[1][0]*transform[2][2]-transform[1][2]*transform[2][0])+transform[0][2]*(transform[1][0]*transform[2][1]-transform[1][1]*transform[2][0])<0;
    if(paths){PrepPart t{"made: split"};split=splitPolygons(v,counts,indices,o.getName());
     // MoonRay's QuadMesh hands polygon maps four polyvertices; a displaced mesh is tessellated from its faces.
     need(!displacementShader||(!split.quads&&split.faceOf.size()==counts.size()),o.getName()+": a displacement on a mesh with faces of more than three vertices is not rendered yet");
     need(!displacementShader||!faceMask,o.getName()+": a displacement on a mesh with parts is not rendered yet");}
    else for(size_t i=0;i<counts.size();++i){need(counts[i]==3,"Non-triangle mesh");split.corners.insert(split.corners.end(),{unsigned(i*3),unsigned(i*3+1),unsigned(i*3+2)});split.faceOf.push_back(unsigned(i));}
-   if(reversed){
+   if(reversed!=mirrored){
     // Its smooth normals are made from the faces as given (initAttributesAndDisplace), then negated with the rest.
     PolygonSplit given=split;reverseSplit(split,counts,indices);split.quadVertices=given.quadVertices;
-    need(!displacementShader,o.getName()+": a displaced mesh with reversed normals falls back");}
+    need(!displacementShader,o.getName()+(reversed?": a displaced mesh with reversed normals falls back":": a displaced mirrored mesh falls back"));}
    const long long keptBegan=nowNs();
    std::vector<unsigned> kept;  // the split's triangles kept, in order
    for(size_t i=0;i<split.faceOf.size();++i){if(faceMask&&!(*faceMask)[split.faceOf[i]])continue;unsigned ids[3];for(int j=0;j<3;++j){auto k=paths?split.vertices[i*3+size_t(j)]:indices[split.corners[i*3+size_t(j)]];need(k>=0&&size_t(k)<v.size(),"Vertex index out of bounds");ids[j]=unsigned(k);}
@@ -3864,7 +3869,10 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
      else m->normals=displace::smoothNormals(m->positions,split.vertices,3);
      // A moving mesh's second normal sample, from its second time step.
      if(!m->steps.empty())m->normals1=split.quads?displace::smoothNormals(m->steps[0],split.quadVertices,4):displace::smoothNormals(m->steps[0],split.vertices,3);
-     m->normalRate=shade::RateVertex;}
+     m->normalRate=shade::RateVertex;
+     // A mirrored quad mesh's are made from its quads as given, turned over by the mirror: negated, as MoonRay's
+     // (a triangle mesh's from its reversed triangles are already outward).
+     if(mirrored&&!reversed&&split.quads){for(auto& n:m->normals)n=surface::mul(n,-1.0f);for(auto& n:m->normals1)n=surface::mul(n,-1.0f);}}
     if(!nl.empty()){
      // Normals transform by the inverse transpose of the node transform (row vectors: n * inverse(M)^T).
      double M[3][3];for(int i=0;i<3;++i)for(int j=0;j<3;++j)M[i][j]=transform[i][j];

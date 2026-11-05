@@ -2,15 +2,16 @@
 // (as geom::internal::VdbVolume reads them) and kept as NanoVDB grids, sampled as MoonRay's VDBSampler samples them:
 // OpenVDB's GridSampler over PointSampler (the nearest voxel, rounded half away from zero), BoxSampler (trilinear,
 // its lerps in OpenVDB's order and precision) and QuadraticSampler (a parabola through the voxels about the floor
-// voxel, along z, then y, then x), at a point in the grid's own world space through its linear transform. The host
-// lane alone reads NanoVDB grids (the CUDA lane leaves VDB volumes to the CPU, async_gpu.h); both read the dense grids
-// a mapped BaseVolume's extinction is baked into. Derived from MoonRay and OpenVDB,
+// voxel, along z, then y, then x), at a point in the grid's own world space through its linear transform. Both lanes
+// read the NanoVDB grids (the GPU's uploaded whole, async_gpu.h's uploadGrids) and the dense grids a mapped BaseVolume's
+// extinction is baked into. Derived from MoonRay and OpenVDB,
 // Apache-2.0 (MOONRAY_LICENSE.txt; OpenVDB Copyright Contributors to the OpenVDB Project).
 #pragma once
 #include "surface_core.h"
 
-#if !defined(__CUDACC__)
+// NanoVDB on both lanes: on the GPU its headers come by name from gpu_build.rtc_headers (with nvrtc_limits.h).
 #include <nanovdb/NanoVDB.h>
+#if !defined(__CUDACC__)
 #include <cmath>
 #endif
 
@@ -42,27 +43,26 @@ struct Grids {
     float time = 0.0f;  // the ray's time in the shutter (a moving or advected VDB's)
 };
 
-#if !defined(__CUDACC__)
 // OpenVDB's Transform::worldToIndex for a linear map: the point times the inverse matrix, in doubles.
-inline void gridIndex(const Grid& g, V3 p, double out[3]) {
+X2_HD inline void gridIndex(const Grid& g, V3 p, double out[3]) {
     const double* m = g.worldToIndex;
     for (int c = 0; c < 3; ++c) out[c] = double(p.x) * m[0 * 4 + c] + double(p.y) * m[1 * 4 + c] + double(p.z) * m[2 * 4 + c] + m[3 * 4 + c];
 }
 // BoxSampler's lerp: (b - a) * weight in doubles, added to a in the value's type.
-inline float boxLerp(float a, float b, double w) { return a + float(double(b - a) * w); }
+X2_HD inline float boxLerp(float a, float b, double w) { return a + float(double(b - a) * w); }
 // QuadraticSampler's parabola through value[0..2] (at -1, 0, 1) at weight.
-inline float quadratic(const float* v, double w) {
+X2_HD inline float quadratic(const float* v, double w) {
     const float a = float(0.5 * double(v[0] + v[2]) - double(v[1])), b = float(0.5 * double(v[2] - v[0])), c = v[1];
     return float(w * (w * double(a) + double(b)) + double(c));
 }
 template <class AccT, class F>
-inline void interpolate(const AccT& acc, const double ip[3], U32 mode, unsigned n, F value, float* out) {
+X2_HD inline void interpolate(const AccT& acc, const double ip[3], U32 mode, unsigned n, F value, float* out) {
     if (mode == InterpolationPoint) {
-        const nanovdb::Coord ijk(int(::round(ip[0])), int(::round(ip[1])), int(::round(ip[2])));
+        const nanovdb::Coord ijk(int(round(ip[0])), int(round(ip[1])), int(round(ip[2])));
         value(acc, ijk, out);
         return;
     }
-    const int i0 = int(std::floor(ip[0])), j0 = int(std::floor(ip[1])), k0 = int(std::floor(ip[2]));
+    const int i0 = int(floor(ip[0])), j0 = int(floor(ip[1])), k0 = int(floor(ip[2]));
     const double uvw[3] = {ip[0] - i0, ip[1] - j0, ip[2] - k0};
     if (mode == InterpolationBox) {
         float d[2][2][2][3];
@@ -93,7 +93,7 @@ inline void interpolate(const AccT& acc, const double ip[3], U32 mode, unsigned 
     }
 }
 // A float grid's value at p (the grid's world space); zero without a grid.
-inline float sampleFloat(const Grids& gs, U32 grid, V3 p, U32 mode) {
+X2_HD inline float sampleFloat(const Grids& gs, U32 grid, V3 p, U32 mode) {
     if (grid >= gs.count || !gs.grids[grid].data || gs.grids[grid].vec3) return 0.0f;
     const Grid& g = gs.grids[grid];
     const auto* nano = static_cast<const nanovdb::FloatGrid*>(g.data);
@@ -105,7 +105,7 @@ inline float sampleFloat(const Grids& gs, U32 grid, V3 p, U32 mode) {
     return out;
 }
 // A Vec3 grid's value at p; zero without a grid. A dense grid's nearest voxel (the baked density's POINT sampling).
-inline V3 sampleVec3(const Grids& gs, U32 grid, V3 p, U32 mode) {
+X2_HD inline V3 sampleVec3(const Grids& gs, U32 grid, V3 p, U32 mode) {
     if (grid < gs.count && gs.grids[grid].dense) {
         const Grid& g = gs.grids[grid];
         double ip[3];
@@ -130,21 +130,5 @@ inline V3 sampleVec3(const Grids& gs, U32 grid, V3 p, U32 mode) {
     }, out);
     return V3{out[0], out[1], out[2]};
 }
-#else
-X2_HD inline float sampleFloat(const Grids&, U32, V3, U32) { return 0.0f; }
-// The GPU reads the dense grids alone (a mapped BaseVolume's baked extinction): the nearest voxel, as the host does
-// (OpenVDB's worldToIndex in doubles, rounded half away from zero); zero outside, or for a NanoVDB grid.
-X2_HD inline V3 sampleVec3(const Grids& gs, U32 grid, V3 p, U32) {
-    if (grid >= gs.count || !gs.grids[grid].dense) return V3{0, 0, 0};
-    const Grid& g = gs.grids[grid];
-    const double* m = g.worldToIndex;
-    double ip[3];
-    for (int c = 0; c < 3; ++c) ip[c] = double(p.x) * m[0 * 4 + c] + double(p.y) * m[1 * 4 + c] + double(p.z) * m[2 * 4 + c] + m[3 * 4 + c];
-    const int i = int(round(ip[0])) - g.denseMin[0], j = int(round(ip[1])) - g.denseMin[1], k = int(round(ip[2])) - g.denseMin[2];
-    if (i < 0 || j < 0 || k < 0 || i >= g.dims[0] || j >= g.dims[1] || k >= g.dims[2]) return V3{0, 0, 0};
-    const float* v = g.dense + 3 * ((size_t(k) * size_t(g.dims[1]) + size_t(j)) * size_t(g.dims[0]) + size_t(i));
-    return V3{v[0], v[1], v[2]};
-}
-#endif
 
 }  // namespace xpu2::interactive::volume

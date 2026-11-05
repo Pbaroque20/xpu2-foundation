@@ -20,9 +20,11 @@ HEADERS = ('async_gpu_abi.h', 'points_core.h', 'async_adaptive_core.h', 'async_i
            'shade_fresnel.h', 'shade_color.h', 'shade_lobes.h', 'shade_lobes_eval.h', 'shade_hair.h', 'shade_flakes.h', 'shade_glitter.h', 'shade_glitter_tables.h', 'shade_state.h', 'shade_builder.h',
            'shade_colorcorrect.h', 'shade_dwabase.h', 'shade_dwalayer.h', 'shade_maps.h', 'shade_noise.h', 'shade_bssrdf.h', 'shade_mapnodes.h', 'shade_mapnodes_more.h', 'curve_core.h', 'curve_embree.h', 'volume_core.h', 'shade_material.h',
            'dwa_admission.h', 'map_admission.h', 'aov_core.h', 'aov_material.h', 'aov_state.h', 'aov_crypto.h', 'camera_core.h', 'light_filter_core.h', 'volume_grid.h', 'volume_emission.h',
-           'async_gpu_device.h', 'bc6h_core.h')
+           'async_gpu_device.h', 'bc6h_core.h', 'nvrtc_limits.h')
 FAST_FLAGS = ['--std=c++17', '--gpu-architecture=compute_75', '--fmad=true', '--prec-div=true',
-              '--prec-sqrt=true', '--ftz=false', '-DXPU2_PATHS_ONLY']
+              '--prec-sqrt=true', '--ftz=false', '-DXPU2_PATHS_ONLY',
+              # NanoVDB (VDB volumes on the GPU, volume_grid.h) leaves some of its small functions unannotated: device ones.
+              '-default-device']
 
 
 def build_all(source, runtime, out):

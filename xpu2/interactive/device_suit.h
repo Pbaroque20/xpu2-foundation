@@ -60,6 +60,7 @@ inline Seeded seed(const mixed::Config& config, const cpu::Plan& plan, const Cpu
     CpuBackend backend{scene};
     backend.setTime(0.5f);
     volume::Crossing x[volume::MaxCrossings];
+    const volume::Grids hostGrids{plan.volumeGridViews.data(), U32(plan.volumeGridViews.size()), nullptr, 0.0f};
     for (U32 ty = 0; ty < tilesY; ++ty)
         for (U32 tx = 0; tx < tilesX; ++tx) {
             const size_t cell = size_t(ty / per) * cellsX + tx / per;
@@ -86,8 +87,9 @@ inline Seeded seed(const mixed::Config& config, const cpu::Plan& plan, const Cpu
                 for (U32 i = 0; i < n && x[i].t < until; ++i) {
                     if (!(x[i].flags & volume::Entry) || x[i].volume >= plan.volumes.size()) continue;
                     const volume::Shader& v = plan.volumes[x[i].volume];
-                    // The GPU's rule (async_gpu.cu volumeCrossings): only homogeneous volumes without emission are its.
-                    if (v.kind != volume::KindBase || v.emission.x != 0.0f || v.emission.y != 0.0f || v.emission.z != 0.0f) defer = true;
+                    // The GPU's own rule (volume::gpuRenders, as its volumeCrossings asks it), with the host's grids: a
+                    // homogeneous volume, a mapped one whose maps it bakes, a VDB one without glow (GPU_VDB).
+                    if (!volume::gpuRenders(v, hostGrids)) defer = true;
                     c += 1.0;
                     a *= 0.8;
                 }

@@ -9,7 +9,8 @@
 //       cached for every session after. A mark of it is left (shaderMark) for this driver and these programs.
 //   moonray_xpu2 --shaders-compiled
 //   moonray_xpu2 --list-devices   (the processor groups and graphics cards, one a line, for Device Management)
-//       Exits 0 when the mark is there, 3 when it is not.
+//       Exits 0 when the mark is there for every kind of card in the machine, 4 when it is out of date (other
+//       programs, another driver, or a kind of card it was not compiled for), 3 when there is none.
 //
 // Where XPU2 does not render a scene (PATH_TRACER.md says what it renders), its GPU programs are not compiled yet,
 // or the GPU fails, the session prints "@@MODO_XPU2 FALLBACK <reason>" and ends: the kit then starts MoonRay in its
@@ -301,11 +302,49 @@ ShaderStamp shaderStamp(const Programs& p) {
     return stamp;
 }
 fs::path shaderMark(const Programs& p) { return shaderStamp(p).mark; }
-void markCompiled(const Programs& p) {
+
+// A kind of graphics card, by its name: OptiX's cache holds the programs for each kind, cards of one kind sharing them.
+// A simulated lane (XPU2_SIMULATE_CARDS) is the first card's kind.
+std::string cardKind(int ordinal) {
+    static const std::vector<gpu::CardInfo> infos = gpu::cardInfos();
+    if (ordinal >= 0 && size_t(ordinal) < infos.size() && !infos[size_t(ordinal)].name.empty()) return infos[size_t(ordinal)].name;
+    return infos.empty() || infos[0].name.empty() ? std::string("graphics card") : infos[0].name;
+}
+
+// The kinds of card a mark says the programs were compiled for: a line "card <name>" each, after the programs and
+// driver. A mark from before the lines (one compile for the first card, and the others with it) is the first card's.
+std::set<std::string> compiledKinds(const fs::path& mark) {
+    std::set<std::string> kinds;
+    std::ifstream file(mark);
+    if (!file) return kinds;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("card ", 0) == 0 && line.size() > 5) kinds.insert(line.substr(5));
+    }
+    if (kinds.empty()) kinds.insert(cardKind(0));
+    return kinds;
+}
+
+void markCompiled(const Programs& p, const std::set<std::string>& kinds) {
     std::error_code ignored;
     const ShaderStamp stamp = shaderStamp(p);
     fs::create_directories(stamp.mark.parent_path(), ignored);
-    std::ofstream(stamp.mark) << "compiled\n" << stamp.programs << ' ' << stamp.driver << '\n';
+    std::ofstream file(stamp.mark);
+    file << "compiled\n" << stamp.programs << ' ' << stamp.driver << '\n';
+    for (const std::string& kind : kinds) file << "card " << kind << '\n';
+}
+
+// The kinds of the machine's cards, switched on or not, that the mark does not hold: each needs compiling.
+std::vector<std::pair<int, std::string>> uncompiledCards(const fs::path& mark, bool every = true) {
+    const std::set<std::string> held = fs::exists(mark) ? compiledKinds(mark) : std::set<std::string>{};
+    std::vector<std::pair<int, std::string>> out;
+    std::set<std::string> listed;
+    for (int card : multi::cardOrdinals(gpu::cardCount(), every)) {
+        const std::string kind = cardKind(card);
+        if (!held.count(kind) && listed.insert(kind).second) out.emplace_back(card, kind);
+    }
+    return out;
 }
 
 // --compile-shaders: the GPU programs into OptiX's disk cache, with progress as it goes.
@@ -323,16 +362,28 @@ int compileShaders(const fs::path& folder) {
             std::printf("MoonRay XPU2 shaders: %u compile tasks done, %u waiting, %.0f s\n", done, waiting, last);
             std::fflush(stdout);
         };
-        // Every graphics card, switched on or not (multi_device.h): OptiX's cache holds the programs for each kind of
-        // card, so a card switched on later renders at once.
-        const std::vector<int> cards = multi::cardOrdinals(gpu::cardCount(), true);
-        gpuLane(p, progress, cards.empty() ? 0 : cards[0]);
-        for (size_t k = 1; k < cards.size(); ++k)
-            if (cards[k] != cards[0]) {
-                std::printf("MoonRay XPU2 shaders: graphics card %d\n", cards[k]);
-                gpuLane(p, progress, cards[k]);
-            }
-        markCompiled(p);
+        // Every kind of graphics card in the machine, switched on or not (multi_device.h), that the mark does not hold
+        // yet: OptiX's cache holds the programs for each kind of card, so a card switched on later renders at once, and
+        // a kind compiled before is not compiled again. Each kind is added to the mark as it is done.
+        const fs::path mark = shaderMark(p);
+        std::set<std::string> kinds = fs::exists(mark) ? compiledKinds(mark) : std::set<std::string>{};
+        const auto missing = uncompiledCards(mark);
+        if (missing.empty() && fs::exists(mark)) {
+            std::printf("MoonRay XPU2 shaders: up to date for every graphics card\n");
+            return 0;
+        }
+        if (missing.empty()) {
+            gpuLane(p, progress, 0);
+            kinds.insert(cardKind(0));
+        }
+        for (const auto& [card, kind] : missing) {
+            std::printf("MoonRay XPU2 shaders: graphics card %d (%s)\n", card, kind.c_str());
+            std::fflush(stdout);
+            gpuLane(p, progress, card);
+            kinds.insert(kind);
+            markCompiled(p, kinds);
+        }
+        markCompiled(p, kinds);
         std::printf("MoonRay XPU2 shaders: compiled in %.0f s\n", seconds());
         return 0;
     } catch (const std::exception& e) {
@@ -367,6 +418,15 @@ int shadersCompiled(const fs::path& folder) {
     try {
         const ShaderStamp stamp = shaderStamp(programs(folder));
         if (fs::exists(stamp.mark)) {
+            // These programs and this driver, but a kind of card in the machine not compiled for (one added since):
+            // out of date, naming it, and Compile XPU2 Shaders compiles that kind alone.
+            const auto missing = uncompiledCards(stamp.mark);
+            if (!missing.empty()) {
+                std::string names;
+                for (const auto& [card, kind] : missing) names += (names.empty() ? "" : ", ") + kind;
+                std::cout << "MoonRay XPU2 shaders: out of date: new graphics card " << names << std::endl;
+                return 4;
+            }
             std::cout << "MoonRay XPU2 shaders: compiled" << std::endl;
             return 0;
         }
@@ -1698,7 +1758,7 @@ int session(const Args& args, const fs::path& directory) {
                 scene.prepare();
                 // Said for every scene sent while it holds, the preview's notices being each scene's.
                 if (const std::string overflow = texture::overflowWords(); !overflow.empty())
-                    modoProtocolLine("@@MODO_XPU2 NOTICE Texture overflow mode: memory ran short, so textures are " + overflow +
+                    modoProtocolLine("@@MODO_XPU2 NOTICE Texture Overflow: memory ran short, so textures are " + overflow +
                                      ". Free memory, or use fewer or smaller textures, then start the preview again for full detail.");
                 if (scene.plan->aovs) checkOutputs(*scene.plan->aovs, mode != 0);
                 if (mode != 0 && !gpu) {
@@ -1706,8 +1766,27 @@ int session(const Args& args, const fs::path& directory) {
                     if (!fs::exists(shaderMark(p))) {
                         outlines.watch(nullptr, id, 0, 0);
                         fallback("XPU2's GPU programs are not compiled yet: System > Preferences > MoonRay > XPU2 > "
-                                 "Compile XPU2 Shaders (about an hour, once)");
+                                 "Device Management > Compile XPU2 Shaders (about an hour, once)");
                         return 0;
+                    }
+                    // The chosen cards whose kind the programs were compiled for: one of a kind not compiled for (a card
+                    // added since) is left out, said, and would otherwise compile for an hour here.
+                    std::vector<int> cards;
+                    {
+                        const std::set<std::string> held = compiledKinds(shaderMark(p));
+                        std::string left;
+                        for (int card : multi::cardOrdinals(gpu::cardCount())) {
+                            if (held.count(cardKind(card))) cards.push_back(card);
+                            else left += (left.empty() ? "" : ", ") + cardKind(card);
+                        }
+                        if (cards.empty()) {
+                            outlines.watch(nullptr, id, 0, 0);
+                            fallback("XPU2's GPU programs are not compiled for " + left + ": System > Preferences > MoonRay > XPU2 > "
+                                     "Device Management > Compile XPU2 Shaders");
+                            return 0;
+                        }
+                        if (!left.empty())
+                            std::printf("MoonRay XPU2: left out, its shaders not compiled (Compile XPU2 Shaders): %s\n", left.c_str());
                     }
                     // Taken from OptiX's cache in a second or two. Its cache emptied (a driver update, its size limit),
                     // they would compile for an hour here: past a minute the session leaves the scene to MoonRay.
@@ -1726,8 +1805,7 @@ int session(const Args& args, const fs::path& directory) {
                     try {
                         // The first chosen graphics card's lane, then the others (multi_device.h), each a lane
                         // following the first; a card that cannot make one is left out.
-                        const std::vector<int> cards = multi::cardOrdinals(gpu::cardCount());
-                        gpu = gpuLane(p, {}, cards.empty() ? 0 : cards[0]);
+                        gpu = gpuLane(p, {}, cards[0]);
                         for (size_t k = 1; k < cards.size(); ++k) {
                             try {
                                 gpu->follow(gpuLane(p, {}, cards[k], int(k)));

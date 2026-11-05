@@ -609,6 +609,201 @@ struct VolumeLpe {
     float* aovs = nullptr;
     float* depths = nullptr;
 };
+// A march along a ray through the volumes (decoupledRayMarching's steps), from its start each time it is run: each step
+// to emit(step, index), which stops it by returning false. The CPU lane keeps the steps in a table; the CUDA lane keeps
+// none (a VDB cloud's hundreds or thousands do not fit a thread) and finds a step it needs by marching again, the
+// marching stream started the same, so the very same steps (ReplaySteps, GPU_VDB).
+template <class Backend>
+struct VolumeMarch {
+    const mixed::Config& c;
+    Backend& backend;
+    const volume::Shader* shaders;
+    volume::Grids grids;
+    const volume::Crossing* x;
+    U32 n, regionsAtStart;
+    V3 org, dir;
+    float tnear, tfar;
+    U32 depth;
+    bool cutouts, sampleEmission;
+    paths::Stream start;  // the marching stream as a march begins
+    U32 limit;     // a march's steps are fewer than this (the CPU lane's table, volume::MarchLimit)
+    // What a march leaves: the transmittances, each volume's emission, the volumes met, the steps taken.
+    V3 vt, vth, vta, vtm;
+    V3 emitted[volume::MaxVolumes];
+    U32 visited, count;
+    bool reachedThreshold, stopped;
+
+    template <class Emit>
+    X2_HD void run(Emit& emit) {
+        paths::Stream marching = start;
+        U32 regions = regionsAtStart;
+        vt = vth = vta = V3{1, 1, 1};
+        vtm = V3{0, 0, 0};
+        for (U32 v = 0; v < volume::MaxVolumes; ++v) emitted[v] = V3{0, 0, 0};
+        visited = count = 0;
+        reachedThreshold = stopped = false;
+        auto update = [&](V3 tr, V3 trh) {
+            vt = volume::times(vt, tr);
+            vth = volume::times(vth, trh);
+            const V3 oldMin = vtm;
+            vtm = volume::plus(volume::times(trh, vtm), volume::times(V3{1.0f - trh.x, 1.0f - trh.y, 1.0f - trh.z}, vta));
+            vta = volume::plus(volume::times(tr, vta), volume::times(V3{1.0f - tr.x, 1.0f - tr.y, 1.0f - tr.z}, oldMin));
+        };
+        auto take = [&](const volume::Step& s) {
+            if (!emit(s, count)) stopped = true;
+            ++count;
+        };
+        auto march = [&](float t0, float t1) {
+            if (!regions || t1 >= volume::FarLimit || count + 1 >= limit || reachedThreshold || stopped) return;
+            visited |= regions;
+            float minFeatureSize;
+            if (volume::stretchHomogeneous(shaders, regions, minFeatureSize)) {
+                const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? marching.next() : 0.0f;
+                V3 emissions[volume::MaxVolumes];
+                U32 chosen = volume::MaxVolumes;
+                const volume::Coefficients k = volume::evalShadersAt(shaders, grids, regions, c.volumeOverlapMode, rnd, org, t1 - t0, volume::NoGrid,
+                                                                     sampleEmission ? emissions : nullptr, &chosen, cutouts);
+                take(volume::Step{k.sigmaT, k.sigmaS, vt, k.g, t0, t1 - t0, k.lightSet, k.sigmaTh, k.sigmaSh, vth, chosen, k.surfaceThreshold});
+                const V3 tr = volume::expNeg(k.sigmaT, t1 - t0), trh = volume::expNeg(k.sigmaTh, t1 - t0);
+                if (sampleEmission) {
+                    // emission * e^(-sigmaT t) over the stretch: (1 - tr) / sigmaT (per channel, none without extinction).
+                    auto integral = [&](V3 e) {
+                        const V3 w{volume::isZero(k.sigmaT.x) ? 0.0f : (1.0f - tr.x) / k.sigmaT.x, volume::isZero(k.sigmaT.y) ? 0.0f : (1.0f - tr.y) / k.sigmaT.y,
+                                   volume::isZero(k.sigmaT.z) ? 0.0f : (1.0f - tr.z) / k.sigmaT.z};
+                        return volume::times(volume::times(volume::times(vt, vth), e), w);
+                    };
+                    if (c.volumeOverlapMode == volume::OverlapSum) {
+                        for (U32 v = 0; v < volume::MaxVolumes; ++v)
+                            if (regions >> v & 1) emitted[v] = volume::plus(emitted[v], integral(emissions[v]));
+                    } else if (chosen < volume::MaxVolumes) {
+                        emitted[chosen] = volume::plus(emitted[chosen], integral(emissions[0]));
+                    }
+                }
+                update(tr, trh);
+                return;
+            }
+            // A heterogeneous stretch: steps of the least feature size over the volume quality (wider deeper in the
+            // path), the first at a random place in the first step, each step's coefficients at its end.
+            const float u = marching.next();
+            const float stepSize = minFeatureSize * c.invVolumeQuality * fmaxf(float(int(depth) - 1), 1.0f);
+            float stepStart = t0, t = t0 + stepSize * u;
+            auto step = [&](float at) {
+                const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? marching.next() : 0.0f;
+                V3 emissions[volume::MaxVolumes];
+                U32 chosen = volume::MaxVolumes;
+                const volume::Coefficients k = volume::evalShadersAt(shaders, grids, regions, c.volumeOverlapMode, rnd, surface::add(org, surface::mul(dir, at)),
+                                                                     -1.0f, volume::NoGrid, sampleEmission ? emissions : nullptr, &chosen, cutouts);
+                const float delta = at - stepStart;
+                take(volume::Step{k.sigmaT, k.sigmaS, vt, k.g, stepStart, delta, k.lightSet, k.sigmaTh, k.sigmaSh, vth, chosen, k.surfaceThreshold});
+                const V3 te = volume::times(vt, vth);
+                if (sampleEmission) {
+                    if (c.volumeOverlapMode == volume::OverlapSum) {
+                        for (U32 v = 0; v < volume::MaxVolumes; ++v)
+                            if (regions >> v & 1) emitted[v] = volume::plus(emitted[v], volume::scaled(volume::times(te, emissions[v]), delta));
+                    } else if (chosen < volume::MaxVolumes) {
+                        emitted[chosen] = volume::plus(emitted[chosen], volume::scaled(volume::times(te, emissions[0]), delta));
+                    }
+                }
+                update(volume::expNeg(k.sigmaT, delta), volume::expNeg(k.sigmaTh, delta));
+            };
+            while (t < t1) {
+                if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
+                    reachedThreshold = true;
+                    return;
+                }
+                step(t);
+                if (stopped) return;
+                stepStart = t;
+                t += stepSize;
+                if (count + 1 >= limit) return;
+            }
+            if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
+                reachedThreshold = true;
+                return;
+            }
+            if (t - t1 > volume::Epsilon) step(t1);
+        };
+        float tStart = tnear;
+        for (U32 i = 0; i < n; ++i) {
+            if (x[i].t > tfar || reachedThreshold || stopped) break;
+            if (x[i].t - tStart > volume::Epsilon) {
+                march(tStart, x[i].t);
+                tStart = x[i].t;
+            }
+            volume::apply(regions, x[i]);
+        }
+        if (tfar - tStart > volume::Epsilon && !reachedThreshold && !stopped) march(tStart, tfar);
+    }
+};
+// A step's weight for distance sampling: its scattering, through what lies before it.
+X2_HD inline float stepWeight(const volume::Step& s) {
+    return volume::lum(volume::times(volume::scaled(s.sigmaS, s.delta), s.tr)) + volume::lum(volume::times(volume::scaled(s.sigmaSh, s.delta), s.trH));
+}
+// The steps of a march as the light sampling asks them: by distance sampling (tabulate and sampleDiscrete's choice, its
+// pdf and the number remapped into the step) and by where along the ray (findInterval, with the step's pdfDiscrete).
+// The CPU lane's from its table (TableSteps); the CUDA lane's by marching again (ReplaySteps), its distribution's cdf made
+// as tabulate makes it: the weights summed in order, each partial sum no more than the total, the last the total; even
+// steps where none weighs.
+struct TableSteps {
+    const volume::Step* steps;
+    const volume::Distribution* dist;
+    U32 count;
+    X2_HD volume::Step pick(float r, float& pdf, float& remapped) const { return steps[volume::sampleDiscrete(*dist, r, pdf, remapped)]; }
+    X2_HD volume::Step at(float t, float& pdf) const {
+        U32 k = 0;
+        while (k + 1 < count && steps[k + 1].tStart <= t) ++k;
+        pdf = volume::pdfDiscrete(*dist, k);
+        return steps[k];
+    }
+};
+template <class March>
+struct ReplaySteps {
+    March& m;
+    U32 count;
+    float total;  // the weights' sum; one where none weighs
+    bool weightless;
+    X2_HD float cdf(float& partial, const volume::Step& s, U32 index) const {
+        if (index + 1 >= count) return total;
+        if (weightless) return float(index + 1) / float(count);
+        partial += stepWeight(s);
+        if (partial > total) partial = total;
+        return partial;
+    }
+    X2_HD volume::Step pick(float r, float& pdf, float& remapped) const {
+        const float rw = r * total;
+        float partial = 0.0f, prev = 0.0f, found = total, before = 0.0f;
+        volume::Step chosen{};
+        auto emit = [&](const volume::Step& s, U32 i) {
+            const float here = cdf(partial, s, i);
+            chosen = s;
+            if (here >= rw || i + 1 >= count) {
+                found = here, before = prev;
+                return false;
+            }
+            prev = here;
+            return true;
+        };
+        m.run(emit);
+        const float value = found - before;
+        pdf = value / total;
+        remapped = (rw - before) / value;
+        return chosen;
+    }
+    X2_HD volume::Step at(float t, float& pdf) const {
+        float partial = 0.0f, here = 0.0f, kept = 0.0f, keptPrev = 0.0f;
+        volume::Step chosen{};
+        auto emit = [&](const volume::Step& s, U32 i) {
+            if (i > 0 && s.tStart > t) return false;
+            const float before = here;
+            here = cdf(partial, s, i);
+            chosen = s, kept = here, keptPrev = i > 0 ? before : 0.0f;
+            return i + 1 < count;
+        };
+        m.run(emit);
+        pdf = (kept - keptPrev) / total;
+        return chosen;
+    }
+};
 template <class Backend>
 X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, Backend& backend, paths::Pending& pv, V3 org, V3 dir,
                           float tnear, float tfar, V3* alphaTransmittance = nullptr, V3* minTransmittance = nullptr,
@@ -628,127 +823,67 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
     const U64 volumeBranch = childBranch(pv.branch, 0xfffc, pv.volumeDepth);
     sample::Identity vid = root;
     vid.branch = childBranch(volumeBranch, 0, 0);
-    Stream marching(vid, pv.depth, 0);
+    // VolumeTransmittance: through the volumes (E), through the holdouts (H), the alpha's and its minimum; camera rays
+    // hold cutouts out (decoupledRayMarching's depth == 0). A camera ray's volume emission (decoupledRayMarching with
+    // perVolumeLVe): each volume's, through what lies before.
+    const bool cutouts = pv.depth == 0, sampleEmission = pv.depth == 0;
+    const volume::Grids grids = backend.volumeGrids();
+    VolumeMarch<Backend> march{c, backend, shaders, grids, x, n, regions, org, dir, tnear, tfar, pv.depth, cutouts, sampleEmission,
+                               Stream(vid, pv.depth, 0), volume::MarchLimit};
+    // The march once, what is needed of its steps taken as they come: the volume's "surface" (where the accumulated
+    // transmittance falls below one minus the step's threshold), each step's coverage of what showed through by its
+    // chosen volume at its middle (Cryptomatte), the weights' sum, the first step's start and the last one's end. The CPU
+    // lane keeps the steps too.
 #if defined(__CUDACC__)
-    volume::MarchSpace space;
+    volume::Step* steps = nullptr;
 #else
     volume::MarchSpace& space = volume::marchSpace();
-#endif
     volume::Step* steps = space.steps;
-    U32 count = 0;
-    // VolumeTransmittance: through the volumes (E), through the holdouts (H), the alpha's and its minimum; camera rays
-    // hold cutouts out (decoupledRayMarching's depth == 0).
-    V3 vt{1, 1, 1}, vth{1, 1, 1}, vta{1, 1, 1}, vtm{0, 0, 0};
-    const bool cutouts = pv.depth == 0;
-    auto update = [&](V3 tr, V3 trh) {
-        vt = volume::times(vt, tr);
-        vth = volume::times(vth, trh);
-        const V3 oldMin = vtm;
-        vtm = volume::plus(volume::times(trh, vtm), volume::times(V3{1.0f - trh.x, 1.0f - trh.y, 1.0f - trh.z}, vta));
-        vta = volume::plus(volume::times(tr, vta), volume::times(V3{1.0f - tr.x, 1.0f - tr.y, 1.0f - tr.z}, oldMin));
-    };
-    float tStart = tnear;
-    // A camera ray's volume emission (decoupledRayMarching with perVolumeLVe): each volume's, through what lies before.
-    const bool sampleEmission = pv.depth == 0;
-    V3 emitted[volume::MaxVolumes];
-    for (U32 v = 0; v < volume::MaxVolumes; ++v) emitted[v] = V3{0, 0, 0};
-    U32 visited = 0;
-    bool reachedThreshold = false;
-    const volume::Grids grids = backend.volumeGrids();
-    auto march = [&](float t0, float t1) {
-        if (!regions || t1 >= volume::FarLimit || count + 1 >= volume::MaxSteps || reachedThreshold) return;
-        visited |= regions;
-        float minFeatureSize;
-        if (volume::stretchHomogeneous(shaders, regions, minFeatureSize)) {
-            const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? marching.next() : 0.0f;
-            V3 emissions[volume::MaxVolumes];
-            U32 chosen = volume::MaxVolumes;
-            const volume::Coefficients k = volume::evalShadersAt(shaders, grids, regions, c.volumeOverlapMode, rnd, org, t1 - t0, volume::NoGrid,
-                                                                 sampleEmission ? emissions : nullptr, &chosen, cutouts);
-            steps[count++] = volume::Step{k.sigmaT, k.sigmaS, vt, k.g, t0, t1 - t0, k.lightSet, k.sigmaTh, k.sigmaSh, vth, chosen, k.surfaceThreshold};
-            const V3 tr = volume::expNeg(k.sigmaT, t1 - t0), trh = volume::expNeg(k.sigmaTh, t1 - t0);
-            if (sampleEmission) {
-                // emission * e^(-sigmaT t) over the stretch: (1 - tr) / sigmaT (per channel, none without extinction).
-                auto integral = [&](V3 e) {
-                    const V3 w{volume::isZero(k.sigmaT.x) ? 0.0f : (1.0f - tr.x) / k.sigmaT.x, volume::isZero(k.sigmaT.y) ? 0.0f : (1.0f - tr.y) / k.sigmaT.y,
-                               volume::isZero(k.sigmaT.z) ? 0.0f : (1.0f - tr.z) / k.sigmaT.z};
-                    return volume::times(volume::times(volume::times(vt, vth), e), w);
-                };
-                if (c.volumeOverlapMode == volume::OverlapSum) {
-                    for (U32 v = 0; v < volume::MaxVolumes; ++v)
-                        if (regions >> v & 1) emitted[v] = volume::plus(emitted[v], integral(emissions[v]));
-                } else if (chosen < volume::MaxVolumes) {
-                    emitted[chosen] = volume::plus(emitted[chosen], integral(emissions[0]));
-                }
-            }
-            update(tr, trh);
-            return;
-        }
-        // A heterogeneous stretch: steps of the least feature size over the volume quality (wider deeper in the
-        // path), the first at a random place in the first step, each step's coefficients at its end.
-        const float u = marching.next();
-        const float stepSize = minFeatureSize * c.invVolumeQuality * fmaxf(float(int(pv.depth) - 1), 1.0f);
-        float stepStart = t0, t = t0 + stepSize * u;
-        auto step = [&](float at) {
-            const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? marching.next() : 0.0f;
-            V3 emissions[volume::MaxVolumes];
-            U32 chosen = volume::MaxVolumes;
-            const volume::Coefficients k = volume::evalShadersAt(shaders, grids, regions, c.volumeOverlapMode, rnd, surface::add(org, surface::mul(dir, at)),
-                                                                 -1.0f, volume::NoGrid, sampleEmission ? emissions : nullptr, &chosen, cutouts);
-            const float delta = at - stepStart;
-            steps[count++] = volume::Step{k.sigmaT, k.sigmaS, vt, k.g, stepStart, delta, k.lightSet, k.sigmaTh, k.sigmaSh, vth, chosen,
-                                          k.surfaceThreshold};
-            const V3 te = volume::times(vt, vth);
-            if (sampleEmission) {
-                if (c.volumeOverlapMode == volume::OverlapSum) {
-                    for (U32 v = 0; v < volume::MaxVolumes; ++v)
-                        if (regions >> v & 1) emitted[v] = volume::plus(emitted[v], volume::scaled(volume::times(te, emissions[v]), delta));
-                } else if (chosen < volume::MaxVolumes) {
-                    emitted[chosen] = volume::plus(emitted[chosen], volume::scaled(volume::times(te, emissions[0]), delta));
-                }
-            }
-            update(volume::expNeg(k.sigmaT, delta), volume::expNeg(k.sigmaTh, delta));
-        };
-        while (t < t1) {
-            if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
-                reachedThreshold = true;
+#endif
+    float surfaceAccumulated = 1.0f, cryptoShown = 1.0f, weights = 0.0f, firstStart = 0.0f, lastEnd = 0.0f;
+    U32 lastVolume = volume::MaxVolumes;
+    bool surfaceFound = false;
+    auto cryptoAdd = [&](U32 v, float coverage, float depth) {
+        if (coverage <= 0.0f) return;
+        VolumeCryptoShares& cs = *cryptoShares;
+        for (U32 i = 0; i < cs.count; ++i)
+            if (cs.share[i].volume == v) {
+                cs.share[i].coverage += coverage;
+                cs.share[i].depth += coverage * depth;
                 return;
             }
-            step(t);
-            stepStart = t;
-            t += stepSize;
-            if (count + 1 >= volume::MaxSteps) return;
-        }
-        if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
-            reachedThreshold = true;
-            return;
-        }
-        if (t - t1 > volume::Epsilon) step(t1);
+        if (cs.count < 16) cs.share[cs.count++] = VolumeCryptoShare{v, coverage, coverage * depth};
     };
-    for (U32 i = 0; i < n; ++i) {
-        if (x[i].t > tfar || reachedThreshold) break;
-        if (x[i].t - tStart > volume::Epsilon) {
-            march(tStart, x[i].t);
-            tStart = x[i].t;
-        }
-        volume::apply(regions, x[i]);
-    }
-    if (tfar - tStart > volume::Epsilon && !reachedThreshold) march(tStart, tfar);
-    if (count == 0) return radiance;
-    // The volume's "surface": where the accumulated transmittance falls below one minus the step's threshold.
-    if (surfaceT) {
-        float accumulated = 1.0f;
-        for (U32 i = 0; i < count; ++i) {
-            const float sigmaT = volume::lum(steps[i].sigmaT);
-            const float stepTr = expf(-sigmaT * steps[i].delta);
-            const float desired = 1.0f - steps[i].surfaceThreshold;
-            if (desired > accumulated * stepTr) {
-                *surfaceT = steps[i].tStart + -logf(desired / accumulated) / sigmaT;
-                break;
+    auto first = [&](const volume::Step& s, U32 i) {
+        if (steps) steps[i] = s;
+        if (i == 0) firstStart = s.tStart;
+        lastEnd = s.tStart + s.delta;
+        lastVolume = s.volume;
+        weights += stepWeight(s);
+        if (surfaceT && !surfaceFound) {
+            const float sigmaT = volume::lum(s.sigmaT);
+            const float stepTr = expf(-sigmaT * s.delta);
+            const float desired = 1.0f - s.surfaceThreshold;
+            if (desired > surfaceAccumulated * stepTr) {
+                *surfaceT = s.tStart + -logf(desired / surfaceAccumulated) / sigmaT;
+                surfaceFound = true;
+            } else {
+                surfaceAccumulated *= stepTr;
             }
-            accumulated *= stepTr;
         }
-    }
+        if (cryptoShares) {
+            const float covered = cryptoShown * (1.0f - expf(-volume::lum(s.sigmaT) * s.delta));
+            cryptoAdd(s.volume, covered, s.tStart + 0.5f * s.delta);
+            cryptoShown -= covered;
+        }
+        return true;
+    };
+    march.run(first);
+    const U32 count = march.count;
+    if (count == 0) return radiance;
+    V3 vt = march.vt, vth = march.vth, vta = march.vta, vtm = march.vtm;
+    const bool reachedThreshold = march.reachedThreshold;
+    const U32 visited = march.visited;
     // Past the transmittance threshold the volume is opaque, and its alpha the holdouts' minimum.
     if (reachedThreshold) {
         vt = V3{0, 0, 0};
@@ -756,39 +891,21 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
     }
     if (alphaTransmittance) *alphaTransmittance = vta;
     if (minTransmittance) *minTransmittance = vtm;
-    // Each step's coverage of what showed through, by its chosen volume, at its middle; past the threshold the last
-    // volume covers the rest.
+    // Each step's coverage, taken above; past the threshold the last volume covers the rest.
     if (cryptoShares) {
-        VolumeCryptoShares& cs = *cryptoShares;
-        cs.marched = true;
-        auto add = [&](U32 v, float coverage, float depth) {
-            if (coverage <= 0.0f) return;
-            for (U32 i = 0; i < cs.count; ++i)
-                if (cs.share[i].volume == v) {
-                    cs.share[i].coverage += coverage;
-                    cs.share[i].depth += coverage * depth;
-                    return;
-                }
-            if (cs.count < 16) cs.share[cs.count++] = VolumeCryptoShare{v, coverage, coverage * depth};
-        };
-        float shown = 1.0f;
-        for (U32 i = 0; i < count; ++i) {
-            const float covered = shown * (1.0f - expf(-volume::lum(steps[i].sigmaT) * steps[i].delta));
-            add(steps[i].volume, covered, steps[i].tStart + 0.5f * steps[i].delta);
-            shown -= covered;
-        }
+        cryptoShares->marched = true;
         if (reachedThreshold) {
-            add(steps[count - 1].volume, shown, steps[count - 1].tStart + steps[count - 1].delta);
-            shown = 0.0f;
+            cryptoAdd(lastVolume, cryptoShown, lastEnd);
+            cryptoShown = 0.0f;
         }
-        cs.shown = fminf(fmaxf(shown, 0.0f), 1.0f);
+        cryptoShares->shown = fminf(fmaxf(cryptoShown, 0.0f), 1.0f);
     }
     const V3 T = pv.T;
     // The camera ray's volume emission, each volume's through what lay before it on the path.
     if (sampleEmission)
         for (U32 v = 0; v < volume::MaxVolumes; ++v) {
             if (!(visited >> v & 1)) continue;
-            const V3 emission = volume::times(T, emitted[v]);
+            const V3 emission = volume::times(T, march.emitted[v]);
             if (volume::black(emission)) continue;
             radiance = volume::plus(radiance, emission);
             if (lpe) lpeAdd(emission, aov::lpeNext(*lpe->t, pv.lpe, aov::LpeEmission, shaders[v].lpeLabel));
@@ -796,14 +913,17 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
     // The path's state at a volume scattering event (volumeEventTransition).
     const int volumeState = lpe ? aov::lpeVolume(*lpe->t, pv.lpe) : -1;
     if (pv.volumeDepth < c.maxVolumeDepth) {
+#if defined(__CUDACC__)
+        const ReplaySteps<VolumeMarch<Backend>> lookup{march, count, weights != 0.0f ? weights : 1.0f, weights == 0.0f};
+#else
         // The steps' weights for distance sampling: their scattering, through what lies before them.
         float* density = space.density;
-        for (U32 i = 0; i < count; ++i)
-            density[i] = volume::lum(volume::times(volume::scaled(steps[i].sigmaS, steps[i].delta), steps[i].tr)) +
-                         volume::lum(volume::times(volume::scaled(steps[i].sigmaSh, steps[i].delta), steps[i].trH));
+        for (U32 i = 0; i < count; ++i) density[i] = stepWeight(steps[i]);
         volume::Distribution& dist = space.dist;
         volume::tabulate(dist, density, count);
-        const float rayEnd = steps[count - 1].tStart + steps[count - 1].delta;
+        const TableSteps lookup{steps, &dist, count};
+#endif
+        const float rayEnd = lastEnd;
         // integrateVolumeScatteringDirect
         const bool highQuality = pv.nonMirrorDepth == 0;
         const U32 samplesPerLight = highQuality ? c.lightSamples : 1, scatterCount = highQuality ? c.volumeIlluminationSamples : 1;
@@ -827,20 +947,19 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
                             offset = surface::dot(surface::add(pivot, surface::mul(org, -1.0f)), dir);
                             const V3 foot = surface::add(org, surface::mul(dir, offset));
                             D = shade::length(surface::add(pivot, surface::mul(foot, -1.0f)));
-                            thetaA = atan2f(steps[0].tStart - offset, D);
+                            thetaA = atan2f(firstStart - offset, D);
                             thetaB = atan2f(rayEnd - offset, D);
                             const float te = volume::sampleEquiAngular(ue, D, thetaA, thetaB);
                             const float pdfTe = volume::pdfEquiAngular(te, D, thetaA, thetaB);
                             if (pdfTe != 0.0f && volume::finitef(pdfTe)) {
                                 const float tePrime = te + offset;
-                                U32 k = 0;  // findInterval: the last step starting at or before tePrime
-                                while (k + 1 < count && steps[k + 1].tStart <= tePrime) ++k;
-                                const volume::Step& vp = steps[k];
+                                float pdfK;  // findInterval: the last step starting at or before tePrime, and its pdfDiscrete
+                                const volume::Step vp = lookup.at(tePrime, pdfK);
                                 if (!volume::black(vp.sigmaS) && backend.inSet(vp.lightSet, li)) {
                                     const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH),
                                                                        volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), tePrime - vp.tStart));
                                     float mis = 1.0f;
-                                    const float pdfTd = volume::pdfDiscrete(dist, k) *
+                                    const float pdfTd = pdfK *
                                                         volume::pdfDistanceExponential(tePrime, volume::lum(vp.sigmaT), vp.tStart,
                                                                                        vp.tStart + vp.delta);
                                     if (volume::finitef(pdfTd)) mis = lights::powerHeuristic(pdfTe, pdfTd);
@@ -855,9 +974,8 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
                         const float ud = ss.next();
                         const float udl[3] = {ss.next(), ss.next(), ss.next()};
                         float pdfDensity, udRemapped;
-                        const U32 k = volume::sampleDiscrete(dist, ud, pdfDensity, udRemapped);
+                        const volume::Step vp = lookup.pick(ud, pdfDensity, udRemapped);
                         if (pdfDensity == 0.0f) continue;
-                        const volume::Step& vp = steps[k];
                         if (volume::black(vp.sigmaS) || !backend.inSet(vp.lightSet, li)) continue;
                         const float sigmaT = volume::lum(vp.sigmaT), t0 = vp.tStart, t1 = vp.tStart + vp.delta;
                         const float td = volume::sampleDistanceExponential(udRemapped, sigmaT, t0, t1);
@@ -939,8 +1057,7 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
                 mid.branch = childBranch(volumeBranch, 0xffff, i);
                 Stream ms(mid, pv.depth, 0);
                 float pdfDensity, utRemapped;
-                const U32 k = volume::sampleDiscrete(dist, ms.next(), pdfDensity, utRemapped);
-                const volume::Step& vp = steps[k];
+                const volume::Step vp = lookup.pick(ms.next(), pdfDensity, utRemapped);
                 float sigmaT = volume::lum(volume::plus(vp.sigmaT, vp.sigmaTh));
                 const float t0 = vp.tStart, t1 = vp.tStart + vp.delta;
                 const float td = volume::sampleDistanceExponential(utRemapped, sigmaT, t0, t1);

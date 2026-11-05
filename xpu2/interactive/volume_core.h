@@ -20,12 +20,19 @@ constexpr U32 MaxVolumes = 32;    // a scene's volumes: one bit each in a ray's 
 constexpr U32 MaxCrossings = 32;  // crossings collected along one ray
 // The steps a ray's march keeps (decoupledRayMarching's VolumeProperties): a homogeneous stretch is one, a
 // heterogeneous one a step each feature size over the volume quality. The host keeps a march's steps in a buffer of
-// its own (volumeSteps); the CUDA lane marches homogeneous volumes alone.
+// its own (volumeSteps); the CUDA lane none (it marches again, ReplaySteps).
+// A march's steps are fewer than this on both lanes (async_integrator.h's VolumeMarch): the CPU lane keeps them in a table
+// (MarchSpace); the CUDA lane keeps none, marching again for a step it needs (ReplaySteps).
+constexpr U32 MarchLimit = 1u << 14;
 #if defined(__CUDACC__)
 constexpr U32 MaxSteps = MaxCrossings + 2;
 #else
-constexpr U32 MaxSteps = 1u << 14;
+constexpr U32 MaxSteps = MarchLimit;
 #endif
+// GPU_VDB: VDB volumes on the CUDA lane (gpuRenders): their grids uploaded whole (async_gpu.h's uploadGrids), sampled as
+// the host samples them (volume_grid.h), marched with no table of steps (async_integrator.h's ReplaySteps). Off: their
+// samples go to the CPU lane, as before.
+constexpr bool GpuVdb = true;
 constexpr float Epsilon = 1.1920928955078125e-07f;  // scene_rdl2 sEpsilon
 constexpr float HitEpsilonStart = 1e-5f;            // pbr sHitEpsilonStart
 constexpr float FarLimit = 0.999f * lights::DistantDistance;  // sHitEpsilonEnd * sDistantLightDistance
@@ -116,6 +123,15 @@ X2_HD inline bool homogeneous(const Shader& s) { return s.kind == KindBase; }
 X2_HD inline bool gpuRenders(const Shader& s, const Grids& grids) {
     if (s.emission.x != 0.0f || s.emission.y != 0.0f || s.emission.z != 0.0f) return false;
     if (s.kind == KindBase) return true;
+    if (s.kind == KindVdb) {
+        // A VDB volume the GPU samples from its NanoVDB grids (volume_grid.h): one that does not glow (an emissive volume
+        // lights every surface, left to the CPU lane with all its samples) and is not mapped (the maps run on the host),
+        // its grids on the card (null where uploadGrids has not sent them: then deferred, as before).
+        if (!GpuVdb) return false;
+        auto there = [&](U32 g) { return g == NoGrid || (g < grids.count && (grids.grids[g].data || grids.grids[g].dense)); };
+        return !s.mapped && s.emissionGrid == NoGrid && s.densityGrid != NoGrid && there(s.densityGrid) && there(s.bakedGrid) &&
+               (!s.hasVelocity || there(s.velocityGrid));
+    }
     if (s.kind != KindBaseMapped) return false;
     const U32 attenuation = (1u << MapAttenuationColor) | (1u << MapAttenuationIntensity) | (1u << MapAttenuationFactor);
     if (s.mapped & ~attenuation) return false;

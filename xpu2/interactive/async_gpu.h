@@ -408,7 +408,7 @@ public:
             // where it was made again.
             scene_.volumes = upload(plan->volumes.data(), plan->volumes.size() * sizeof(volume::Shader));
             bool regrid = plan->volumeGridViews.size() != gridsSent_.size();
-            for (size_t k = 0; !regrid && k < gridsSent_.size(); ++k) regrid = plan->volumeGridViews[k].dense != gridsSent_[k];
+            for (size_t k = 0; !regrid && k < gridsSent_.size(); ++k) regrid = gridHeld(plan->volumeGridViews[k]) != gridsSent_[k];
             if (regrid) uploadGrids(*plan);
         }
         uploadConfig(plan);
@@ -2516,9 +2516,11 @@ private:
         }
     }
     std::vector<B> lightKeep_;
-    // The dense grids (mapped BaseVolumes' baked extinction) on the device, the NanoVDB ones left null; each grid's
+    // The grids on the device: dense ones (mapped BaseVolumes' baked extinction) and NanoVDB ones (VDB volumes); each grid's
     // host data as sent (a moved volume's baked grid made again is another, updatePlacements).
-    std::vector<const float*> gridsSent_;
+    std::vector<const void*> gridsSent_;
+    // A grid's host data, dense or NanoVDB, by which a grid made again is told from the one sent.
+    static const void* gridHeld(const volume::Grid& g) { return g.dense ? static_cast<const void*>(g.dense) : g.data; }
     void uploadGrids(const cpu::Plan& plan) {
         scene_.gridData.clear();
         scene_.volumeGrids = nullptr;
@@ -2527,9 +2529,22 @@ private:
         if (plan.volumeGridViews.empty()) return;
         std::vector<volume::Grid> views(plan.volumeGridViews.begin(), plan.volumeGridViews.end());
         for (auto& g : views) {
-            gridsSent_.push_back(g.dense);
+            gridsSent_.push_back(gridHeld(g));
+            if (!g.dense) {
+                // A VDB grid: its NanoVDB buffer whole (it holds its nodes by offsets, so it reads where it lands), for
+                // volume_grid.h to sample on the card as the host does.
+                const void* host = g.data;
+                g.data = nullptr;
+                if (!host || !volume::GpuVdb) continue;  // not sent while the card does not render VDB volumes
+                const size_t bytes = size_t(static_cast<const nanovdb::GridData*>(host)->mGridSize);
+                if (!bytes) continue;
+                gpu::Allocating what("a VDB volume's grid");
+                B data = upload(host, bytes);
+                g.data = reinterpret_cast<const void*>(data->pointer);
+                scene_.gridData.push_back(data);
+                continue;
+            }
             g.data = nullptr;
-            if (!g.dense) continue;
             const size_t floats = size_t(g.dims[0]) * size_t(g.dims[1]) * size_t(g.dims[2]) * 3;
             if (!floats) {
                 g.dense = nullptr;
