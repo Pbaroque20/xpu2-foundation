@@ -9,7 +9,7 @@
 //       cached for every session after. A mark of it is left (shaderMark) for this driver and these programs.
 //   moonray_xpu2 --shaders-compiled
 //   moonray_xpu2 --list-devices   (the processor groups and graphics cards, one a line, for Device Management)
-//   moonray_xpu2 --rhizome-master ... / --rhizome-node ...   (a frame across machines: rhizome_session.inc, RHIZOME.md)
+//   moonray_xpu2 rhizome node | master | id | trust | approve | revoke | status   (a frame across machines: rhizome_session.inc, RHIZOME.md)
 //       Exits 0 when the mark is there for every kind of card in the machine, 4 when it is out of date (other
 //       programs, another driver, or a kind of card it was not compiled for), 3 when there is none.
 //
@@ -2483,9 +2483,14 @@ int session(const Args& args, const fs::path& directory) {
 
 int main(int argc, char** argv) {
     const fs::path folder = executableFolder();
-    if (argc >= 2 && (std::string(argv[1]) == "--rhizome-master" || std::string(argv[1]) == "--rhizome-node")) {
-        memoryCeiling();
-        texture::watchPressure(ceilingBytes);
+    if (argc >= 2 && (std::string(argv[1]) == "rhizome" || std::string(argv[1]) == "--rhizome-master" || std::string(argv[1]) == "--rhizome-node")) {
+        // A node or master renders: its memory ceiling and the texture watch, as a session's. The identity verbs print
+        // their answer alone (a script reads the hash rhizome id prints).
+        const std::string verb = argc >= 3 ? argv[2] : "";
+        if (std::string(argv[1]) != "rhizome" || verb == "node" || verb == "master") {
+            memoryCeiling();
+            texture::watchPressure(ceilingBytes);
+        }
         try {
             return rhizomesession::run(argc, argv);
         } catch (const std::exception& e) {

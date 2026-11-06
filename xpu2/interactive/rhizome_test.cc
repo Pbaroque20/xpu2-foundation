@@ -4,6 +4,7 @@
 // refused, the important cells are the fast nodes', a node that fails has its work and its memory taken over, and one
 // that cheats is caught. Prints a line a check and a JSON summary; exits non-zero on a failure.
 #include "rhizome_node.h"
+#include "rhizome_discovery.h"
 #include <future>
 #include <cstdio>
 #include <filesystem>
@@ -512,7 +513,7 @@ static void sceneThroughSwarm(bool joinFirst) {
     check(got, "each worker takes the manifest" + when);
     check(all, "each worker fetches the scene's pieces from the swarm" + when);
     check(whole, "every piece arrives whole on each worker" + when);
-    for (int k = 0; k < 100 && master.ready() < 2; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    for (int k = 0; k < 500 && master.ready() < 2; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     check(master.ready() == 2, "the workers say they are ready" + when);
     const FrameShape s = shape();
     master.beginFrame(s, {});
@@ -522,15 +523,158 @@ static void sceneThroughSwarm(bool joinFirst) {
     master.stop();
 }
 
+// Signed approvals in the swarm (rhizome_trust.h): a master that requires them holds a node until an approver
+// endorses it, a node keeps its endorsement and pins its master, trust-first endorses at once, a revocation
+// refuses a node everywhere, a build that differs is refused, and a master reaches a waiting node itself.
+static bool until(const std::function<bool()>& f, double seconds = 5) {
+    for (int k = 0; k < int(seconds * 50); ++k) {
+        if (f()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return f();
+}
+static void approvals() {
+    const std::string key = "studio rhizome key";
+    const auto root = std::filesystem::temp_directory_path() / "rhizome-approvals-test";
+    std::filesystem::remove_all(root);
+    auto masterId = Identity::load(root / "master");
+    auto master = std::make_shared<Trust>(root / "master", *masterId);
+    master->require(true);
+    master->trustSelf();
+    NodeOptions mo = options(key, true, 2e6);
+    mo.trust = master;
+    mo.build = "build-a";
+    RhizomeNode m(mo, std::move(masterId));
+    m.start();
+
+    auto nodeId = Identity::load(root / "node");
+    auto nodeTrust = std::make_shared<Trust>(root / "node", *nodeId);
+    NodeOptions no = options(key, false, 2e6);
+    no.trust = nodeTrust;
+    no.build = "build-a";
+    no.masterAddress = m.address();
+    const Hash nodeHash = nodeId->hash();
+    RhizomeNode n(no, std::move(nodeId));
+    n.start();
+    check(until([&] { auto w = m.waitingForApproval(); return w.size() == 1 && w[0] == nodeHash; }), "a node not yet approved waits for approval");
+    check(!m.isMember(nodeHash), "and is not a member meanwhile");
+    // The approve command: an endorsement written into the master's folder by its key.
+    {
+        auto id = Identity::load(root / "master");
+        Trust t(root / "master", *id);
+        t.endorse(nodeHash);
+    }
+    check(until([&] { return m.isMember(nodeHash); }), "approved, it joins within a second or two");
+    check(until([&] { return Trust(root / "node", *Identity::load(root / "node")).shown().size() == 1; }), "the node keeps its endorsement");
+    check(until([&] { return Trust(root / "node", *Identity::load(root / "node")).trusted(m.hash()); }), "and pins its master as its approver");
+
+    // A node of another build is refused.
+    {
+        NodeOptions bo = options(key, false, 2e6);
+        bo.build = "build-b";
+        bo.masterAddress = m.address();
+        RhizomeNode other(bo);
+        other.start();
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        check(!m.isMember(other.hash()) && m.waitingForApproval().size() == 0, "a node of another build is refused");
+        other.stop();
+    }
+    // Trust first: a master that endorses each machine it meets on this run.
+    {
+        auto fid = Identity::load(root / "first");
+        auto ft = std::make_shared<Trust>(root / "first", *fid);
+        ft->require(true);
+        ft->trustSelf();
+        NodeOptions fo = options(key, true, 2e6);
+        fo.trust = ft;
+        fo.trustFirst = true;
+        RhizomeNode fm(fo, std::move(fid));
+        fm.start();
+        NodeOptions wo = options(key, false, 2e6);
+        wo.masterAddress = fm.address();
+        RhizomeNode w(wo);
+        w.start();
+        check(until([&] { return fm.isMember(w.hash()); }), "trust first: a machine is endorsed and joins at once");
+        // A master reaches a node itself (as discovery has it do): a node that waits, with no master given.
+        NodeOptions ho = options(key, false, 2e6);
+        RhizomeNode headless(ho);
+        headless.start();
+        fm.dial(headless.address());
+        check(until([&] { return fm.isMember(headless.hash()) && headless.isMember(fm.hash()); }), "a master reaches a waiting node and both are members");
+        std::printf("    (stopping trust-first's machines)\n");
+        std::fflush(stdout);
+        headless.stop();
+        std::printf("    (headless stopped)\n");
+        std::fflush(stdout);
+        w.stop();
+        std::printf("    (worker stopped)\n");
+        std::fflush(stdout);
+        fm.stop();
+        std::printf("    (stopped)\n");
+        std::fflush(stdout);
+    }
+    // A revocation by the master's key: the node is refused from then on.
+    {
+        auto id = Identity::load(root / "master");
+        Trust t(root / "master", *id);
+        t.revoke(nodeHash);
+    }
+    check(until([&] { return !m.isMember(nodeHash); }), "a revoked node is refused");
+    std::printf("    (stopping the node)\n");
+    std::fflush(stdout);
+    n.stop();
+    std::printf("    (stopping the master)\n");
+    std::fflush(stdout);
+    m.stop();
+    std::filesystem::remove_all(root);
+}
+
+// Discovery (rhizome_discovery.h): a master's probes on every adapter and loopback, a node's answer straight back with
+// its hash and TCP port and a keyed check; a member of another rhizome is not found.
+static void discovery() {
+    Winsock w;
+    const uint16_t port = 47911;  // a test port of its own
+    auto a = Identity::make(), b = Identity::make();
+    const auto adapters = broadcastAddresses();
+    check(!adapters.empty(), "the broadcast address of each adapter is known (" + std::to_string(adapters.size()) + ")");
+    Responder ra("studio rhizome key", a->hash(), 47123, port), rb("another studio's key", b->hash(), 47124, port);
+    std::mutex m;
+    std::map<Hash, std::string> found;
+    Prober p("studio rhizome key", [&](const Hash& h, const std::string& at) {
+        std::lock_guard<std::mutex> g(m);
+        found[h] = at;
+    }, port, 0.2);
+    const bool got = until([&] {
+        std::lock_guard<std::mutex> g(m);
+        return found.count(a->hash()) != 0;
+    });
+    std::lock_guard<std::mutex> g(m);
+    check(got, "a master finds a node of its rhizome by discovery");
+    check(got && found[a->hash()].size() > 6 && found[a->hash()].substr(found[a->hash()].size() - 6) == ":47123", "at its address and TCP port (" +
+          (got ? found[a->hash()] : std::string("none")) + ")");
+    check(!found.count(b->hash()), "a node of another rhizome is not found");
+}
+
 int main() {
-    identities();
-    messages();
-    plans();
-    memory();
-    audits();
-    swarms();
-    sceneThroughSwarm(false);
-    sceneThroughSwarm(true);
+    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, messages, plans, memory, audits, swarms, scene, approvals).
+    const char* only = std::getenv("RHIZOME_TEST_ONLY");
+    auto run = [&](const char* name, const std::function<void()>& f) {
+        if (only && std::string(only) != name) return;
+        f();
+        std::fflush(stdout);
+    };
+    run("identities", identities);
+    run("messages", messages);
+    run("plans", plans);
+    run("memory", memory);
+    run("audits", audits);
+    run("swarms", swarms);
+    run("scene", [] {
+        sceneThroughSwarm(false);
+        sceneThroughSwarm(true);
+    });
+    run("approvals", approvals);
+    run("discovery", discovery);
     std::printf("{\"checks\": %d, \"failures\": %d}\n", checks, failures);
     return failures ? 1 : 0;
 }

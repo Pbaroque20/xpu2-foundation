@@ -19,8 +19,10 @@
 #include "rhizome_schedule.h"
 #include "rhizome_swarm.h"
 #include "rhizome_wire.h"
+#include "rhizome_trust.h"
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -31,7 +33,11 @@
 
 namespace xpu2::interactive::rhizome {
 
-enum : uint16_t { TypeJoin = 15, TypePieceMoves = 16, TypePieceAsk = 17, TypePieceData = 18, TypeReassign = 19, TypeManifest = 20, TypeReady = 21 };
+enum : uint16_t {
+    TypeJoin = 15, TypePieceMoves = 16, TypePieceAsk = 17, TypePieceData = 18, TypeReassign = 19, TypeManifest = 20, TypeReady = 21,
+    TypeEndorse = 22,  // master -> node: its endorsement (and the master's own, for a delegation)
+    TypeRevoke = 23,   // a revocation, passed through the swarm
+};
 
 // A node's renderer: the film of a cell's rectangle for samples [first, first + count).
 using CellRenderer = std::function<Film(const uint32_t rect[4], uint32_t first, uint32_t count)>;
@@ -51,12 +57,21 @@ struct NodeOptions {
     // a node takes cells before it says it is ready (markReady), as the stand-in renderer's tests do.
     std::function<void(const Bytes&)> onManifest;
     bool readyAtJoin = true;
+    // Where the node writes its status each second (rhizome status reads it; empty: nowhere), and what it says of the
+    // job (the scene's name, set by the caller).
+    std::string statusPath, job;
+    // Signed approvals (rhizome_trust.h): this member's trust (none: the rhizome key alone admits), and, for a master,
+    // whether it endorses each machine it meets on this run (trust first). The XPU2 build it runs (empty: not checked).
+    std::shared_ptr<Trust> trust;
+    bool trustFirst = false;
+    std::string build;
     double heartbeat = 0.25, suspectAfter = 1.0, goneAfter = 2.0;
     bool masterRenders = true;  // the master takes cells too
     // Where it listens: an address of this machine (127.0.0.1 for a swarm on one machine, 0.0.0.0 for every network)
     // and a port (0: one the system picks), and the address the others are told to reach it at (empty: the bound one).
     std::string bind = "127.0.0.1", advertise;
     uint16_t port = 0;
+    bool portFallback = false;  // its port taken: one the system picks (a node's or master's default port)
     std::function<void(const std::string&)> log;
 };
 
@@ -91,8 +106,17 @@ public:
         a.sin_family = AF_INET;
         a.sin_port = htons(o_.port);
         inet_pton(AF_INET, o_.bind.c_str(), &a.sin_addr);
-        if (::bind(listener_, (sockaddr*)&a, sizeof a) != 0 || listen(listener_, 64) != 0)
-            throw std::runtime_error("cannot listen on " + o_.bind + ":" + std::to_string(o_.port));
+        if (::bind(listener_, (sockaddr*)&a, sizeof a) != 0 || listen(listener_, 64) != 0) {
+            // Its port taken (another node or master on this machine, started at the same moment): one the system
+            // picks, when it may (portFallback); discovery tells the master which.
+            if (!o_.portFallback || o_.port == 0) throw std::runtime_error("cannot listen on " + o_.bind + ":" + std::to_string(o_.port));
+            log("port " + std::to_string(o_.port) + " is taken here: another one is used");
+            closesocket(listener_);
+            listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            a.sin_port = 0;
+            if (::bind(listener_, (sockaddr*)&a, sizeof a) != 0 || listen(listener_, 64) != 0)
+                throw std::runtime_error("cannot listen on " + o_.bind);
+        }
         int len = sizeof a;
         getsockname(listener_, (sockaddr*)&a, &len);
         address_ = (o_.advertise.empty() ? (o_.bind == "0.0.0.0" ? std::string("127.0.0.1") : o_.bind) : o_.advertise) + ":" +
@@ -107,8 +131,9 @@ public:
             std::lock_guard<std::mutex> g(m_);
             pool_.addNode(hash(), o_.ramBytes, o_.vramBytes);
         } else {
-            // The master may not listen yet (it reads the scene first) or may go and come back: tried until it answers.
-            threads_.emplace_back([this] { reachMaster(); });
+            // Given a master: it may not listen yet (it reads the scene first) or may go and come back: tried until it
+            // answers. Not given one (a headless node): it waits to be found.
+            if (!o_.masterAddress.empty()) threads_.emplace_back([this] { reachMaster(); });
         }
     }
     // Stops everything (a node leaving, or one that fails in a test: its peers then find it silent).
@@ -123,14 +148,22 @@ public:
         for (auto& t : threads_)
             if (t.joinable()) t.join();
         threads_.clear();
+        {
+            std::lock_guard<std::mutex> g(dialsMutex_);
+            for (auto& t : dials_)
+                if (t.joinable()) t.join();
+            dials_.clear();
+        }
+        // Every connection, those adopted while the threads above ended too (a peer accepted just as this node
+        // stopped, or reached by a dial): closed, then their threads joined.
         std::vector<ConnPtr> conns;
         {
             std::lock_guard<std::mutex> g(m_);
             conns = conns_;
         }
+        for (auto& c : conns) c->close();
         for (auto& c : conns) {
             if (c->reader.joinable()) c->reader.join();
-            c->close();
             if (c->writer.joinable()) c->writer.join();
         }
     }
@@ -209,6 +242,26 @@ public:
     uint64_t audits() {
         std::lock_guard<std::mutex> g(m_);
         return auditsDone_;
+    }
+    // Reaches a member at host:port (a master dialling a node discovery found, or one given by address); the usual
+    // handshake follows. On a thread of its own: connecting may take a while.
+    void dial(const std::string& address) {
+        std::lock_guard<std::mutex> g(dialsMutex_);
+        dials_.emplace_back([this, address] {
+            if (running_) connectTo(address, false);
+        });
+    }
+    // The machines waiting for approval (master).
+    std::vector<Hash> waitingForApproval() {
+        std::lock_guard<std::mutex> g(m_);
+        std::vector<Hash> out;
+        for (const auto& [h, w] : waiting_) out.push_back(h);
+        return out;
+    }
+    bool isMember(const Hash& h) {
+        std::lock_guard<std::mutex> g(m_);
+        const Member* mm = members_.find(h);
+        return mm && mm->state != State::Gone && !mm->quarantined;
     }
     // Master: what the frame needs (the scene's files, as pieces in the pool), to every node now and each one joining.
     void publishManifest(const Bytes& manifest) {
@@ -332,6 +385,19 @@ private:
         }
     };
     using ConnPtr = std::shared_ptr<Conn>;
+    // A machine shaking hands: what it said of itself, kept until it is admitted.
+    struct Pending {
+        Bytes key;
+        Capabilities caps;
+        uint64_t ram = 0, vram = 0;
+        bool isMaster = false;
+        std::string build;
+        std::vector<Bytes> shown;  // its endorsements
+    };
+    struct Waiting {
+        ConnPtr conn;
+        Pending info;
+    };
 
     // RHIZOME_TRACE=1: every message taken or refused (heartbeats aside) in the log.
     static bool trace() {
@@ -355,12 +421,16 @@ private:
         c->s = s;
         BOOL on = 1;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&on, sizeof on);
-        {
-            std::lock_guard<std::mutex> g(m_);
-            conns_.push_back(c);
+        // Under the lock, as stop takes the connections: one adopted once the node is stopping is closed at once, and
+        // every other has its threads before stop can see it.
+        std::lock_guard<std::mutex> g(m_);
+        if (!running_) {
+            c->close();
+            return c;
         }
         c->reader = std::thread([this, c] { read(c); });
         c->writer = std::thread([c] { c->write(); });
+        conns_.push_back(c);
         return c;
     }
     void reachMaster() {
@@ -381,9 +451,17 @@ private:
     // False: not reached (said in the log when quiet is false).
     bool connectTo(const std::string& address, bool toMaster, bool tell = true) {
         const auto colon = address.rfind(':');
+        int port = -1;
+        if (colon != std::string::npos && colon + 1 < address.size() &&
+            address.find_first_not_of("0123456789", colon + 1) == std::string::npos && address.size() - colon - 1 <= 5)
+            port = std::stoi(address.substr(colon + 1));
+        if (port <= 0 || port > 65535) {
+            if (tell) log("not an address (host:port): " + address);
+            return false;
+        }
         sockaddr_in a{};
         a.sin_family = AF_INET;
-        a.sin_port = htons(uint16_t(std::stoi(address.substr(colon + 1))));
+        a.sin_port = htons(uint16_t(port));
         inet_pton(AF_INET, address.substr(0, colon).c_str(), &a.sin_addr);
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (connect(s, (sockaddr*)&a, sizeof a) != 0) {
@@ -399,7 +477,12 @@ private:
         o_.caps.write(w);
         w.u64(o_.ramBytes), w.u64(o_.vramBytes);
         w.hash(challenge);
-        w.u8(toMaster ? 1 : 0);
+        w.u8(o_.master ? 1 : 0);
+        w.str(o_.build);
+        const std::vector<Bytes> shown = o_.trust ? o_.trust->shown() : std::vector<Bytes>{};
+        w.u32(uint32_t(shown.size()));
+        for (const auto& s : shown) w.bytes(s);
+        (void)toMaster;
         std::lock_guard<std::mutex> g(m_);
         c->challenge = challenge;
         sendOn(c, Type::Hello, w.b);
@@ -465,7 +548,7 @@ private:
 
     // ---- the loop
     void loop() {
-        double nextBeat = 0;
+        double nextBeat = 0, nextTrust = 0;
         std::unique_lock<std::mutex> g(m_);
         while (running_) {
             cv_.wait_for(g, std::chrono::milliseconds(20), [&] { return !inbox_.empty() || !self_.empty() || !running_; });
@@ -493,6 +576,11 @@ private:
                 broadcast(Type::Heartbeat, w.b);
                 for (const Hash& h : members_.sweep(now)) lose(h, "silent");
                 askPlaced(now);
+                if (now >= nextTrust) {
+                    nextTrust = now + 1.0;
+                    reviewTrust(now);
+                    writeStatus(now);
+                }
             }
         }
     }
@@ -636,6 +724,26 @@ private:
                 g_unlock([&] { o_.onManifest(copy); });
             }
             break;
+        case TypeEndorse:
+            if (o_.trust && m.sender == masterHash_) {
+                const Bytes e = r.bytes();
+                std::vector<Bytes> chain(std::min<uint32_t>(r.u32(), 64));
+                for (auto& s : chain) s = r.bytes();
+                if (!r.bad && o_.trust->take(e, m.sender, chain)) log("endorsed by " + shortHex(m.sender));
+            }
+            break;
+        case TypeRevoke:
+            if (o_.trust) {
+                const Bytes v = r.bytes();
+                if (auto who = o_.trust->takeRevocation(v)) {
+                    if (*who == hash()) log("this machine has been revoked");
+                    else if (!members_.quarantined(*who)) {
+                        log("revoked " + shortHex(*who));
+                        refuse(*who, "revoked");
+                    }
+                }
+            }
+            break;
         case TypeReady:
             if (o_.master) {
                 ready_.insert(m.sender);
@@ -654,78 +762,329 @@ private:
         m_.lock();
     }
 
+    // The handshake (both sides alike): Hello (key, what it has, memory it gives, a challenge, whether it is a master,
+    // its build, its endorsements) -> Welcome (the same, with the proof for the challenge and a challenge back) -> Join
+    // (the proof for that). Then decide: a build other than this one's is refused (its samples would differ); one
+    // that is not approved (Trust::admits) is refused by a node, held by a master until an approver endorses it (or
+    // endorsed at once with trustFirst); the rest admitted, and a master then welcomes it into the swarm.
     void handshake(const ConnPtr& c, const Bytes& frame, const Message& m, double now) {
         if (!c) return;
         Reader r(m.payload);
+        auto readShown = [&] {
+            std::vector<Bytes> shown(std::min<uint32_t>(r.u32(), 64));
+            for (auto& s : shown) s = r.bytes();
+            return shown;
+        };
+        auto writeOwn = [&](Writer& w) {
+            w.u8(o_.master ? 1 : 0);
+            w.str(o_.build);
+            const std::vector<Bytes> shown = o_.trust ? o_.trust->shown() : std::vector<Bytes>{};
+            w.u32(uint32_t(shown.size()));
+            for (const auto& s : shown) w.bytes(s);
+        };
         if (m.type == Type::Hello) {
-            const Bytes key = r.bytes();
-            const Capabilities caps = Capabilities::read(r);
-            const uint64_t ram = r.u64(), vram = r.u64();
+            Pending info;
+            info.key = r.bytes();
+            info.caps = Capabilities::read(r);
+            info.ram = r.u64(), info.vram = r.u64();
             const Hash challenge = r.hash();
-            r.u8();
-            if (r.bad || !authentic(frame, m, key) || members_.quarantined(m.sender)) return c->close();
-            pendingKey_[c.get()] = {key, caps, ram, vram};
+            info.isMaster = r.u8() != 0;
+            info.build = r.str();
+            info.shown = readShown();
+            if (r.bad || !authentic(frame, m, info.key) || members_.quarantined(m.sender) || revoked(m.sender)) return c->close();
             c->peer = m.sender;
             Hash back;
             randomBytes(back.data(), back.size());
             c->challenge = back;
+            pendingKey_[c.get()] = std::move(info);
             Writer w;
             w.bytes(id_->publicKey());
             o_.caps.write(w);
             w.u64(o_.ramBytes), w.u64(o_.vramBytes);
             w.hash(membershipProof(o_.rhizomeKey, challenge, hash()));
             w.hash(back);
-            w.u8(o_.master ? 1 : 0);
+            writeOwn(w);
             sendOn(c, Type::Welcome, w.b);
         } else if (m.type == Type::Welcome) {
-            const Bytes key = r.bytes();
-            const Capabilities caps = Capabilities::read(r);
-            const uint64_t ram = r.u64(), vram = r.u64();
+            Pending info;
+            info.key = r.bytes();
+            info.caps = Capabilities::read(r);
+            info.ram = r.u64(), info.vram = r.u64();
             const Hash proof = r.hash(), back = r.hash();
-            const bool isMaster = r.u8() != 0;
-            if (r.bad || !authentic(frame, m, key) || proof != membershipProof(o_.rhizomeKey, c->challenge, m.sender)) {
+            info.isMaster = r.u8() != 0;
+            info.build = r.str();
+            info.shown = readShown();
+            if (r.bad || !authentic(frame, m, info.key) || proof != membershipProof(o_.rhizomeKey, c->challenge, m.sender)) {
                 log("refused " + shortHex(m.sender) + ": no proof of the rhizome key");
                 return c->close();
             }
+            c->peer = m.sender;
             Writer w;
             w.hash(membershipProof(o_.rhizomeKey, back, hash()));
             sendOn(c, uint16_t(TypeJoin), w.b);
-            admit(c, m.sender, key, caps, ram, vram, now, isMaster);
-            if (isMaster) masterHash_ = m.sender;
+            decide(c, m.sender, info, now);
         } else {
             auto it = pendingKey_.find(c.get());
             if (it == pendingKey_.end() || c->peer != m.sender) return c->close();
             const Hash proof = r.hash();
-            const auto info = it->second;
+            const Pending info = it->second;
             pendingKey_.erase(it);
             if (!authentic(frame, m, info.key) || proof != membershipProof(o_.rhizomeKey, c->challenge, m.sender)) {
                 log("refused " + shortHex(m.sender) + ": no proof of the rhizome key");
                 return c->close();
             }
-            admit(c, m.sender, info.key, info.caps, info.ram, info.vram, now, false);
-            if (o_.master) {
-                // The members to the newcomer; the newcomer to the members (each dials by the lower hash).
-                Writer w;
-                const auto list = members_.working();
-                w.u32(uint32_t(list.size()));
-                for (const Member* mm : list) w.hash(mm->hash), mm->caps.write(w);
-                broadcast(Type::Members, w.b);
-                pool_.addNode(m.sender, info.ram, info.vram);
-                if (!manifest_.empty()) {
-                    Writer mw;
-                    mw.bytes(manifest_);
-                    sendOn(c, uint16_t(TypeManifest), mw.b);
-                }
-                pool_.joined();  // pieces short of copies, placed now there is room
-                sendPlacements(nullptr);
-            }
+            decide(c, m.sender, info, now);
         }
     }
-    void admit(const ConnPtr& c, const Hash& h, const Bytes& key, const Capabilities& caps, uint64_t, uint64_t, double now, bool isMaster) {
-        if (!members_.introduce(h, key, caps, now, isMaster)) return c->close();
+    void decide(const ConnPtr& c, const Hash& h, const Pending& info, double now) {
+        if (!o_.build.empty() && !info.build.empty() && info.build != o_.build) {
+            log("refused " + shortHex(h) + ": it runs XPU2 build " + info.build.substr(0, 12) + ", this machine " + o_.build.substr(0, 12) +
+                " (a sample would differ)");
+            return c->close();
+        }
+        if (revoked(h)) {
+            log("refused " + shortHex(h) + ": revoked");
+            return c->close();
+        }
+        if (o_.trust && !o_.trust->admits(h, info.shown)) {
+            if (!o_.master) {
+                log("refused " + shortHex(h) + ": not approved by an approver this machine trusts");
+                return c->close();
+            }
+            if (o_.trustFirst) {
+                o_.trust->endorse(h);
+                log("approved " + shortHex(h) + " (trust first)");
+            } else {
+                if (!waiting_.count(h))
+                    log("waiting for approval: " + hex(h) + " at " + info.caps.address + "; approve it with: moonray_xpu2 rhizome approve " + hex(h));
+                waiting_[h] = Waiting{c, info};
+                return;
+            }
+        }
+        admitMember(c, h, info, now);
+    }
+    // Where a member is reached: the address it gave, or, where it gave this machine's loopback (it listens on every
+    // adapter), the address its connection comes from, with its port: what the members are told to dial.
+    std::string reachableAt(const ConnPtr& c, const std::string& given) const {
+        const auto colon = given.rfind(':');
+        if (colon == std::string::npos) return given;
+        const std::string host = given.substr(0, colon);
+        if (host != "127.0.0.1" && host != "0.0.0.0") return given;
+        sockaddr_in peer{};
+        int len = sizeof peer;
+        if (getpeername(c->s, (sockaddr*)&peer, &len) != 0) return given;
+        char ip[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+        return std::string(ip) + given.substr(colon);
+    }
+    void admitMember(const ConnPtr& c, const Hash& h, const Pending& info0, double now) {
+        Pending info = info0;
+        info.caps.address = reachableAt(c, info.caps.address);
+        if (!members_.introduce(h, info.key, info.caps, now, info.isMaster)) return c->close();
         if (Member* mm = members_.find(h)) mm->lastSequence = 0;
         c->peer = h, c->known = true, c->joined = true;
+        if (info.isMaster && !o_.master) masterHash_ = h;
         log("joined " + shortHex(h));
+        if (o_.master) welcome(c, h, info);
+    }
+    // Master: a member admitted: its endorsement (one an approver issued it), the revocations known, the members to it
+    // and it to them (each pair dials by the lower hash), its place in the memory pool, the manifest.
+    void welcome(const ConnPtr& c, const Hash& h, const Pending& info) {
+        if (o_.trust) {
+            if (auto e = o_.trust->issued(h)) {
+                Writer w;
+                w.bytes(*e);
+                const std::vector<Bytes> chain = o_.trust->shown();
+                w.u32(uint32_t(chain.size()));
+                for (const auto& s : chain) w.bytes(s);
+                sendOn(c, uint16_t(TypeEndorse), w.b);
+            }
+            for (const Bytes& v : o_.trust->revocations()) {
+                Writer w;
+                w.bytes(v);
+                sendOn(c, uint16_t(TypeRevoke), w.b);
+            }
+        }
+        Writer w;
+        const auto list = members_.working();
+        w.u32(uint32_t(list.size()));
+        for (const Member* mm : list) w.hash(mm->hash), mm->caps.write(w);
+        broadcast(Type::Members, w.b);
+        pool_.addNode(h, info.ram, info.vram);
+        if (!manifest_.empty()) {
+            Writer mw;
+            mw.bytes(manifest_);
+            sendOn(c, uint16_t(TypeManifest), mw.b);
+        }
+        pool_.joined();  // pieces short of copies, placed now there is room
+        sendPlacements(nullptr);
+    }
+    bool revoked(const Hash& h) const { return o_.trust && o_.trust->revokedAfter(h, 0); }
+    // Master, each second: a machine waiting for approval admitted once an approver has endorsed it (the approve
+    // command writes the endorsement into this master's folder); revocations the folder has gained passed on and
+    // enforced. A node: revocations its folder has gained (its own blocks) enforced.
+    void reviewTrust(double now) {
+        if (!o_.trust) return;
+        for (auto it = waiting_.begin(); it != waiting_.end();) {
+            if (!it->second.conn->open) {
+                it = waiting_.erase(it);
+                continue;
+            }
+            if (revoked(it->first)) {
+                log("refused " + shortHex(it->first) + ": revoked");
+                it->second.conn->close();
+                it = waiting_.erase(it);
+                continue;
+            }
+            if (o_.trust->issued(it->first) || o_.trust->admits(it->first, it->second.info.shown)) {
+                log("approved " + shortHex(it->first));
+                const Waiting w = it->second;
+                const Hash h = it->first;
+                it = waiting_.erase(it);
+                admitMember(w.conn, h, w.info, now);
+                continue;
+            }
+            ++it;
+        }
+        for (const Hash& h : o_.trust->refreshRevocations()) {
+            log("revoked " + shortHex(h));
+            if (o_.trust->approver())
+                for (const Bytes& v : o_.trust->revocations()) {
+                    Writer w;
+                    w.bytes(v);
+                    broadcast(Type(TypeRevoke), w.b);
+                }
+            refuse(h, "revoked");
+        }
+    }
+    // status.json (rhizome status): this machine, the frame, each member's role, state, tier, rate, distance and progress,
+    // and the memory pool, as this machine sees them. Written whole each second, then renamed into place.
+    static std::string jsonText(const std::string& s) {
+        std::string o = "\"";
+        for (char c : s) {
+            if (c == '"' || c == '\\') o += '\\';
+            if (static_cast<unsigned char>(c) >= 0x20) o += c;
+        }
+        return o + "\"";
+    }
+    void writeStatus(double now) {
+        if (o_.statusPath.empty()) return;
+        auto num = [](double v) {
+            char t[32];
+            std::snprintf(t, sizeof t, "%.6g", std::isfinite(v) ? v : 0.0);
+            return std::string(t);
+        };
+        std::string j = "{\n";
+        j += "  \"hash\": " + jsonText(hex(hash())) + ",\n";
+        j += "  \"role\": " + jsonText(o_.master ? "master" : "node") + ",\n";
+        j += "  \"address\": " + jsonText(address_) + ",\n";
+        j += "  \"approver\": " + std::string(o_.trust && o_.trust->approver() ? "true" : "false") + ",\n";
+        j += "  \"master\": " + jsonText(o_.master ? hex(hash()) : masterHash_ == Hash{} ? "" : hex(masterHash_)) + ",\n";
+        j += "  \"job\": " + jsonText(o_.job) + ",\n";
+        j += "  \"time\": " + num(now) + ",\n";
+        // The frame: chunks in all and back (the master's ledger), the chunks this machine holds still.
+        size_t total = 0, back = 0;
+        if (plan_) total = size_t(plan_->shape.cells()) * plan_->shape.chunksPerCell();
+        if (ledger_) back = total - ledger_->outstanding();
+        j += "  \"frame\": {\"running\": " + std::string(plan_ && !frameDone_ ? "true" : "false") + ", \"done\": " +
+             std::string(frameDone_ ? "true" : "false") + ", \"chunks\": " + std::to_string(total) + ", \"back\": " + std::to_string(back) +
+             ", \"held\": " + std::to_string(holder_ ? holder_->remaining() : 0) + ", \"audits\": " + std::to_string(auditsDone_) +
+             (plan_ ? ", \"width\": " + std::to_string(plan_->shape.width) + ", \"height\": " + std::to_string(plan_->shape.height) +
+                          ", \"spp\": " + std::to_string(plan_->shape.spp) + ", \"cells\": " + std::to_string(plan_->shape.cells())
+                    : std::string()) +
+             "},\n";
+        // The memory pool (the master knows its whole layout).
+        j += "  \"pool\": {\"ram\": " + std::to_string(pool_.total(Tier::Ram)) + ", \"vram\": " + std::to_string(pool_.total(Tier::Vram)) +
+             ", \"pieces\": " + std::to_string(sourcePieces_.size()) + ", \"held\": " + std::to_string(store_.size()) + "},\n";
+        j += "  \"members\": [\n";
+        auto row = [&](const Hash& h, const std::string& addr, const std::string& role, const std::string& state, double rate, double rtt) {
+            const int i = plan_ ? plan_->nodeIndex(h) : -1;
+            std::string tier = i < 0 ? "" : plan_->nodes[size_t(i)].fast ? "fast" : "slow";
+            const uint64_t done = i >= 0 && size_t(i) < byNode_.size() ? byNode_[size_t(i)] : 0;
+            return "    {\"hash\": " + jsonText(hex(h)) + ", \"address\": " + jsonText(addr) + ", \"role\": " + jsonText(role) +
+                   ", \"state\": " + jsonText(state) + ", \"tier\": " + jsonText(tier) + ", \"rate\": " + num(rate) + ", \"rtt\": " + num(rtt) +
+                   ", \"chunks\": " + std::to_string(done) + ", \"ram\": " + std::to_string(pool_.used(h, Tier::Ram)) +
+                   ", \"vram\": " + std::to_string(pool_.used(h, Tier::Vram)) + ", \"ramGiven\": " + std::to_string(pool_.capacity(h, Tier::Ram)) +
+                   ", \"vramGiven\": " + std::to_string(pool_.capacity(h, Tier::Vram)) + "}";
+        };
+        std::vector<std::string> rows;
+        // The same as text (rhizome status prints it): a line a member.
+        char line[320];
+        std::string text;
+        auto mb = [](uint64_t v) {
+            char t[24];
+            std::snprintf(t, sizeof t, "%.1f", double(v) / (1 << 20));
+            return std::string(t);
+        };
+        auto textRow = [&](const Hash& h, const std::string& addr, const std::string& role, const std::string& state, double rate, double rtt) {
+            const int i = plan_ ? plan_->nodeIndex(h) : -1;
+            const char* tier = i < 0 ? "-" : plan_->nodes[size_t(i)].fast ? "fast" : "slow";
+            const uint64_t done = i >= 0 && size_t(i) < byNode_.size() ? byNode_[size_t(i)] : 0;
+            char rt[24], rr[24];
+            std::snprintf(rt, sizeof rt, rtt >= 0 ? "%.1f ms" : "-", rtt * 1000.0);
+            std::snprintf(rr, sizeof rr, rate > 0 ? "%.2f" : "-", rate / 1e6);
+            std::snprintf(line, sizeof line, "%-12s  %-21s  %-22s  %-8s  %-5s  %10s  %9s  %6llu  %s of %s MB\n", shortHex(h).c_str(), addr.c_str(),
+                          role.c_str(), state.c_str(), tier, rr, rt, (unsigned long long)done, mb(pool_.used(h, Tier::Ram) + pool_.used(h, Tier::Vram)).c_str(),
+                          mb(pool_.capacity(h, Tier::Ram) + pool_.capacity(h, Tier::Vram)).c_str());
+            text += line;
+        };
+        rows.push_back(row(hash(), address_, o_.master ? "master" : "node (this machine)", "alive", o_.caps.rate, 0));
+        textRow(hash(), address_, o_.master ? "master (this machine)" : "node (this machine)", "alive", o_.caps.rate, -1);
+        for (const Member* mm : members_.all()) {
+            const char* st = mm->quarantined ? "refused" : mm->state == State::Alive ? "alive" : mm->state == State::Suspect ? "suspect" : "gone";
+            std::string role = mm->quarantined ? (revoked(mm->hash) ? "revoked" : "quarantined") : mm->master || mm->hash == masterHash_ ? "master" : "node";
+            if (o_.trust && o_.trust->blocked(mm->hash)) role = "blocked (here)";
+            rows.push_back(row(mm->hash, mm->caps.address, role, st, mm->caps.rate, mm->rtt));
+            textRow(mm->hash, mm->caps.address, role, st, mm->caps.rate, mm->rtt);
+        }
+        for (const auto& [h, w] : waiting_) {
+            rows.push_back(row(h, w.info.caps.address, "waiting for approval", "held", w.info.caps.rate, -1));
+            textRow(h, w.info.caps.address, "waiting for approval", "held", w.info.caps.rate, -1);
+        }
+        for (size_t i = 0; i < rows.size(); ++i) j += rows[i] + (i + 1 < rows.size() ? ",\n" : "\n");
+        j += "  ]\n}\n";
+        const std::string temp = o_.statusPath + ".part";
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            out << j;
+        }
+        std::error_code e;
+        std::filesystem::rename(temp, o_.statusPath, e);
+        // The text: this machine, the frame, the pool, then the members.
+        std::string head;
+        std::snprintf(line, sizeof line, "This machine  %s  %s%s   %s\n", hex(hash()).c_str(), o_.master ? "master" : "node",
+                      o_.trust && o_.trust->approver() ? ", approver" : "", address_.c_str());
+        head += line;
+        if (!o_.master && masterHash_ != Hash{}) {
+            std::snprintf(line, sizeof line, "Master        %s\n", hex(masterHash_).c_str());
+            head += line;
+        }
+        if (plan_) {
+            std::snprintf(line, sizeof line, "Frame         %s %ux%u, %u spp   %s   %zu of %zu chunks back (%.0f%%), %llu films audited\n", o_.job.c_str(),
+                          plan_->shape.width, plan_->shape.height, plan_->shape.spp, frameDone_ ? "done" : "rendering", back, total,
+                          total ? 100.0 * double(back) / double(total) : 0.0, (unsigned long long)auditsDone_);
+            head += line;
+        } else {
+            head += "Frame         none (waiting for a job)\n";
+        }
+        std::snprintf(line, sizeof line, "Memory pool   %zu pieces of the scene, %s MB given in RAM and %s MB in card memory across the swarm; %zu held here\n",
+                      sourcePieces_.size(), mb(pool_.total(Tier::Ram)).c_str(), mb(pool_.total(Tier::Vram)).c_str(), store_.size());
+        head += line;
+        head += "\nHash          Address                Role                    State     Tier   Rate Ms/s        RTT  Chunks  Pool\n";
+        const std::string textPath = o_.statusPath.substr(0, o_.statusPath.size() - 5) + ".txt";
+        {
+            std::ofstream out(textPath + ".part", std::ios::binary | std::ios::trunc);
+            out << head << text;
+        }
+        std::filesystem::rename(textPath + ".part", textPath, e);
+    }
+    // A member refused from now on (quarantined, revoked or blocked): its connections closed, its work given out.
+    void refuse(const Hash& h, const char* why) {
+        members_.quarantine(h);
+        waiting_.erase(h);
+        for (auto& cc : conns_)
+            if (cc->peer == h) cc->close();
+        lose(h, why);
     }
 
     // ---- frames
@@ -969,11 +1328,6 @@ private:
         broadcast(Type(TypePieceMoves), w.b);
     }
 
-    struct Pending {
-        Bytes key;
-        Capabilities caps;
-        uint64_t ram = 0, vram = 0;
-    };
 
     NodeOptions o_;
     std::unique_ptr<Identity> id_;
@@ -982,6 +1336,8 @@ private:
     std::string address_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> threads_;
+    std::mutex dialsMutex_;
+    std::vector<std::thread> dials_;
     std::mutex m_;
     std::condition_variable cv_, doneCv_;
     std::vector<ConnPtr> conns_;
@@ -993,6 +1349,7 @@ private:
     std::deque<Arrived> inbox_;
     std::deque<Bytes> self_;
     std::map<Conn*, Pending> pendingKey_;
+    std::map<Hash, Waiting> waiting_;  // master: admitted by the key, waiting for an approver's endorsement
     std::atomic<uint64_t> sequence_{0};
     Members members_;
     Hash masterHash_{};

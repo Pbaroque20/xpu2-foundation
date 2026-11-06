@@ -123,6 +123,7 @@ public:
     Trust(const std::filesystem::path& folder, const Identity& self) : folder_(folder), self_(self) {
         std::filesystem::create_directories(folder_ / "endorsed");
         std::filesystem::create_directories(folder_ / "revoked");
+        std::filesystem::create_directories(folder_ / "blocked");
         std::ifstream in(folder_ / "approvers.txt");
         for (std::string line; std::getline(in, line);) {
             while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
@@ -147,6 +148,17 @@ public:
             if (e.role == Role::Approver && trusted(e.approver())) return true;
         return false;
     }
+    // An approver trusted from now on (the trust command, --trust).
+    void addApprover(const Hash& h) {
+        if (approvers_.insert(h).second) saveApprovers();
+    }
+    // A machine this member alone refuses (the revoke command of one that is not an approver): blocked/<hash>, kept
+    // across restarts, never passed on. It beats any endorsement here.
+    void block(const Hash& h) {
+        std::ofstream(folder_ / "blocked" / (hex(h) + ".txt")) << hex(h) << "\n";
+        blocked_.insert(h);
+    }
+    bool blocked(const Hash& h) const { return blocked_.count(h) != 0; }
     void trustSelf() {
         if (approvers_.insert(self_.hash()).second) saveApprovers();
     }
@@ -223,6 +235,7 @@ public:
         const Bytes b = fileBytes(p);
         auto e = Endorsement::read(b);
         if (!e || e->subject != subject || !e->signedWell()) return std::nullopt;
+        if (revokedAfter(subject, e->issued)) return std::nullopt;  // revoked since: it no longer counts
         return b;
     }
     Bytes revoke(const Hash& subject) {
@@ -253,6 +266,9 @@ public:
     }
     std::vector<Hash> refreshRevocations() {
         std::vector<Hash> fresh;
+        for (const auto& f : std::filesystem::directory_iterator(folder_ / "blocked"))
+            if (auto h = parseHash(f.path().stem().string()))
+                if (blocked_.insert(*h).second) fresh.push_back(*h);
         for (const auto& f : std::filesystem::directory_iterator(folder_ / "revoked"))
             if (auto v = Revocation::read(fileBytes(f.path())))
                 if (v->signedWell() && (trusted(v->approver()) || v->approver() == self_.hash())) {
@@ -265,6 +281,7 @@ public:
         return fresh;
     }
     bool revokedAfter(const Hash& who, uint64_t issued) const {
+        if (blocked_.count(who)) return true;
         auto it = revoked_.find(who);
         return it != revoked_.end() && it->second >= issued;
     }
@@ -293,6 +310,7 @@ private:
     std::set<Hash> approvers_;
     std::vector<Endorsement> own_, chain_;
     std::map<Hash, uint64_t> revoked_;
+    std::set<Hash> blocked_;
     bool require_ = false;
 };
 

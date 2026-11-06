@@ -100,6 +100,12 @@ public:
         return out;
     }
     size_t size() const { return members_.size(); }
+    // Every member known, gone and refused ones too (status).
+    std::vector<const Member*> all() const {
+        std::vector<const Member*> out;
+        for (const auto& [h, m] : members_) out.push_back(&m);
+        return out;
+    }
 
 private:
     std::map<Hash, Member> members_;

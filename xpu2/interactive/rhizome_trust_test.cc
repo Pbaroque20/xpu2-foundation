@@ -57,6 +57,7 @@ int main() {
     // Revocation: signed by a trusted approver, it beats the endorsements issued before it, wherever it is taken.
     const Bytes rv = m.revoke(node->hash());
     check(!m.admits(node->hash(), {e}), "a revoked node is not admitted by the master");
+    check(!m.issued(node->hash()).has_value(), "the endorsement the master issued it no longer counts");
     auto subject = s.takeRevocation(rv);
     check(subject && *subject == node->hash() && !s.admits(node->hash(), {e}), "the revocation passed on is kept and enforced by a member");
     const Bytes fake = r.revoke(successor->hash());

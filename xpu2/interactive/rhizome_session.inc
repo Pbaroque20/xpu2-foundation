@@ -1,51 +1,110 @@
 // Rhizome in moonray_xpu2 (RHIZOME.md): a frame rendered by a swarm of machines, each a whole XPU2 (its processor groups,
-// NUMA nodes and graphics cards), one the master integrator.
+// NUMA nodes and graphics cards), one the master integrator. Every machine has the same command line; what it may do
+// follows its keys and endorsements (rhizome_trust.h).
 //
-//   moonray_xpu2 --rhizome-master -in <scene> [-in ...] -out <image.pfm> --key <rhizome key> [--nodes N] [--wait s]
-//                [--bind host] [--port p] [--advertise host] [--cell px] [--chunk samples] [--mode 0|1|2] [-threads n]
-//       Listens for nodes, waits for N of them (or --wait seconds), plans the frame over them and itself, audits and
-//       adds what comes back, and writes the picture (the beauty, a PFM in MoonRay's film order).
-//   moonray_xpu2 --rhizome-node --master host:port -in <scene> [-in ...] --key <rhizome key> [--bind host] [--port p]
-//                [--advertise host] [--mode 0|1|2] [-threads n] [--folder <its folder: node.key>]
-//       Joins the master and renders the chunks it holds until the frame is done.
+//   moonray_xpu2 rhizome node    --key <k> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2] [-threads n]
+//                                [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]
+//   moonray_xpu2 rhizome master  -in <scene> [-in ...] -out <image.pfm> --key <k> [--nodes N] [--node host:port ...]
+//                                [--wait s] [--approve] [--trust-first] [--trust <hash> ...] [--cell px] [--chunk n]
+//                                [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]
+//   moonray_xpu2 rhizome id      [--folder f]
+//   moonray_xpu2 rhizome trust   <approver hash> [--folder f]
+//   moonray_xpu2 rhizome approve <hash> [--approver] [--folder f]
+//   moonray_xpu2 rhizome revoke  <hash> [--folder f]
+//   moonray_xpu2 rhizome status  [--folder f] [--watch]
+//   moonray_xpu2 rhizome <verb> --help
+// (--rhizome-node and --rhizome-master: node and master.)
 //
-// Each machine reads the scene itself for now (the scene's pieces through the memory pool are to come). A chunk is a
-// share of the frame (async::RenderOptions::share): a cell's pixels and a range of the frame's sample indices, the
-// samples the whole frame would give them, so the master's picture is the frame one machine would render.
-// Included by xpu2_session.cc.
+// A node needs no scene and no master: it makes its hash the first time it runs (node.key in its folder), listens,
+// answers discovery on every network adapter (a direct cable too), and renders each job a master gives it, then waits
+// for the next. A master finds the nodes on its networks (or is given them), sends them the scene through the swarm's
+// memory, audits and adds what comes back, and writes the picture and the scene's outputs. A chunk is a share of the
+// frame (async::RenderOptions::share): a cell's pixels and a range of the frame's sample indices, the samples the whole
+// frame would give them, so the master's picture is the frame one machine would render. Included by xpu2_session.cc.
 #include "rhizome_node.h"
+#include "rhizome_discovery.h"
 #include <future>
 
 namespace {
 namespace rhizomesession {
 namespace rz = xpu2::interactive::rhizome;
 
+constexpr uint16_t NodePort = 47100, MasterPort = 47110;
+
+enum class Verb { Node, Master, Id, Trust, Approve, Revoke, Status, Help };
 struct RhizomeArgs {
-    bool master = false;
-    std::vector<std::string> scenes;
-    std::string out, key, masterAddress, bind = "127.0.0.1", advertise, folder;
+    Verb verb = Verb::Help;
+    bool master = false, help = false;
+    std::vector<std::string> scenes, nodeAddresses, trust;
+    std::string out, key, masterAddress, bind = "0.0.0.0", advertise, folder, subject;
     unsigned nodes = 0, threads = 0, cell = 256, chunk = 16;
-    uint16_t port = 0;
+    int port = -1;  // -1: the verb's own (NodePort, MasterPort)
     int mode = 2;
     double wait = 30;
+    bool approve = false, trustFirst = false, approver = false, watch = false, discovery = true;
 };
+
+inline const char* usage(Verb v) {
+    switch (v) {
+    case Verb::Node:
+        return "moonray_xpu2 rhizome node --key <rhizome key> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2]\n"
+               "    [-threads n] [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]\n"
+               "  A headless node: makes or reads its hash, listens and answers discovery, renders each job a master gives it\n"
+               "  and waits for the next. --master: reach that master instead of waiting to be found. --trust: approvers this\n"
+               "  node trusts (else it trusts the master that first endorses it). Port 47100 by default.";
+    case Verb::Master:
+        return "moonray_xpu2 rhizome master -in <scene> [-in ...] -out <image.pfm> --key <rhizome key> [--nodes N]\n"
+               "    [--node host:port ...] [--wait s] [--approve] [--trust-first] [--trust <approver hash> ...] [--cell px]\n"
+               "    [--chunk samples] [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]\n"
+               "  Finds the nodes on its networks (and those given with --node), waits for N of them ready (or --wait seconds),\n"
+               "  renders the frame with them, and writes the picture and the scene's outputs. --approve: only approved\n"
+               "  machines join (the others wait, their hash printed with the command to approve them); --trust-first:\n"
+               "  approve every machine met on this run. Port 47110 by default.";
+    case Verb::Id: return "moonray_xpu2 rhizome id [--folder f]\n  This machine's hash (made the first time).";
+    case Verb::Trust: return "moonray_xpu2 rhizome trust <approver hash> [--folder f]\n  Trust an approver: its endorsements and revocations count here.";
+    case Verb::Approve:
+        return "moonray_xpu2 rhizome approve <hash> [--approver] [--folder f]\n"
+               "  Endorse a machine with this machine's key (it must be an approver). --approver: it may approve in its turn,\n"
+               "  as a master's successor must. A master running from the same folder admits it within a second.";
+    case Verb::Revoke:
+        return "moonray_xpu2 rhizome revoke <hash> [--folder f]\n"
+               "  An approver: revoke a machine, signed, passed through the swarm. Another machine: block it here only.";
+    case Verb::Status: return "moonray_xpu2 rhizome status [--folder f] [--watch]\n  The swarm as this machine sees it (a running node or master's status.json).";
+    default:
+        return "moonray_xpu2 rhizome node | master | id | trust | approve | revoke | status   (each with --help)";
+    }
+}
+
 inline RhizomeArgs parseRhizome(int argc, char** argv) {
     RhizomeArgs a;
-    for (int i = 1; i < argc; ++i) {
+    int i = 1;
+    const std::string first = argc > 1 ? argv[1] : "";
+    if (first == "--rhizome-master") a.verb = Verb::Master, i = 2;
+    else if (first == "--rhizome-node") a.verb = Verb::Node, i = 2;
+    else if (first == "rhizome") {
+        const std::string v = argc > 2 ? argv[2] : "help";
+        a.verb = v == "node" ? Verb::Node : v == "master" ? Verb::Master : v == "id" ? Verb::Id : v == "trust" ? Verb::Trust
+                 : v == "approve" ? Verb::Approve : v == "revoke" ? Verb::Revoke : v == "status" ? Verb::Status : Verb::Help;
+        if (a.verb == Verb::Help && v != "help" && v != "--help") throw std::runtime_error("unknown verb " + v + "\n" + usage(Verb::Help));
+        i = 3;
+    }
+    a.master = a.verb == Verb::Master;
+    for (; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) throw std::runtime_error(k + " needs a value");
             return argv[++i];
         };
-        if (k == "--rhizome-master") a.master = true;
-        else if (k == "--rhizome-node") a.master = false;
+        if (k == "--help" || k == "-h") a.help = true;
         else if (k == "-in") a.scenes.push_back(next());
         else if (k == "-out") a.out = next();
         else if (k == "--key") a.key = next();
         else if (k == "--master") a.masterAddress = next();
+        else if (k == "--node") a.nodeAddresses.push_back(next());
+        else if (k == "--trust") a.trust.push_back(next());
         else if (k == "--bind") a.bind = next();
         else if (k == "--advertise") a.advertise = next();
-        else if (k == "--port") a.port = uint16_t(std::stoul(next()));
+        else if (k == "--port") a.port = std::stoi(next());
         else if (k == "--nodes") a.nodes = unsigned(std::stoul(next()));
         else if (k == "--wait") a.wait = std::stod(next());
         else if (k == "--cell") a.cell = unsigned(std::stoul(next()));
@@ -53,14 +112,49 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--mode") a.mode = std::stoi(next());
         else if (k == "-threads") a.threads = unsigned(std::stoul(next()));
         else if (k == "--folder") a.folder = next();
-        else throw std::runtime_error("unknown argument " + k);
+        else if (k == "--approve") a.approve = true;
+        else if (k == "--trust-first") a.trustFirst = true;
+        else if (k == "--approver") a.approver = true;
+        else if (k == "--watch") a.watch = true;
+        else if (k == "--no-discovery") a.discovery = false;
+        else if (!k.empty() && k[0] != '-' && a.subject.empty() &&
+                 (a.verb == Verb::Trust || a.verb == Verb::Approve || a.verb == Verb::Revoke)) a.subject = k;
+        else throw std::runtime_error("unknown argument " + k + "\n" + usage(a.verb));
     }
-    if (a.scenes.empty()) throw std::runtime_error("no scene (-in)");
-    if (a.key.empty()) throw std::runtime_error("no rhizome key (--key)");
-    if (a.master && a.out.empty()) throw std::runtime_error("no picture to write (-out)");
-    if (!a.master && a.masterAddress.empty()) throw std::runtime_error("no master (--master host:port)");
-    if (a.cell == 0 || a.cell % 64) throw std::runtime_error("--cell must be a multiple of 64");
+    if (a.help || a.verb == Verb::Help) return a;
+    if (a.verb == Verb::Master || a.verb == Verb::Node) {
+        if (a.key.empty()) throw std::runtime_error("no rhizome key (--key)\n" + std::string(usage(a.verb)));
+        if (a.cell == 0 || a.cell % 64) throw std::runtime_error("--cell must be a multiple of 64");
+    }
+    if (a.verb == Verb::Master) {
+        if (a.scenes.empty()) throw std::runtime_error("no scene (-in)\n" + std::string(usage(a.verb)));
+        if (a.out.empty()) throw std::runtime_error("no picture to write (-out)\n" + std::string(usage(a.verb)));
+    }
+    if ((a.verb == Verb::Trust || a.verb == Verb::Approve || a.verb == Verb::Revoke) && !rz::parseHash(a.subject))
+        throw std::runtime_error("a machine's hash, 64 hex digits, is needed\n" + std::string(usage(a.verb)));
     return a;
+}
+// A machine's folder for a verb: --folder, else rhizome\master or rhizome\node beside the executable (the identity
+// commands take the master's when there is one, else the node's).
+inline fs::path roleFolder(const RhizomeArgs& a) {
+    if (!a.folder.empty()) return fs::u8path(a.folder);
+    const fs::path base = executableFolder() / "rhizome";
+    if (a.verb == Verb::Master) return base / "master";
+    if (a.verb == Verb::Node) return base / "node";
+    return fs::exists(base / "master" / "node.key") ? base / "master" : base / "node";
+}
+// The XPU2 build this machine runs: its executable and its GPU programs, hashed (machines whose samples would differ
+// refuse each other, rhizome_node.h decide).
+inline std::string buildId() {
+    const fs::path folder = executableFolder();
+    std::vector<unsigned char> all;
+    for (const fs::path& p : {folder / "moonray_xpu2.exe", folder / "async_gpu.ptx"}) {
+        std::ifstream in(p, std::ios::binary);
+        std::vector<unsigned char> b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const rz::Hash h = rz::sha256(b);
+        all.insert(all.end(), h.begin(), h.end());
+    }
+    return rz::hex(rz::sha256(all));
 }
 
 // A machine's XPU2: the scene prepared once, its lanes, and a share of the frame rendered on request. Everything runs
@@ -472,37 +566,153 @@ inline std::vector<std::string> receiveScene(rz::RhizomeNode& node, const rz::By
     return scenes;
 }
 
+// The identity verbs: id, trust, approve, revoke, status. No renderer, no network.
+inline int identityVerb(const RhizomeArgs& a) {
+    const fs::path folder = roleFolder(a);
+    if (a.verb == Verb::Status) {
+        const fs::path text = folder / "status.txt", json = folder / "status.json";
+        for (bool first = true; first || a.watch; first = false) {
+            if (a.watch) std::printf("\x1b[2J\x1b[H");
+            std::error_code e;
+            if (!fs::exists(text)) {
+                const bool made = fs::exists(folder / "node.key");
+                std::printf("No node or master is running from %s%s\n", folder.u8string().c_str(),
+                            made ? "" : " (and this folder has no hash yet: rhizome id makes one)");
+                if (made) {
+                    auto id = rz::Identity::load(folder);
+                    rz::Trust t(folder, *id);
+                    std::printf("This machine  %s%s\n", rz::hex(id->hash()).c_str(), t.approver() ? "  approver" : "");
+                    std::printf("Approvers     %zu trusted, %zu endorsement(s) held\n", t.approvers().size(), t.shown().size());
+                }
+            } else {
+                const auto age = std::chrono::duration<double>(fs::file_time_type::clock::now() - fs::last_write_time(text, e)).count();
+                std::ifstream in(text, std::ios::binary);
+                const std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                std::fwrite(s.data(), 1, s.size(), stdout);
+                if (age > 5) std::printf("\n(not running now: written %.0f s ago)\n", age);
+            }
+            std::fflush(stdout);
+            if (a.watch) std::this_thread::sleep_for(std::chrono::seconds(1));
+            (void)json;
+        }
+        return 0;
+    }
+    const bool made = !fs::exists(folder / "node.key");
+    auto id = rz::Identity::load(folder);
+    rz::Trust t(folder, *id);
+    const rz::Hash subject = a.subject.empty() ? rz::Hash{} : *rz::parseHash(a.subject);
+    switch (a.verb) {
+    case Verb::Id:
+        std::printf("%s\n", rz::hex(id->hash()).c_str());
+        std::printf("(%s %s; %s; %zu approver(s) trusted, %zu endorsement(s) held)\n", made ? "made now in" : "kept in", folder.u8string().c_str(),
+                    t.approver() ? "an approver" : "not an approver", t.approvers().size(), t.shown().size());
+        return 0;
+    case Verb::Trust:
+        t.addApprover(subject);
+        std::printf("trusted %s as an approver (%s)\n", rz::hex(subject).c_str(), folder.u8string().c_str());
+        return 0;
+    case Verb::Approve: {
+        if (!t.approver()) {
+            std::string who;
+            for (const auto& h : t.approvers()) who += (who.empty() ? "" : ", ") + rz::shortHex(h);
+            std::printf("this machine is not an approver: ask an approver (%s) to run: moonray_xpu2 rhizome approve %s\n",
+                        who.empty() ? "none trusted yet" : who.c_str(), rz::hex(subject).c_str());
+            return 2;
+        }
+        t.endorse(subject, a.approver ? rz::Role::Approver : rz::Role::Node);
+        std::printf("approved %s%s, signed by %s; a master running from %s admits it within a second\n", rz::hex(subject).c_str(),
+                    a.approver ? " as an approver" : "", rz::shortHex(id->hash()).c_str(), folder.u8string().c_str());
+        return 0;
+    }
+    case Verb::Revoke:
+        if (t.approver()) {
+            t.revoke(subject);
+            std::printf("revoked %s, signed by approver %s; passed through the swarm by a master running from %s\n", rz::hex(subject).c_str(),
+                        rz::shortHex(id->hash()).c_str(), folder.u8string().c_str());
+        } else {
+            t.block(subject);
+            std::printf("blocked %s on this machine only (it is not an approver: the others are not told)\n", rz::hex(subject).c_str());
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+// Whether a TCP port may be listened on here (a node's or master's own, else one the system picks).
+inline bool portFree(const std::string& bind, uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    inet_pton(AF_INET, bind.c_str(), &a.sin_addr);
+    const bool ok = ::bind(s, (sockaddr*)&a, sizeof a) == 0;
+    closesocket(s);
+    return ok;
+}
+
 inline int run(int argc, char** argv) {
     RhizomeArgs a = parseRhizome(argc, argv);
+    if (a.help || a.verb == Verb::Help) {
+        std::printf("%s\n", usage(a.verb));
+        return 0;
+    }
+    if (a.verb != Verb::Node && a.verb != Verb::Master) return identityVerb(a);
+    rz::Winsock winsock;
+    const fs::path folder = roleFolder(a);
+    const bool fresh = !fs::exists(folder / "node.key");
+    auto identity = rz::Identity::load(folder);
+    auto trust = std::make_shared<rz::Trust>(folder, *identity);
+    for (const auto& t : a.trust) {
+        const auto h = rz::parseHash(t);
+        if (!h) throw std::runtime_error("--trust takes an approver's hash (64 hex digits): " + t);
+        trust->addApprover(*h);
+    }
+    if (a.master && (a.approve || a.trustFirst)) {
+        trust->require(true);
+        trust->trustSelf();
+    }
+    std::printf("MoonRay XPU2 Rhizome: this machine is %s (%s %s)\n", rz::hex(identity->hash()).c_str(), fresh ? "made now in" : "kept in",
+                folder.u8string().c_str());
+    std::fflush(stdout);
     const fs::path base = fs::temp_directory_path() / ("xpu2-rhizome-" + std::to_string(GetCurrentProcessId()));
-    // The master reads the scene where it is; a node makes it from the swarm's memory once it has joined.
-    std::unique_ptr<Local> held;
-    if (a.master) held = std::make_unique<Local>(a, base / "staging");
-    Local* local = held.get();
-    std::atomic<Local*> made{local};
+    // The master reads the scene where it is; a node makes each job's from the swarm's memory.
+    std::shared_ptr<Local> current;
+    std::mutex currentMutex;
+    if (a.master) current = std::make_shared<Local>(a, base / "staging");
+    auto local = [&] {
+        std::lock_guard<std::mutex> g(currentMutex);
+        return current;
+    };
     // The master's merge of the AOVs and aux outputs (each film as it is taken in, by each output's filter).
     std::vector<double> mergedAovs, odd;
     std::vector<float> mergedDepths;
     rz::NodeOptions o;
     o.readyAtJoin = false;
-    std::promise<rz::Bytes> manifestPromise;
-    auto manifest = manifestPromise.get_future();
-    std::atomic<bool> manifestSet{false};
+    // A node's jobs: each manifest as it comes (the same one again is not a new job).
+    std::mutex jobsMutex;
+    std::condition_variable jobsCv;
+    std::deque<rz::Bytes> manifests;
     o.onManifest = [&](const rz::Bytes& m) {
-        if (!manifestSet.exchange(true)) manifestPromise.set_value(m);
+        {
+            std::lock_guard<std::mutex> g(jobsMutex);
+            manifests.push_back(m);
+        }
+        jobsCv.notify_all();
     };
     if (a.master) {
-        const aov::Tables& t = local->aovTables();
-        const size_t pixels = size_t(local->plan().width) * local->plan().height;
+        Local* l = current.get();
+        const aov::Tables& t = l->aovTables();
+        const size_t pixels = size_t(l->plan().width) * l->plan().height;
         if (t.channels) {
             mergedAovs.resize(pixels * t.channels);
             mergedDepths.resize(pixels * std::max<U32>(t.closestCount, 1));
             for (size_t p = 0; p < pixels; ++p) async::initAovPixel(t, mergedAovs.data() + p * t.channels, mergedDepths.data() + p * t.closestCount);
         }
-        const bool aux = local->plan().aovs && (local->plan().aovs->beautyAux || local->plan().aovs->alphaAux);
+        const bool aux = l->plan().aovs && (l->plan().aovs->beautyAux || l->plan().aovs->alphaAux);
         if (aux) odd.assign(pixels * 4, 0.0);
-        o.onFilm = [&, pixels, t](const rz::Film& f) {
-            const uint32_t W = local->plan().width;
+        o.onFilm = [&, pixels, t, l](const rz::Film& f) {
+            const uint32_t W = l->plan().width;
             size_t i = 0;
             for (uint32_t y = f.rect[1]; y < f.rect[3]; ++y)
                 for (uint32_t x = f.rect[0]; x < f.rect[2]; ++x, ++i) {
@@ -515,50 +725,113 @@ inline int run(int argc, char** argv) {
                                              f.aovs.data() + i * t.channels, f.aovDepths.data() + i * t.closestCount);
                 }
         };
+        o.job = fs::u8path(a.scenes.front()).filename().u8string();
     }
     o.rhizomeKey = a.key;
     o.master = a.master;
     o.masterAddress = a.masterAddress;
-    o.bind = a.bind, o.port = a.port, o.advertise = a.advertise;
+    o.trust = trust;
+    o.trustFirst = a.trustFirst;
+    o.build = buildId();
+    o.statusPath = (folder / "status.json").string();
+    // Its own port, else (taken: another node or master on this machine) one the system picks.
+    const uint16_t wanted = a.port >= 0 ? uint16_t(a.port) : a.master ? MasterPort : NodePort;
+    o.bind = a.bind, o.advertise = a.advertise;
+    o.port = wanted == 0 || portFree(a.bind, wanted) ? wanted : 0;
+    if (o.port != wanted) std::printf("MoonRay XPU2 Rhizome: port %u is taken here: another one is used\n", unsigned(wanted));
+    o.portFallback = a.port < 0;  // the default port: another one if it is taken as the node starts
     o.caps.cpuThreads = multi::logicalProcessors();
     o.caps.numaNodes = unsigned(std::max<size_t>(1, multi::nodes().size()));
     o.caps.cards = unsigned(gpu::cardCount());
     o.ramBytes = Local::ramBytes();
     o.render = [&](const uint32_t r[4], uint32_t first, uint32_t count) {
-        Local* l = made.load();
+        const std::shared_ptr<Local> l = local();
         if (!l) throw std::runtime_error("the scene is not made here yet");
         return l->render(r, first, count);
     };
-    o.renderPixel = [&](uint32_t x, uint32_t y, uint32_t first, uint32_t count, float sum[4]) { made.load()->pixel(x, y, first, count, sum); };
+    o.renderPixel = [&](uint32_t x, uint32_t y, uint32_t first, uint32_t count, float sum[4]) { local()->pixel(x, y, first, count, sum); };
     o.log = [](const std::string& s) {
         std::printf("MoonRay XPU2 Rhizome: %s\n", s.c_str());
         std::fflush(stdout);
     };
-    // The node's hash is kept in its folder (node.key), the same each time it runs from it.
-    const fs::path folder = a.folder.empty() ? (executableFolder() / "rhizome" / (a.master ? "master" : "node")) : fs::u8path(a.folder);
-    rz::RhizomeNode node(o, rz::Identity::load(folder));
+    rz::RhizomeNode node(o, std::move(identity));
     node.start();
-    std::printf("MoonRay XPU2 Rhizome: %s %s at %s\n", a.master ? "master" : "node", rz::hex(node.hash()).c_str(), node.address().c_str());
+    std::printf("MoonRay XPU2 Rhizome: %s %s listening at %s\n", a.master ? "master" : "node", rz::shortHex(node.hash()).c_str(),
+                node.address().c_str());
     std::fflush(stdout);
+    // Discovery: a node answers probes on every adapter; a master probes them and reaches each node of the rhizome
+    // it finds (a direct cable's too), and those given by address.
+    std::unique_ptr<rz::Responder> responder;
+    std::unique_ptr<rz::Prober> prober;
+    const uint16_t tcpPort = uint16_t(std::stoi(node.address().substr(node.address().rfind(':') + 1)));
+    if (a.discovery) {
+        try {
+            if (a.master)
+                prober = std::make_unique<rz::Prober>(a.key, [&](const rz::Hash& h, const std::string& at) {
+                    if (h == node.hash()) return;
+                    std::printf("MoonRay XPU2 Rhizome: found %s at %s\n", rz::shortHex(h).c_str(), at.c_str());
+                    std::fflush(stdout);
+                    node.dial(at);
+                });
+            else
+                responder = std::make_unique<rz::Responder>(a.key, node.hash(), tcpPort);
+        } catch (const std::exception& e) {
+            std::printf("MoonRay XPU2 Rhizome: discovery is off here: %s\n", e.what());
+        }
+    }
+    for (const auto& at : a.nodeAddresses) node.dial(at);
     if (!a.master) {
-        // A node: the scene from the swarm's memory, made here, then ready for cells; it renders until it is stopped.
-        if (manifest.wait_for(std::chrono::duration<double>(std::max(a.wait, 60.0))) != std::future_status::ready)
-            throw std::runtime_error("no manifest from the master");
-        a.scenes = receiveScene(node, manifest.get(), base / "scene");
-        held = std::make_unique<Local>(a, base / "staging");
-        made.store(held.get());
-        node.markReady();
-        std::printf("MoonRay XPU2 Rhizome: node ready\n");
+        // A node: each job's scene from the swarm's memory, made here, then ready for cells; then the next job.
+        std::printf("MoonRay XPU2 Rhizome: node waiting for a master%s\n", a.masterAddress.empty() ? " to find it" : "");
         std::fflush(stdout);
-        for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+        rz::Hash last{};
+        for (unsigned job = 1;; ++job) {
+            rz::Bytes m;
+            {
+                std::unique_lock<std::mutex> g(jobsMutex);
+                jobsCv.wait(g, [&] { return !manifests.empty(); });
+                m = std::move(manifests.back());
+                manifests.clear();
+            }
+            const rz::Hash which = rz::sha256(m);
+            if (which == last) continue;  // the same job sent again (a master reaching it once more)
+            last = which;
+            try {
+                RhizomeArgs j = a;
+                j.scenes = receiveScene(node, m, base / ("job" + std::to_string(job)));
+                auto made = std::make_shared<Local>(j, base / ("staging" + std::to_string(job)));
+                {
+                    std::lock_guard<std::mutex> g(currentMutex);
+                    current = made;  // the last job's goes once no chunk of it is rendering
+                }
+                node.markReady();
+                std::printf("MoonRay XPU2 Rhizome: node ready for job %u (%s)\n", job, fs::u8path(j.scenes.front()).filename().u8string().c_str());
+            } catch (const std::exception& e) {
+                std::printf("MoonRay XPU2 Rhizome: job %u could not be made here: %s\n", job, e.what());
+            }
+            std::fflush(stdout);
+        }
     }
     uint64_t sceneBytes = 0;
     node.publishManifest(publishScene(node, a.scenes, sceneBytes));
+    // The nodes: as many as asked (--nodes) or given (--node) ready, else every one found ready and none new for three
+    // seconds; --wait seconds at most.
+    const size_t needed = a.nodes ? a.nodes : a.nodeAddresses.size();
     const auto began = Clock::now();
-    while (node.ready() < a.nodes && std::chrono::duration<double>(Clock::now() - began).count() < a.wait)
+    auto lastChange = Clock::now();
+    size_t seen = 0;
+    for (;;) {
+        const double t = std::chrono::duration<double>(Clock::now() - began).count();
+        const size_t joined = node.joined(), ready = node.ready();
+        if (joined != seen) seen = joined, lastChange = Clock::now();
+        const double quiet = std::chrono::duration<double>(Clock::now() - lastChange).count();
+        if (needed ? ready >= needed : (ready == joined && joined > 0 && quiet > 3.0)) break;
+        if (t > a.wait) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));  // the nodes meet each other
-    const cpu::Plan& p = local->plan();
+    Local* l = current.get();
+    const cpu::Plan& p = l->plan();
     rz::FrameShape shape;
     shape.width = p.width, shape.height = p.height, shape.cellSize = a.cell, shape.spp = p.spp, shape.chunkSamples = std::min(a.chunk, p.spp);
     std::printf("MoonRay XPU2 Rhizome: %zu nodes joined, %zu ready; the frame in %u cells of %u px, chunks of %u samples\n", node.joined(),
@@ -570,7 +843,7 @@ inline int run(int argc, char** argv) {
     const std::vector<double> film = node.film();
     const std::vector<uint32_t> counts = node.counts();
     writePfm(fs::u8path(a.out), shape.width, shape.height, film, counts);
-    local->writeOutputs(film, counts, odd, mergedAovs, mergedDepths);
+    l->writeOutputs(film, counts, odd, mergedAovs, mergedDepths);
     const auto by = node.chunksByNode();
     std::string share;
     for (size_t i = 0; i < by.size(); ++i)
@@ -579,6 +852,7 @@ inline int run(int argc, char** argv) {
                 (unsigned long long)node.audits(), share.c_str());
     std::printf("MoonRay XPU2 Rhizome: wrote %s\n", a.out.c_str());
     std::fflush(stdout);
+    prober.reset();
     node.stop();
     return 0;
 }
