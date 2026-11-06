@@ -309,6 +309,13 @@ public:
         for (const auto& [c, ks] : held_) n += ks.size();
         return n;
     }
+    // The chunks it holds (a node's report to a master that took over).
+    std::vector<Chunk> held() const {
+        std::vector<Chunk> out;
+        for (const auto& [c, ks] : held_)
+            for (U32 k : ks) out.push_back(Chunk{c, k});
+        return out;
+    }
     // The owners to ask for work, best first: owners of cells next to this node's (by the plan), then the others;
     // nearer and of the cell's tier first. A slow node asks fast ones last.
     std::vector<int> victims() const {

@@ -49,14 +49,19 @@ public:
     }
     // Whether a frame from a known member is to be taken: authentic, its sequence past the last, not quarantined.
     // Taking it marks the member heard.
-    bool accept(const Bytes& frame, const Message& m, double now) {
+    // lastOnConnection: the last sequence taken on the connection it came by (messages on one connection keep their
+    // order; on two connections between the same pair they need not, so the number is checked by connection), or, as
+    // here without one, the member's own.
+    bool accept(const Bytes& frame, const Message& m, double now, uint64_t* lastOnConnection = nullptr) {
         Member* who = find(m.sender);
-        if (!who || who->quarantined || who->state == State::Gone) return false;
-        if (m.sequence <= who->lastSequence) return false;
+        if (!who || who->quarantined) return false;
+        uint64_t& last = lastOnConnection ? *lastOnConnection : who->lastSequence;
+        if (m.sequence <= last) return false;
         if (!authentic(frame, m, who->publicKey)) return false;
-        who->lastSequence = m.sequence;
+        last = m.sequence;
+        who->lastSequence = std::max(who->lastSequence, m.sequence);
         who->lastHeard = now;
-        who->state = State::Alive;
+        who->state = State::Alive;  // a member taken for gone that speaks again is back (its work was given out)
         return true;
     }
     // A round trip measured (a heartbeat's echo): the distance's running mean.

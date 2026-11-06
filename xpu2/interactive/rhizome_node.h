@@ -37,6 +37,11 @@ enum : uint16_t {
     TypeJoin = 15, TypePieceMoves = 16, TypePieceAsk = 17, TypePieceData = 18, TypeReassign = 19, TypeManifest = 20, TypeReady = 21,
     TypeEndorse = 22,  // master -> node: its endorsement (and the master's own, for a delegation)
     TypeRevoke = 23,   // a revocation, passed through the swarm
+    TypeSuccession = 24,  // master: who takes over if it fails, in order, signed
+    TypeReplica = 25,     // master -> deputy: a film it took in (the deputy keeps the picture and the ledger too)
+    TypeTakeover = 26,    // a successor: it is the master now (the old master's signed succession as its right)
+    TypeHeld = 27,        // a node -> its new master: the chunks it holds
+    TypeReplicaState = 28,  // master -> a new deputy: the picture, counts and chunks back so far, and the caller's merge
 };
 
 // A node's renderer: the film of a cell's rectangle for samples [first, first + count).
@@ -53,6 +58,11 @@ struct NodeOptions {
     // The master's: each film as it is taken into the picture (audited, the first of its chunk), under the node's
     // lock: the AOVs and aux outputs merged by the caller, which knows the scene's schema.
     std::function<void(const Film&)> onFilm;
+    // Failover: the caller's merge (AOVs, aux) as bytes for a new deputy, taken in by it; and what the caller does when
+    // this node takes over as master (it then waits for the picture and writes it).
+    std::function<Bytes()> exportMerge;
+    std::function<void(const Bytes&)> importMerge;
+    std::function<void()> onTakeover;
     // A node's: the master's manifest (what the frame needs: the scene's files as pieces), as it comes; and whether
     // a node takes cells before it says it is ready (markReady), as the stand-in renderer's tests do.
     std::function<void(const Bytes&)> onManifest;
@@ -126,7 +136,7 @@ public:
         threads_.emplace_back([this] { acceptLoop(); });
         threads_.emplace_back([this] { loop(); });
         threads_.emplace_back([this] { work(); });
-        if (o_.master) threads_.emplace_back([this] { auditLoop(); });
+        threads_.emplace_back([this] { auditLoop(); });  // every node: one may become the master (failover)
         if (o_.master) {
             std::lock_guard<std::mutex> g(m_);
             pool_.addNode(hash(), o_.ramBytes, o_.vramBytes);
@@ -191,6 +201,8 @@ public:
         writePlan(w, *plan_);
         broadcast(Type::Assign, w.b);
         startPlan();
+        frameId_ = nowSeconds() * 1e6;
+        announceSuccession();
         log("frame: " + std::to_string(shape.cells()) + " cells, " + std::to_string(plan_->nodes.size()) + " nodes");
     }
     // Master: waits for the picture (false: timed out).
@@ -262,6 +274,24 @@ public:
         std::lock_guard<std::mutex> g(m_);
         const Member* mm = members_.find(h);
         return mm && mm->state != State::Gone && !mm->quarantined;
+    }
+    // Whether this node is the master now (it may have taken over), who it takes as master, and its succession.
+    bool isMaster() {
+        std::lock_guard<std::mutex> g(m_);
+        return o_.master;
+    }
+    Hash masterOf() {
+        std::lock_guard<std::mutex> g(m_);
+        return o_.master ? hash() : masterHash_;
+    }
+    std::vector<Hash> succession() {
+        std::lock_guard<std::mutex> g(m_);
+        return succession_;
+    }
+    // The deputy's copy: chunks of the frame it holds the films of.
+    size_t replicaChunks() {
+        std::lock_guard<std::mutex> g(m_);
+        return replicaLedger_ ? size_t(plan_->shape.cells()) * plan_->shape.chunksPerCell() - replicaLedger_->outstanding() : 0;
     }
     // Master: what the frame needs (the scene's files, as pieces in the pool), to every node now and each one joining.
     void publishManifest(const Bytes& manifest) {
@@ -347,6 +377,7 @@ private:
         Hash peer{};
         bool known = false, joined = false;
         Hash challenge{};  // the one this side sent
+        uint64_t lastSequence = 0;  // the last message's number taken on this connection
         // Outgoing frames, in the order they were numbered, sent by the connection's writer thread: no thread holding
         // the node's lock ever waits on the network (two nodes sending each other large pieces would otherwise each
         // block in send while the other's reader waits for its node's lock).
@@ -574,7 +605,16 @@ private:
                 Writer w;
                 w.f64(now);
                 broadcast(Type::Heartbeat, w.b);
-                for (const Hash& h : members_.sweep(now)) lose(h, "silent");
+                for (const Hash& h : members_.sweep(now)) {
+                    if (!o_.master && h == masterHash_) masterGone(now);
+                    else {
+                        const bool successor = std::find(succession_.begin(), succession_.end(), h) != succession_.end();
+                        lose(h, "silent");
+                        if (successor && o_.master) announceSuccession();
+                    }
+                }
+                takeOverDone(now);
+                if (o_.master && !takeoverMessage_.empty() && now - takeoverAt_ < 10.0) broadcast(Type(TypeTakeover), takeoverMessage_);
                 askPlaced(now);
                 if (now >= nextTrust) {
                     nextTrust = now + 1.0;
@@ -593,7 +633,7 @@ private:
             return;
         }
         if (c) {
-            if (!c->joined || !members_.accept(frame, m, now)) {
+            if (!c->joined || !members_.accept(frame, m, now, &c->lastSequence)) {
                 if (trace()) log("refused type " + std::to_string(type) + " from " + shortHex(m.sender) + (c->joined ? " (not accepted: sequence " +
                                  std::to_string(m.sequence) + ")" : " (not joined)"));
                 return;
@@ -619,7 +659,8 @@ private:
                 const Hash h = r.hash();
                 const Capabilities caps = Capabilities::read(r);
                 // Workers connect to each other: the one with the lower hash dials, so each pair has one connection.
-                if (h != hash() && !members_.find(h) && hash() < h && !caps.address.empty()) {
+                if (h != hash() && !members_.find(h) && hash() < h && !caps.address.empty() && dialing_.insert(h).second) {
+                    // Dialled once: a member list that comes again while this dial shakes hands does not dial twice.
                     g_unlock([&] { connectTo(caps.address, false); });
                 }
             }
@@ -628,6 +669,8 @@ private:
         case uint16_t(Type::Assign): {
             auto p = std::make_unique<Plan>();
             if (readPlan(r, *p)) {
+                replicaLedger_.reset();  // it holds the plan it was made of
+                succession_.clear();
                 plan_ = std::move(p);
                 frameDone_ = false;
                 startPlan();
@@ -743,6 +786,37 @@ private:
                     }
                 }
             }
+            break;
+        case TypeSuccession:
+            if (!o_.master && m.sender == masterHash_) {
+                const Bytes body = r.bytes(), sig = r.bytes();
+                const Member* mm = members_.find(m.sender);
+                if (!r.bad && mm && verify(mm->publicKey, body.data(), body.size(), sig)) {
+                    Reader br(body);
+                    if (br.u32() == 0x31535A52u && br.hash() == m.sender) {
+                        br.u64();
+                        std::vector<Hash> list(std::min<uint32_t>(br.u32(), 16));
+                        for (auto& h : list) h = br.hash();
+                        if (!br.bad) {
+                            succession_ = list;
+                            successionBody_ = body;
+                            successionSig_ = sig;
+                        }
+                    }
+                }
+            }
+            break;
+        case TypeReplica:
+            if (m.sender == masterHash_) takeReplica(r);
+            break;
+        case TypeReplicaState:
+            if (m.sender == masterHash_) takeReplicaState(r);
+            break;
+        case TypeTakeover:
+            takeTakeover(m.sender, r, now);
+            break;
+        case TypeHeld:
+            if (o_.master) heldReports_[m.sender] = readChunks(r);
             break;
         case TypeReady:
             if (o_.master) {
@@ -884,6 +958,8 @@ private:
         if (Member* mm = members_.find(h)) mm->lastSequence = 0;
         c->peer = h, c->known = true, c->joined = true;
         if (info.isMaster && !o_.master) masterHash_ = h;
+        given_[h] = {info.ram, info.vram};
+        dialing_.erase(h);
         log("joined " + shortHex(h));
         if (o_.master) welcome(c, h, info);
     }
@@ -1070,6 +1146,25 @@ private:
         std::snprintf(line, sizeof line, "Memory pool   %zu pieces of the scene, %s MB given in RAM and %s MB in card memory across the swarm; %zu held here\n",
                       sourcePieces_.size(), mb(pool_.total(Tier::Ram)).c_str(), mb(pool_.total(Tier::Vram)).c_str(), store_.size());
         head += line;
+        // Failover: who takes over, in order, and the deputy's copy of the frame.
+        if (!succession_.empty()) {
+            std::string order;
+            for (const auto& h : succession_) order += (order.empty() ? "" : " -> ") + shortHex(h);
+            std::snprintf(line, sizeof line, "Succession    %s\n", order.c_str());
+            head += line;
+            if (o_.master) {
+                std::snprintf(line, sizeof line, "Deputy        %s   sent %llu films of the %zu taken in\n", shortHex(succession_[0]).c_str(),
+                              (unsigned long long)replicasSent_, back);
+                head += line;
+            } else if (succession_[0] == hash()) {
+                const size_t copy = replicaLedger_ ? total - replicaLedger_->outstanding() : 0;
+                std::snprintf(line, sizeof line, "Deputy        this machine   holds the films of %zu of %zu chunks, the picture so far and its AOVs\n", copy, total);
+                head += line;
+            }
+        }
+        if (tookOverFrom_ != Hash{} || (o_.master && !takeoverMessage_.empty())) {
+            head += "Master        this machine since it took over (the master before it failed)\n";
+        }
         head += "\nHash          Address                Role                    State     Tier   Rate Ms/s        RTT  Chunks  Pool\n";
         const std::string textPath = o_.statusPath.substr(0, o_.statusPath.size() - 5) + ".txt";
         {
@@ -1140,7 +1235,6 @@ private:
             const auto chunk = holder_->next();
             if (chunk) {
                 const Plan plan = *plan_;
-                const Hash master = o_.master ? hash() : masterHash_;
                 U32 rect[4];
                 plan.shape.rect(chunk->cell, rect);
                 const U32 first = plan.shape.first(chunk->index), count = plan.shape.count(chunk->index);
@@ -1168,7 +1262,8 @@ private:
                 w.array(f.aovs);
                 w.array(f.aovDepths);
                 g.lock();
-                sendTo(master, Type::Contribution, w.b);
+                // To the master as it is now (one may have taken over while the film was rendering).
+                sendTo(o_.master ? hash() : masterHash_, Type::Contribution, w.b);
                 continue;
             }
             // Out of work: ask the victims in turn, one at a time.
@@ -1191,20 +1286,35 @@ private:
     }
 
     // Master: a film. Audited, then added once.
-    void contribution(const Hash& from, Reader& r) {
-        if (!o_.master || !ledger_ || frameDone_) return;
-        Chunk c;
+    static void writeFilm(Writer& w, const Chunk& c, const Film& f, double seconds) {
+        w.u32(c.cell), w.u32(c.index);
+        for (int k = 0; k < 4; ++k) w.u32(f.rect[k]);
+        w.u32(f.first), w.u32(f.count);
+        w.array(f.sums);
+        w.array(f.counts);
+        w.f64(seconds);
+        w.array(f.odd);
+        w.array(f.aovs);
+        w.array(f.aovDepths);
+    }
+    static bool readFilm(Reader& r, Chunk& c, Film& f, double& seconds) {
         c.cell = r.u32(), c.index = r.u32();
-        Film f;
         for (int k = 0; k < 4; ++k) f.rect[k] = r.u32();
         f.first = r.u32(), f.count = r.u32();
         f.sums = r.array<float>();
         f.counts = r.array<uint32_t>();
-        const double seconds = r.f64();
+        seconds = r.f64();
         f.odd = r.array<float>();
         f.aovs = r.array<double>();
         f.aovDepths = r.array<float>();
-        if (r.bad) return;
+        return !r.bad;
+    }
+    void contribution(const Hash& from, Reader& r) {
+        if (!o_.master || !ledger_ || frameDone_) return;
+        Chunk c;
+        Film f;
+        double seconds = 0;
+        if (!readFilm(r, c, f, seconds)) return;
         // The node's rate, measured: the next frame's plan uses it.
         if (seconds > 0 && from != hash()) members_.rate(from, double(f.width()) * f.height() * f.count / seconds);
         if (seconds > 0 && from == hash()) o_.caps.rate = o_.caps.rate > 0 ? 0.7 * o_.caps.rate + 0.3 * double(f.width()) * f.height() * f.count / seconds
@@ -1273,14 +1383,9 @@ private:
             ++byNode_[size_t(who)];
             if (plan_->important[c.cell]) (plan_->nodes[size_t(who)].fast ? importantByFast_ : importantBySlow_)++;
         }
-        const U32 W = plan_->shape.width;
-        for (U32 y = f.rect[1]; y < f.rect[3]; ++y)
-            for (U32 x = f.rect[0]; x < f.rect[2]; ++x) {
-                const size_t i = size_t(y - f.rect[1]) * f.width() + (x - f.rect[0]), o = size_t(y) * W + x;
-                for (int k = 0; k < 4; ++k) film_[o * 4 + k] += f.sums[i * 4 + k];
-                counts_[o] += f.counts[i];
-            }
+        addFilm(film_, counts_, f);
         if (o_.onFilm) o_.onFilm(f);
+        replicate(from, c, f);
         if (ledger_->complete()) {
             frameDone_ = true;
             broadcast(Type::FrameDone, {});
@@ -1313,6 +1418,271 @@ private:
             log("gave " + std::to_string(chunks.size()) + " chunks to " + shortHex(plan_->nodes[size_t(to)].hash));
         }
     }
+    void addFilm(std::vector<double>& film, std::vector<uint32_t>& counts, const Film& f) const {
+        const U32 W = plan_->shape.width;
+        for (U32 y = f.rect[1]; y < f.rect[3]; ++y)
+            for (U32 x = f.rect[0]; x < f.rect[2]; ++x) {
+                const size_t i = size_t(y - f.rect[1]) * f.width() + (x - f.rect[0]), o = size_t(y) * W + x;
+                if (o >= counts.size()) continue;
+                for (int k = 0; k < 4; ++k) film[o * 4 + k] += f.sums[i * 4 + k];
+                counts[o] += f.counts[i];
+            }
+    }
+
+    // ---- failover (RHIZOME.md, 3b)
+    // Master: who takes over if it fails: the frame's members by rate, fastest first (three at most), signed. With
+    // approvals each is endorsed as an approver, so a master after a takeover approves and revokes in its turn.
+    void announceSuccession() {
+        if (!o_.master || !plan_) return;
+        std::vector<std::pair<double, Hash>> by;
+        for (const auto& n : plan_->nodes) {
+            if (n.hash == hash()) continue;
+            const Member* mm = members_.find(n.hash);
+            if (!mm || mm->state == State::Gone || mm->quarantined) continue;
+            by.push_back({-mm->caps.rate, n.hash});
+        }
+        std::sort(by.begin(), by.end());
+        std::vector<Hash> list;
+        for (size_t i = 0; i < by.size() && i < 3; ++i) list.push_back(by[i].second);
+        const Hash oldDeputy = succession_.empty() ? Hash{} : succession_[0];
+        succession_ = list;
+        Writer body;
+        body.u32(0x31535A52u);  // "RZS1"
+        body.hash(hash());
+        body.u64(uint64_t(frameId_));
+        body.u32(uint32_t(list.size()));
+        for (const auto& h : list) body.hash(h);
+        successionBody_ = body.b;
+        successionSig_ = id_->sign(body.b.data(), body.b.size());
+        Writer w;
+        w.bytes(successionBody_);
+        w.bytes(successionSig_);
+        broadcast(Type(TypeSuccession), w.b);
+        if (o_.trust && o_.trust->approver())
+            for (const Hash& h : list) {
+                if (approverEndorsed_.count(h)) continue;
+                approverEndorsed_.insert(h);
+                const Bytes e = o_.trust->endorse(h, Role::Approver);
+                Writer ew;
+                ew.bytes(e);
+                const std::vector<Bytes> chain = o_.trust->shown();
+                ew.u32(uint32_t(chain.size()));
+                for (const auto& s : chain) ew.bytes(s);
+                sendTo(h, uint16_t(TypeEndorse), ew.b);
+            }
+        // A new deputy has none of the films taken in so far: the picture as it stands, the chunks back, the merge.
+        if (!list.empty() && list[0] != oldDeputy && ledger_) {
+            Writer s;
+            s.array(film_);
+            s.array(counts_);
+            std::vector<U32> back;
+            for (U32 c = 0; c < plan_->shape.cells(); ++c)
+                for (U32 k = 0; k < plan_->shape.chunksPerCell(); ++k)
+                    if (ledger_->returned(Chunk{c, k})) back.push_back(c), back.push_back(k);
+            s.array(back);
+            s.array(byNode_);
+            s.bytes(o_.exportMerge ? o_.exportMerge() : Bytes{});
+            sendTo(list[0], uint16_t(TypeReplicaState), s.b);
+            log("deputy " + shortHex(list[0]) + " given the frame so far (" + std::to_string(back.size() / 2) + " chunks)");
+        }
+        std::string names;
+        for (const auto& h : list) names += (names.empty() ? "" : " -> ") + shortHex(h);
+        log("succession: " + (names.empty() ? std::string("none") : names));
+    }
+    // Master: a film taken in, to the deputy.
+    void replicate(const Hash& from, const Chunk& c, const Film& f) {
+        if (!o_.master || succession_.empty()) return;
+        Writer w;
+        w.hash(from);
+        writeFilm(w, c, f, 0.0);
+        sendTo(succession_[0], uint16_t(TypeReplica), w.b);
+        ++replicasSent_;
+    }
+    void makeReplica() {
+        if (replicaLedger_ || !plan_) return;
+        replicaLedger_ = std::make_unique<Ledger>(*plan_);
+        replicaFilm_.assign(size_t(plan_->shape.width) * plan_->shape.height * 4, 0.0);
+        replicaCounts_.assign(size_t(plan_->shape.width) * plan_->shape.height, 0);
+        replicaBy_.assign(plan_->nodes.size(), 0);
+    }
+    // The deputy: a film the master took in, kept as the master keeps it.
+    void takeReplica(Reader& r) {
+        if (o_.master || !plan_) return;
+        const Hash from = r.hash();
+        Chunk c;
+        Film f;
+        double seconds = 0;
+        if (!readFilm(r, c, f, seconds)) return;
+        makeReplica();
+        if (!replicaLedger_->arrived(c)) return;
+        addFilm(replicaFilm_, replicaCounts_, f);
+        const int who = plan_->nodeIndex(from);
+        if (who >= 0) ++replicaBy_[size_t(who)];
+        if (o_.onFilm) o_.onFilm(f);
+    }
+    void takeReplicaState(Reader& r) {
+        if (o_.master || !plan_) return;
+        replicaLedger_.reset();
+        makeReplica();
+        replicaFilm_ = r.array<double>();
+        replicaCounts_ = r.array<uint32_t>();
+        const auto back = r.array<U32>();
+        replicaBy_ = r.array<uint64_t>();
+        const Bytes merge = r.bytes();
+        if (r.bad || replicaFilm_.size() != size_t(plan_->shape.width) * plan_->shape.height * 4) {
+            replicaLedger_.reset();
+            return;
+        }
+        for (size_t i = 0; i + 1 < back.size(); i += 2) replicaLedger_->arrived(Chunk{back[i], back[i + 1]});
+        if (o_.importMerge) o_.importMerge(merge);
+        log("deputy: the frame so far taken (" + std::to_string(back.size() / 2) + " chunks)");
+    }
+    // A node: its master gone. The first successor of the signed list still here takes over: this node, or one it
+    // waits to hear from (its takeover is checked as it comes).
+    void masterGone(double now) {
+        if (o_.master || succession_.empty() || !plan_ || frameDone_) return;
+        for (const Hash& h : succession_) {
+            if (h == hash()) {
+                takeOver(now);
+                return;
+            }
+            const Member* mm = members_.find(h);
+            if (mm && mm->state != State::Gone && !mm->quarantined) {
+                log("master " + shortHex(masterHash_) + " gone: waiting for " + shortHex(h) + " to take over");
+                return;
+            }
+        }
+        log("master " + shortHex(masterHash_) + " gone, and no successor is here");
+    }
+    void takeOver(double now) {
+        const Hash old = masterHash_;
+        log("master " + shortHex(old) + " gone: taking over as master");
+        o_.master = true;
+        o_.masterRenders = true;
+        masterHash_ = hash();
+        makeReplica();
+        ledger_ = std::move(replicaLedger_);
+        film_ = std::move(replicaFilm_);
+        counts_ = std::move(replicaCounts_);
+        byNode_ = std::move(replicaBy_);
+        byNode_.resize(plan_->nodes.size(), 0);
+        frameDone_ = false;
+        auditor_ = Auditor();
+        tookOverFrom_ = old;
+        takeoverAt_ = now;
+        heldReports_.clear();
+        // The memory pool again, from the members here and the scene this node holds whole.
+        pool_ = Pool();
+        pool_.addNode(hash(), o_.ramBytes, o_.vramBytes);
+        for (const Member* mm : members_.working())
+            if (mm->hash != old) {
+                auto it = given_.find(mm->hash);
+                pool_.addNode(mm->hash, it == given_.end() ? 0 : it->second.first, it == given_.end() ? 0 : it->second.second);
+            }
+        sourcePieces_.clear();
+        for (const auto& [h, data] : store_) {
+            Piece pc{h, data.size(), Tier::Ram};
+            sourcePieces_[h] = pc;
+            pool_.add(pc);
+        }
+        sendPlacements(nullptr);
+        Writer w;
+        w.hash(old);
+        w.bytes(successionBody_);
+        w.bytes(successionSig_);
+        takeoverMessage_ = w.b;
+        broadcast(Type(TypeTakeover), takeoverMessage_);
+        // The others report what they hold; what no one holds and did not come back is given out again (takeOverDone).
+        if (o_.onTakeover) {
+            auto f = o_.onTakeover;
+            g_unlock([&] { f(); });
+        }
+    }
+    // A node: a successor says it is the master now. Taken when the old master signed the succession it shows, it is
+    // in it, and every successor before it is gone here.
+    void takeTakeover(const Hash& from, Reader& r, double now) {
+        const Hash old = r.hash();
+        const Bytes body = r.bytes(), sig = r.bytes();
+        if (r.bad || o_.master || from == old) return;
+        if (masterHash_ == from) {
+            sendHeld(from);  // the takeover again (it repeats it a while): the report again, in case it was lost
+            return;
+        }
+        const Member* om = members_.find(old);
+        if (!om || !verify(om->publicKey, body.data(), body.size(), sig)) {
+            log("refused a takeover by " + shortHex(from) + ": its succession is not the old master's");
+            return;
+        }
+        Reader br(body);
+        if (br.u32() != 0x31535A52u || br.hash() != old) return;
+        br.u64();
+        const uint32_t n = br.u32();
+        bool ok = false;
+        for (uint32_t i = 0; i < n && !br.bad; ++i) {
+            const Hash h = br.hash();
+            if (h == from) {
+                ok = true;
+                break;
+            }
+            if (h == hash()) return;  // this node is ahead of it: it takes over itself, as its master went (masterGone)
+            const Member* mm = members_.find(h);
+            if (mm && mm->state != State::Gone && !mm->quarantined) return;  // an earlier successor is still here
+        }
+        if (!ok || (om->state != State::Gone && now - om->lastHeard < o_.goneAfter)) return;
+        log("master " + shortHex(from) + " took over from " + shortHex(old));
+        masterHash_ = from;
+        if (Member* mm = members_.find(from)) mm->master = true;
+        sendHeld(from);
+    }
+    void sendHeld(const Hash& to) {
+        Writer w;
+        writeChunks(w, holder_ ? holder_->held() : std::vector<Chunk>{});
+        sendTo(to, uint16_t(TypeHeld), w.b);
+    }
+    // The new master, two seconds on: the chunks neither back nor held by anyone who reported, given out again.
+    void takeOverDone(double now) {
+        if (!o_.master || tookOverFrom_ == Hash{} || now - takeoverAt_ < 2.0 || !ledger_ || frameDone_) return;
+        tookOverFrom_ = Hash{};
+        std::set<Chunk> held;
+        if (holder_)
+            for (const auto& c : holder_->held()) held.insert(c);
+        for (const auto& [h, cs] : heldReports_)
+            for (const auto& c : cs) held.insert(c);
+        std::vector<Chunk> orphans;
+        for (U32 c = 0; c < plan_->shape.cells(); ++c)
+            for (U32 k = 0; k < plan_->shape.chunksPerCell(); ++k)
+                if (!ledger_->returned(Chunk{c, k}) && !held.count(Chunk{c, k})) orphans.push_back(Chunk{c, k});
+        // To the reporting members by the plan's owner where it reported, else to this master.
+        std::map<Hash, std::vector<Chunk>> to;
+        for (const auto& c : orphans) {
+            const int owner = plan_->owner[c.cell];
+            const Hash h = owner >= 0 ? plan_->nodes[size_t(owner)].hash : hash();
+            to[heldReports_.count(h) || h == hash() ? h : hash()].push_back(c);
+        }
+        for (const auto& [h, cs] : to) {
+            if (h == hash()) {
+                if (holder_) holder_->receive(cs);
+                cv_.notify_all();
+            } else {
+                Writer w;
+                w.hash(h);
+                writeChunks(w, cs);
+                sendTo(h, uint16_t(TypeReassign), w.b);
+            }
+        }
+        for (const auto& [h, cs] : heldReports_) ledger_->granted(cs, plan_->nodeIndex(h));
+        announceSuccession();
+        log("takeover done: " + std::to_string(orphans.size()) + " chunks no one held given out again; " +
+            std::to_string(ledger_->outstanding()) + " to come");
+        if (ledger_->complete()) {
+            frameDone_ = true;
+            broadcast(Type::FrameDone, {});
+            holder_.reset();
+            doneCv_.notify_all();
+            log("frame complete");
+        }
+    }
+
     // Master: where copies are to be made (all of the pool's placements when moves is null, each to its node).
     void sendPlacements(const std::vector<Move>* moves) {
         if (!o_.master) return;
@@ -1350,6 +1720,21 @@ private:
     std::deque<Bytes> self_;
     std::map<Conn*, Pending> pendingKey_;
     std::map<Hash, Waiting> waiting_;  // master: admitted by the key, waiting for an approver's endorsement
+    std::set<Hash> dialing_;           // peers this node has dialled (one connection a pair)
+    // Failover: the signed succession (its list, body and signature), the deputy's copy of the master's frame, a
+    // takeover's state, and what each member gives the pool.
+    std::vector<Hash> succession_;
+    Bytes successionBody_, successionSig_, takeoverMessage_;
+    double frameId_ = 0, takeoverAt_ = 0;
+    std::unique_ptr<Ledger> replicaLedger_;
+    std::vector<double> replicaFilm_;
+    std::vector<uint32_t> replicaCounts_;
+    std::vector<uint64_t> replicaBy_;
+    uint64_t replicasSent_ = 0;
+    Hash tookOverFrom_{};
+    std::map<Hash, std::vector<Chunk>> heldReports_;
+    std::set<Hash> approverEndorsed_;
+    std::map<Hash, std::pair<uint64_t, uint64_t>> given_;
     std::atomic<uint64_t> sequence_{0};
     Members members_;
     Hash masterHash_{};

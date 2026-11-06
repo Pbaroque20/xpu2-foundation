@@ -67,6 +67,24 @@ passes it.
 
 The scene reaches the nodes through the swarm's memory (section 4b).
 
+## 3b. When the master fails
+
+The master names its successors as a frame begins: the frame's members by their measured rate, the fastest first,
+three at most. It signs the list and sends it to every node. With approvals each successor is also endorsed as an
+approver, so whichever takes over can approve and revoke in its turn.
+
+The first successor is the deputy. Each film the master takes in (audited, the first of its chunk) goes to the deputy
+too, which keeps the picture, the counts, the chunks back and the merged AOVs as the master does. A deputy named later
+(the first one gone) is given all of it at once.
+
+When the nodes find the master silent, the first successor still here takes over: its copy becomes the master's
+picture and ledger, it makes the memory pool again from the scene it holds whole, and it tells the others, showing
+the old master's signed list. A node takes the new master when that list verifies against the old master's key, the
+new master is in it, and every successor before it is gone. The nodes then report the chunks they hold; two seconds
+on, what no one holds and has not come back (the old master's own, films that were on their way to it) is given out
+again. The new master finishes the frame and writes the picture and the scene's outputs (its folder's
+`output\<scene>.pfm`). `rhizome status` shows the succession and the deputy's copy.
+
 ## 4. Cells, ownership and stealing
 
 The picture is cut into rhizome cells (256 px by default, four of a machine's grid cells across). A cell's work is its
@@ -125,7 +143,7 @@ picture.
 | Tiers by rate, important cells to the fast tier, cells kept together, stealing by neighbours, reassignment (`rhizome_schedule.h`) | built, tested |
 | Audit by rendering samples again, quarantine (`rhizome_audit.h`) | built, tested |
 | Memory pool: RAM and card memory across the nodes, two copies a piece, copied again when a machine fails (`rhizome_memory.h`) | built, tested |
-| Loopback swarm: nodes over TCP on one machine, a stand-in renderer, the master's film, pieces moved between nodes (`rhizome_node.h`, `rhizome_test.cc`) | built, tested (78 checks) |
+| Loopback swarm: nodes over TCP on one machine, a stand-in renderer, the master's film, pieces moved between nodes (`rhizome_node.h`, `rhizome_test.cc`) | built, tested (96 checks) |
 | The XPU2 renderer as a node's renderer: a share of the frame (a cell's pixels, a range of its sample indices), its film back; the film's rows alone cleared and downloaded (`async_render.h`, `async_gpu.h`, `rhizome_session.inc`) | built; tested on Hydra (beauty as one machine's) |
 | AOVs and aux outputs: each node's accumulators merged at the master by each output's filter, resolved once, the scene's outputs written | built; Cryptomatte written empty (below) |
 | The scene's files (and the files they name, UDIM sets too) as pieces in the pool; a node fetches them and points the scene at its copies | built |
@@ -139,8 +157,8 @@ picture.
 | 2 | Headless nodes: no scene and no master given, a hash made on first start, listening, rendering each job and waiting for the next | built; tested: two nodes, two jobs one after another on them |
 | 3 | Discovery on every adapter, a direct cable's own 169.254 address too, answered only by members (`rhizome_discovery.h`); a master given `--nodes host:port,...` where broadcast does not reach | built; tested: a master found two nodes on one machine through its network address; a direct cable not tried yet (19) |
 | 4 | Signed approvals: endorsements and revocations, approver lists on every machine, `--approve`, `--trust-first`, `--trust` (`rhizome_trust.h`, 18 checks) | built; tested: held until approved, endorsed, a master the nodes do not trust refused, a revoked node refused; 19 + 9 checks |
-| 5 | Status: this machine, the frame, each machine's role, state, tier, rate, progress and pool share, the deputy's copy and the succession, the memory pool; `--watch` | built (status.json, status.txt, `--watch`); the deputy and succession lines come with 6 |
-| 6 | Master failover: a signed succession list, the deputy's copy of film, AOVs and ledger, a takeover by the first live successor, approvals carried by its approver endorsement | todo |
+| 5 | Status: this machine, the frame, each machine's role, state, tier, rate, progress and pool share, the deputy's copy and the succession, the memory pool; `--watch` | built (status.json, status.txt, `--watch`, the succession and the deputy's copy) |
+| 6 | Master failover: a signed succession list, the deputy's copy of film, AOVs and ledger, a takeover by the first live successor, approvals carried by its approver endorsement | built; tested: the master killed a third of the way into Hydra, a node took over and finished it as one machine renders it; unit checks for a late and an early failure |
 | 7 | Matching builds: the handshake compares the XPU2 build and shader hashes and refuses a machine whose samples would differ | built: the executable and its GPU programs hashed; tested in the unit checks |
 | 8 | Encrypted traffic: a key exchange each connection (ECDH, Windows CNG) and AES-GCM, so scene files cross the network unread | todo |
 | 9 | The indexer's probe as the master's importance (the first-hit probe per cell) | todo |

@@ -655,8 +655,46 @@ static void discovery() {
     check(!found.count(b->hash()), "a node of another rhizome is not found");
 }
 
+// Master failover: the master names its successors (the fastest first) and sends the deputy each film it takes in;
+// when it fails mid-frame the deputy takes over with the picture so far, the others follow it, what no one held is
+// given out again, and the frame completes at the new master as one machine renders it.
+// early: the master fails at a tenth of the frame, the nodes holding much of their work still (their reports count).
+static void failover(bool early) {
+    const std::string key = "studio rhizome key";
+    const FrameShape s = shape();
+    const double k = early ? 0.25 : 1.0;  // slower nodes: still holding work when the master fails
+    Swarm sw = swarm({{4e5 * k, 0}, {2e5 * k, 0}, {1e5 * k, 0}}, 3e5 * k, key);
+    const std::string when = early ? " (early, nodes holding work)" : "";
+    sw.master->beginFrame(s, importance(s));
+    const Hash fastest = sw.workers[0]->hash();
+    auto order = [&](RhizomeNode& n) { return n.succession(); };
+    check(until([&] { return order(*sw.workers[1]).size() == 3 && order(*sw.workers[1])[0] == fastest; }),
+          "the master names its successors, the fastest first, and every node holds the list");
+    // A quarter of the frame back, then the master fails.
+    auto back = [&] {
+        uint64_t n = 0;
+        for (auto v : sw.master->chunksByNode()) n += v;
+        return n;
+    };
+    const uint64_t total = uint64_t(s.cells()) * s.chunksPerCell();
+    check(until([&] { return back() >= (early ? total / 10 : total / 4); }, 60), std::string(early ? "a tenth" : "a quarter") +
+                                                                                  " of the frame comes back before the master fails");
+    check(until([&] { return sw.workers[0]->replicaChunks() > 0; }), "the deputy holds the films the master took in (" +
+                                                                    std::to_string(sw.workers[0]->replicaChunks()) + ")");
+    sw.master->stop();
+    check(until([&] { return sw.workers[0]->isMaster(); }, 10), "the deputy takes over as master" + when);
+    check(until([&] { return sw.workers[1]->masterOf() == fastest && sw.workers[2]->masterOf() == fastest; }, 10),
+          "the other nodes take it as their master" + when);
+    const bool done = sw.workers[0]->waitFrame(early ? 180 : 90);
+    double worst = 0;
+    check(done && exact(*sw.workers[0], s, &worst), "the frame completes at the new master, every sample once" + when + " (worst " +
+                                                         std::to_string(worst) + ")");
+    for (auto& w : sw.workers) w->stop();
+}
+
 int main() {
-    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, messages, plans, memory, audits, swarms, scene, approvals).
+    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, messages, plans, memory, audits, swarms, scene, approvals,
+    // discovery, failover).
     const char* only = std::getenv("RHIZOME_TEST_ONLY");
     auto run = [&](const char* name, const std::function<void()>& f) {
         if (only && std::string(only) != name) return;
@@ -675,6 +713,11 @@ int main() {
     });
     run("approvals", approvals);
     run("discovery", discovery);
+    run("failover-early", [] { failover(true); });
+    run("failover", [] {
+        failover(false);
+        failover(true);
+    });
     std::printf("{\"checks\": %d, \"failures\": %d}\n", checks, failures);
     return failures ? 1 : 0;
 }

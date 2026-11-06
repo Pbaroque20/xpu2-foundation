@@ -566,6 +566,54 @@ inline std::vector<std::string> receiveScene(rz::RhizomeNode& node, const rz::By
     return scenes;
 }
 
+// The merge of a frame's AOVs and aux outputs, as films are taken in (by each output's filter, async::mergeAovPixel):
+// the master's, and its deputy's copy (failover), which a new deputy is given whole.
+struct Merge {
+    aov::Tables tables;
+    size_t pixels = 0;
+    uint32_t width = 0;
+    std::vector<double> aovs, odd;
+    std::vector<float> depths;
+    void init(Local& l) {
+        tables = l.aovTables();
+        width = l.plan().width;
+        pixels = size_t(l.plan().width) * l.plan().height;
+        aovs.clear(), depths.clear(), odd.clear();
+        if (tables.channels) {
+            aovs.resize(pixels * tables.channels);
+            depths.resize(pixels * std::max<U32>(tables.closestCount, 1));
+            for (size_t p = 0; p < pixels; ++p) async::initAovPixel(tables, aovs.data() + p * tables.channels, depths.data() + p * tables.closestCount);
+        }
+        if (l.plan().aovs && (l.plan().aovs->beautyAux || l.plan().aovs->alphaAux)) odd.assign(pixels * 4, 0.0);
+    }
+    void add(const rz::Film& f) {
+        size_t i = 0;
+        for (uint32_t y = f.rect[1]; y < f.rect[3]; ++y)
+            for (uint32_t x = f.rect[0]; x < f.rect[2]; ++x, ++i) {
+                const size_t p = size_t(y) * width + x;
+                if (p >= pixels) continue;
+                if (!odd.empty() && !f.odd.empty())
+                    for (int c = 0; c < 4; ++c) odd[p * 4 + c] += f.odd[i * 4 + c];
+                if (tables.channels && f.aovs.size() >= (i + 1) * tables.channels)
+                    async::mergeAovPixel(tables, aovs.data() + p * tables.channels, depths.data() + p * tables.closestCount,
+                                         f.aovs.data() + i * tables.channels, f.aovDepths.data() + i * tables.closestCount);
+            }
+    }
+    rz::Bytes save() const {
+        rz::Writer w;
+        w.array(aovs), w.array(depths), w.array(odd);
+        return w.b;
+    }
+    void load(const rz::Bytes& b) {
+        rz::Reader r(b);
+        auto a = r.array<double>();
+        auto d = r.array<float>();
+        auto o = r.array<double>();
+        if (r.bad || a.size() != aovs.size() || d.size() != depths.size() || o.size() != odd.size()) return;
+        aovs = std::move(a), depths = std::move(d), odd = std::move(o);
+    }
+};
+
 // The identity verbs: id, trust, approve, revoke, status. No renderer, no network.
 inline int identityVerb(const RhizomeArgs& a) {
     const fs::path folder = roleFolder(a);
@@ -684,9 +732,8 @@ inline int run(int argc, char** argv) {
         std::lock_guard<std::mutex> g(currentMutex);
         return current;
     };
-    // The master's merge of the AOVs and aux outputs (each film as it is taken in, by each output's filter).
-    std::vector<double> mergedAovs, odd;
-    std::vector<float> mergedDepths;
+    // The merge of the AOVs and aux outputs: the master's, or a deputy's copy of it (failover).
+    Merge merge;
     rz::NodeOptions o;
     o.readyAtJoin = false;
     // A node's jobs: each manifest as it comes (the same one again is not a new job).
@@ -700,33 +747,38 @@ inline int run(int argc, char** argv) {
         }
         jobsCv.notify_all();
     };
+    o.onFilm = [&](const rz::Film& f) { merge.add(f); };
+    o.exportMerge = [&] { return merge.save(); };
+    o.importMerge = [&](const rz::Bytes& b) { merge.load(b); };
     if (a.master) {
-        Local* l = current.get();
-        const aov::Tables& t = l->aovTables();
-        const size_t pixels = size_t(l->plan().width) * l->plan().height;
-        if (t.channels) {
-            mergedAovs.resize(pixels * t.channels);
-            mergedDepths.resize(pixels * std::max<U32>(t.closestCount, 1));
-            for (size_t p = 0; p < pixels; ++p) async::initAovPixel(t, mergedAovs.data() + p * t.channels, mergedDepths.data() + p * t.closestCount);
-        }
-        const bool aux = l->plan().aovs && (l->plan().aovs->beautyAux || l->plan().aovs->alphaAux);
-        if (aux) odd.assign(pixels * 4, 0.0);
-        o.onFilm = [&, pixels, t, l](const rz::Film& f) {
-            const uint32_t W = l->plan().width;
-            size_t i = 0;
-            for (uint32_t y = f.rect[1]; y < f.rect[3]; ++y)
-                for (uint32_t x = f.rect[0]; x < f.rect[2]; ++x, ++i) {
-                    const size_t p = size_t(y) * W + x;
-                    if (p >= pixels) continue;
-                    if (!odd.empty() && !f.odd.empty())
-                        for (int c = 0; c < 4; ++c) odd[p * 4 + c] += f.odd[i * 4 + c];
-                    if (t.channels && f.aovs.size() >= (i + 1) * t.channels)
-                        async::mergeAovPixel(t, mergedAovs.data() + p * t.channels, mergedDepths.data() + p * t.closestCount,
-                                             f.aovs.data() + i * t.channels, f.aovDepths.data() + i * t.closestCount);
-                }
-        };
+        merge.init(*current);
         o.job = fs::u8path(a.scenes.front()).filename().u8string();
     }
+    // A node that takes over as master (its master failed): it waits for the picture, then writes it and the scene's
+    // outputs as the master would have (the beauty beside its folder, output\<scene>.pfm).
+    std::thread finisher;
+    std::atomic<bool> finishing{false};
+    rz::RhizomeNode* nodeRef = nullptr;
+    o.onTakeover = [&] {
+        if (finishing.exchange(true)) return;
+        if (finisher.joinable()) finisher.join();  // the last takeover's, done (finishing was false)
+        finisher = std::thread([&] {
+            rz::RhizomeNode& n = *nodeRef;
+            if (!n.waitFrame(24 * 3600.0)) return;
+            const std::shared_ptr<Local> l = local();
+            if (!l) return;
+            const std::vector<double> film = n.film();
+            const std::vector<uint32_t> counts = n.counts();
+            const fs::path out = folder / "output" / (fs::u8path(o.job).stem().u8string() + ".pfm");
+            std::error_code e;
+            fs::create_directories(out.parent_path(), e);
+            writePfm(out, l->plan().width, l->plan().height, film, counts);
+            l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths);
+            std::printf("MoonRay XPU2 Rhizome: took over as master and finished the frame: wrote %s\n", out.u8string().c_str());
+            std::fflush(stdout);
+            finishing = false;
+        });
+    };
     o.rhizomeKey = a.key;
     o.master = a.master;
     o.masterAddress = a.masterAddress;
@@ -755,6 +807,7 @@ inline int run(int argc, char** argv) {
         std::fflush(stdout);
     };
     rz::RhizomeNode node(o, std::move(identity));
+    nodeRef = &node;
     node.start();
     std::printf("MoonRay XPU2 Rhizome: %s %s listening at %s\n", a.master ? "master" : "node", rz::shortHex(node.hash()).c_str(),
                 node.address().c_str());
@@ -804,6 +857,8 @@ inline int run(int argc, char** argv) {
                     std::lock_guard<std::mutex> g(currentMutex);
                     current = made;  // the last job's goes once no chunk of it is rendering
                 }
+                merge.init(*made);  // its copy, should it be a deputy (failover)
+                o.job = fs::u8path(j.scenes.front()).filename().u8string();
                 node.markReady();
                 std::printf("MoonRay XPU2 Rhizome: node ready for job %u (%s)\n", job, fs::u8path(j.scenes.front()).filename().u8string().c_str());
             } catch (const std::exception& e) {
@@ -843,7 +898,7 @@ inline int run(int argc, char** argv) {
     const std::vector<double> film = node.film();
     const std::vector<uint32_t> counts = node.counts();
     writePfm(fs::u8path(a.out), shape.width, shape.height, film, counts);
-    l->writeOutputs(film, counts, odd, mergedAovs, mergedDepths);
+    l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths);
     const auto by = node.chunksByNode();
     std::string share;
     for (size_t i = 0; i < by.size(); ++i)
@@ -854,6 +909,7 @@ inline int run(int argc, char** argv) {
     std::fflush(stdout);
     prober.reset();
     node.stop();
+    if (finisher.joinable()) finisher.join();
     return 0;
 }
 
