@@ -1,15 +1,15 @@
-// Hive's members (HIVE.md, 2): every node a node knows, by its hash, with its public key, what it has, when it was
+// Rhizome's members (RHIZOME.md, 2): every node a node knows, by its hash, with its public key, what it has, when it was
 // last heard from, its distance (the round trip of its heartbeats, a running mean) and the last sequence number it
 // sent. A member silent for SuspectAfter is suspected, for GoneAfter dropped; a quarantined one is refused for the
 // rest of the session whatever it sends. Not thread-safe: the node's network thread owns it.
 #pragma once
-#include "hive_wire.h"
+#include "rhizome_wire.h"
 #include <algorithm>
 #include <map>
 #include <optional>
 #include <vector>
 
-namespace xpu2::interactive::hive {
+namespace xpu2::interactive::rhizome {
 
 enum class State : uint8_t { Alive, Suspect, Gone };
 
@@ -105,4 +105,4 @@ private:
     std::map<Hash, Member> members_;
 };
 
-}  // namespace xpu2::interactive::hive
+}  // namespace xpu2::interactive::rhizome

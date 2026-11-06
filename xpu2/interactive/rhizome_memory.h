@@ -1,4 +1,4 @@
-// Hive's memory (HIVE.md, 4b): the swarm's RAM and graphics card memory as one pool. The scene's pieces (the scene
+// Rhizome's memory (RHIZOME.md, 4b): the swarm's RAM and graphics card memory as one pool. The scene's pieces (the scene
 // file's blocks, meshes, texture tiles), each named by its SHA-256, are placed on the nodes by their free memory,
 // each kept on Replicas nodes so a machine that fails loses no piece; its pieces are then copied again, from a node
 // that still holds them, to nodes with room (allocation as nodes come and go). A piece a graphics card reads (a mesh,
@@ -9,7 +9,7 @@
 // members, so a node finds a piece's holders without asking; only what moved after a failure is told.
 // The master keeps the authoritative pool; nodes keep a copy from its reports. Not thread-safe.
 #pragma once
-#include "hive_identity.h"
+#include "rhizome_identity.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -17,7 +17,7 @@
 #include <set>
 #include <vector>
 
-namespace xpu2::interactive::hive {
+namespace xpu2::interactive::rhizome {
 
 enum class Tier : uint8_t { Ram = 0, Vram = 1 };
 
@@ -167,4 +167,4 @@ private:
     std::map<Hash, std::vector<Copy>> copies_;
 };
 
-}  // namespace xpu2::interactive::hive
+}  // namespace xpu2::interactive::rhizome

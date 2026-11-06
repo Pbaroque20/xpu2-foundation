@@ -1,4 +1,4 @@
-// Hive's scheduling (HIVE.md, 3-4): the master's plan of a frame (tiers of nodes by rate, the important cells to the
+// Rhizome's scheduling (RHIZOME.md, 3-4): the master's plan of a frame (tiers of nodes by rate, the important cells to the
 // fast tier and the rest to the slow tier, each node's cells kept together along a Morton curve, chunk sizes by
 // distance), its ledger (which chunks came back, from whom; what a lost node held, given to the nearest), and a
 // node's holder (the ranges it holds, the order it works them, what it gives a node that steals).
@@ -8,7 +8,7 @@
 // the picture exactly once whatever is lost or stolen on the way (a chunk may be rendered twice after a loss; the
 // second film is thrown away).
 #pragma once
-#include "hive_identity.h"
+#include "rhizome_identity.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -18,7 +18,7 @@
 #include <set>
 #include <vector>
 
-namespace xpu2::interactive::hive {
+namespace xpu2::interactive::rhizome {
 
 using U32 = uint32_t;
 
@@ -343,4 +343,4 @@ private:
     U32 sinceSwitch_ = 0;
 };
 
-}  // namespace xpu2::interactive::hive
+}  // namespace xpu2::interactive::rhizome

@@ -1,13 +1,14 @@
-// Hive's checks (HIVE.md, 6): identities, messages, members, the plan, ledger and holder, the memory pool, the audit,
+// Rhizome's checks (RHIZOME.md, 6): identities, messages, members, the plan, ledger and holder, the memory pool, the audit,
 // and swarms of nodes over TCP on this machine with a stand-in renderer (a sample's value is a hash of its identity,
 // as an XPU2 sample is a function of its identity): every pixel gets exactly its samples whatever is lost, stolen or
 // refused, the important cells are the fast nodes', a node that fails has its work and its memory taken over, and one
 // that cheats is caught. Prints a line a check and a JSON summary; exits non-zero on a failure.
-#include "hive_node.h"
+#include "rhizome_node.h"
+#include <future>
 #include <cstdio>
 #include <filesystem>
 
-using namespace xpu2::interactive::hive;
+using namespace xpu2::interactive::rhizome;
 
 static int failures = 0, checks = 0;
 static void check(bool ok, const std::string& what) {
@@ -58,7 +59,7 @@ static void identities() {
     char other[] = "a contribution";
     other[0] = 'A';
     check(!verify(a->publicKey(), other, sizeof other, sig), "and not over other bytes");
-    const auto folder = std::filesystem::temp_directory_path() / ("hive-test-" + shortHex(a->hash()));
+    const auto folder = std::filesystem::temp_directory_path() / ("rhizome-test-" + shortHex(a->hash()));
     std::filesystem::remove_all(folder);
     const Hash first = Identity::load(folder)->hash();
     check(Identity::load(folder)->hash() == first, "a node keeps its hash across restarts (node.key)");
@@ -245,40 +246,61 @@ static void audits() {
     const uint32_t r[4] = {0, 0, 64, 64};
     const Film honest = renderer(1e12)(r, 4, 4);
     check(a.check(fakeHash(0), honest, pixelSum).passed, "an honest film passes");
+    // Device noise: each pixel a few tenths of a percent off either way, as a card's film is beside a processor's.
+    Film noisy = honest;
+    for (size_t i = 0; i < noisy.counts.size(); ++i) {
+        const float k = 1.0f + 0.004f * ((i * 2654435761u >> 7) % 2 ? 1.0f : -1.0f) * float((i * 40503u) % 100) / 100.0f;
+        for (int c = 0; c < 4; ++c) noisy.sums[i * 4 + c] *= k;
+    }
+    Auditor every;
+    every.rate = 1.0;
+    check(every.check(fakeHash(3), noisy, pixelSum).passed, "a film with device noise (up to 0.4% a pixel, either way) passes");
     const Film biased = renderer(1e12, 0.01f)(r, 4, 4);
-    const Verdict v = a.check(fakeHash(1), biased, pixelSum);
-    check(!v.passed && v.failed > 0, "a film one percent off fails");
-    Film one = honest;
-    one.sums[5 * 4] += 1.0f;  // one pixel wrong
+    check(!a.check(fakeHash(1), biased, pixelSum).passed, "a film one percent off fails");
+    Film brighter = honest;
+    for (auto& s : brighter.sums) s *= 1.003f;
+    Auditor b2;
+    b2.rate = 1.0 / 16;
+    const Verdict vb = b2.check(fakeHash(4), brighter, pixelSum);
+    check(!vb.passed, "a film 0.3% brighter everywhere fails (bias " + std::to_string(vb.bias * 100) + "%)");
+    Film some = honest;
+    for (size_t i = 0; i < some.counts.size(); i += 10) some.sums[i * 4] += 1.0f;  // a tenth of the pixels wrong
     Auditor b;
     b.rate = 1.0;  // every pixel
-    check(!b.check(fakeHash(2), one, pixelSum).passed, "a single wrong pixel fails when every pixel is checked");
+    check(!b.check(fakeHash(2), some, pixelSum).passed, "a film with a tenth of its pixels wrong fails");
+    Film short_ = honest;
+    short_.counts[7] -= 1;
+    check(!every.check(fakeHash(5), short_, pixelSum).passed, "a pixel short of its samples fails");
 }
 
 struct Swarm {
-    std::unique_ptr<HiveNode> master;
-    std::vector<std::unique_ptr<HiveNode>> workers;
+    std::unique_ptr<RhizomeNode> master;
+    std::vector<std::unique_ptr<RhizomeNode>> workers;
 };
 static NodeOptions options(const std::string& key, bool master, double rate, float bias = 0) {
     NodeOptions o;
-    o.hiveKey = key;
+    o.rhizomeKey = key;
     o.master = master;
     o.caps.rate = rate;
     o.caps.cpuThreads = 8;
     o.ramBytes = 256ull << 20, o.vramBytes = 64ull << 20;
     o.render = renderer(rate, bias);
     o.renderPixel = pixelSum;
-    if (std::getenv("HIVE_TEST_LOG")) o.log = [](const std::string& s) { std::printf("    %s\n", s.c_str()); };
+    if (std::getenv("RHIZOME_TEST_LOG"))
+        o.log = [](const std::string& s) {
+            static const double began = nowSeconds();
+            std::printf("    %8.3f %s\n", nowSeconds() - began, s.c_str());
+        };
     return o;
 }
-static Swarm swarm(const std::vector<std::pair<double, float>>& workers, double masterRate, const std::string& key = "studio hive key") {
+static Swarm swarm(const std::vector<std::pair<double, float>>& workers, double masterRate, const std::string& key = "studio rhizome key") {
     Swarm s;
-    s.master = std::make_unique<HiveNode>(options(key, true, masterRate));
+    s.master = std::make_unique<RhizomeNode>(options(key, true, masterRate));
     s.master->start();
     for (const auto& [rate, bias] : workers) {
         NodeOptions o = options(key, false, rate, bias);
         o.masterAddress = s.master->address();
-        s.workers.push_back(std::make_unique<HiveNode>(o));
+        s.workers.push_back(std::make_unique<RhizomeNode>(o));
         s.workers.back()->start();
     }
     for (int k = 0; k < 200 && s.master->joined() < workers.size(); ++k) std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -299,7 +321,7 @@ static std::vector<float> importance(const FrameShape& s) {
     return imp;
 }
 // Whether the master's picture is every pixel's spp samples, each once, as the stand-in renders them.
-static bool exact(HiveNode& m, const FrameShape& s, double* worst = nullptr) {
+static bool exact(RhizomeNode& m, const FrameShape& s, double* worst = nullptr) {
     const auto film = m.film();
     const auto counts = m.counts();
     double w = 0;
@@ -349,8 +371,8 @@ static void swarms() {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         bool placed = true;
         for (const auto& p : pieces)
-            for (const auto& c : sw.master->pool().holders(p.hash)) {
-                HiveNode* n = c.node == sw.master->hash() ? sw.master.get() : nullptr;
+            for (const auto& c : sw.master->holdersOf(p.hash)) {
+                RhizomeNode* n = c.node == sw.master->hash() ? sw.master.get() : nullptr;
                 for (auto& w : sw.workers)
                     if (w->hash() == c.node) n = w.get();
                 placed = placed && n && n->holds(p.hash);
@@ -360,17 +382,21 @@ static void swarms() {
         // A worker fails: its memory is taken over.
         const Hash dead = sw.workers[2]->hash();
         sw.workers[2]->stop();
-        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
-        bool covered = true;
-        for (const auto& p : pieces) {
-            const auto& hs = sw.master->pool().holders(p.hash);
-            covered = covered && hs.size() == 2;
-            for (const auto& c : hs) {
-                covered = covered && c.node != dead;
-                HiveNode* n = c.node == sw.master->hash() ? sw.master.get() : nullptr;
-                for (auto& w : sw.workers)
-                    if (w->hash() == c.node && w->hash() != dead) n = w.get();
-                covered = covered && n && n->holds(p.hash);
+        // Gone after two seconds of silence, then its pieces copied again: looked at until they are, ten seconds at most.
+        bool covered = false;
+        for (int k = 0; k < 100 && !covered; ++k) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            covered = true;
+            for (const auto& p : pieces) {
+                const auto hs = sw.master->holdersOf(p.hash);
+                covered = covered && hs.size() == 2;
+                for (const auto& c : hs) {
+                    covered = covered && c.node != dead;
+                    RhizomeNode* n = c.node == sw.master->hash() ? sw.master.get() : nullptr;
+                    for (auto& w : sw.workers)
+                        if (w->hash() == c.node && w->hash() != dead) n = w.get();
+                    covered = covered && n && n->holds(p.hash);
+                }
             }
         }
         check(covered, "a failed node's pieces are copied to the others: two copies each again");
@@ -395,16 +421,105 @@ static void swarms() {
         check(done && exact(*sw.master, s), "and the picture is the honest one");
     }
     {
-        // A node without the hive key is not let in.
+        // A node without the rhizome key is not let in.
         Swarm sw = swarm({{2e6, 0}}, 2e6);
         NodeOptions o = options("another key", false, 2e6);
         o.masterAddress = sw.master->address();
-        HiveNode stranger(o);
+        RhizomeNode stranger(o);
         stranger.start();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        check(sw.master->joined() == 1, "a node without the hive key does not join");
+        check(sw.master->joined() == 1, "a node without the rhizome key does not join");
         stranger.stop();
     }
+}
+
+// The scene through the swarm as a session moves it: the master's pieces and manifest, each worker taking the manifest
+// as it joins and fetching every piece while the others do, then saying it is ready; a frame then only on ready nodes.
+static void sceneThroughSwarm(bool joinFirst) {
+    const std::string key = "studio rhizome key";
+    NodeOptions mo = options(key, true, 2e6);
+    mo.readyAtJoin = false;
+    RhizomeNode master(mo);
+    master.start();
+    std::vector<Hash> pieces;
+    auto publish = [&] {
+        for (int k = 0; k < 32; ++k) {
+            Bytes data(4u << 20, uint8_t(k * 7 + 1));
+            data[0] = uint8_t(k);
+            Piece p{sha256(data), data.size(), Tier::Ram};
+            master.addPiece(p, data);
+            pieces.push_back(p.hash);
+        }
+        Writer mw;
+        mw.u32(uint32_t(pieces.size()));
+        for (const auto& h : pieces) mw.hash(h);
+        master.publishManifest(mw.b);
+    };
+    // The master's pieces before anyone joins, or once the workers have (as a session reading its scene while they come).
+    if (!joinFirst) publish();
+    struct Worker {
+        std::unique_ptr<RhizomeNode> node;
+        std::promise<Bytes> manifest;
+        std::atomic<bool> got{false};
+        bool fetched = false;
+    };
+    std::vector<std::unique_ptr<Worker>> workers;
+    for (int i = 0; i < 2; ++i) {
+        auto w = std::make_unique<Worker>();
+        NodeOptions o = options(key, false, 2e6);
+        o.readyAtJoin = false;
+        o.masterAddress = master.address();
+        Worker* wp = w.get();
+        o.onManifest = [wp](const Bytes& m) {
+            if (!wp->got.exchange(true)) wp->manifest.set_value(m);
+        };
+        w->node = std::make_unique<RhizomeNode>(o);
+        w->node->start();
+        workers.push_back(std::move(w));
+    }
+    if (joinFirst) {
+        for (int k = 0; k < 200 && master.joined() < 2; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        publish();
+    }
+    const std::string when = joinFirst ? " (joined before the scene was published)" : "";
+    std::vector<std::thread> threads;
+    for (auto& w : workers)
+        threads.emplace_back([wp = w.get()] {
+            auto f = wp->manifest.get_future();
+            const double began = nowSeconds();
+            if (f.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+                std::printf("    worker %s: no manifest in 20 s\n", shortHex(wp->node->hash()).c_str());
+                return;
+            }
+            const Bytes manifest = f.get();  // kept: the reader points into it
+            Reader r(manifest);
+            std::vector<Hash> want(r.u32());
+            for (auto& h : want) h = r.hash();
+            wp->fetched = wp->node->fetch(want, 60);
+            if (!wp->fetched || std::getenv("RHIZOME_TEST_LOG"))
+                std::printf("    worker %s: %zu pieces %s in %.2f s\n", shortHex(wp->node->hash()).c_str(), want.size(),
+                            wp->fetched ? "fetched" : "NOT fetched", nowSeconds() - began);
+            if (wp->fetched) wp->node->markReady();
+        });
+    for (auto& t : threads) t.join();
+    bool got = true, all = true, whole = true;
+    for (auto& w : workers) {
+        got = got && w->got;
+        all = all && w->fetched;
+        for (const auto& h : pieces) whole = whole && sha256(w->node->piece(h)) == h;
+    }
+    check(got, "each worker takes the manifest" + when);
+    check(all, "each worker fetches the scene's pieces from the swarm" + when);
+    check(whole, "every piece arrives whole on each worker" + when);
+    for (int k = 0; k < 100 && master.ready() < 2; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(master.ready() == 2, "the workers say they are ready" + when);
+    const FrameShape s = shape();
+    master.beginFrame(s, {});
+    const bool done = master.waitFrame(60);
+    check(done && exact(master, s), "a frame on the ready workers completes, every sample once" + when);
+    for (auto& w : workers) w->node->stop();
+    master.stop();
 }
 
 int main() {
@@ -414,6 +529,8 @@ int main() {
     memory();
     audits();
     swarms();
+    sceneThroughSwarm(false);
+    sceneThroughSwarm(true);
     std::printf("{\"checks\": %d, \"failures\": %d}\n", checks, failures);
     return failures ? 1 : 0;
 }

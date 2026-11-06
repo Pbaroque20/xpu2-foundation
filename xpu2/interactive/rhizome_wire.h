@@ -1,24 +1,24 @@
-// Hive's messages (HIVE.md, 1-2): a header (its magic, the type, a sequence number, the sender's hash, the payload's
+// Rhizome's messages (RHIZOME.md, 1-2): a header (its magic, the type, a sequence number, the sender's hash, the payload's
 // length), the payload, and the sender's signature over both. A receiver takes a message only once it knows the
 // sender's public key (from its Hello, whose key must hash to the sender's hash) and the signature verifies; the
 // sequence must rise, so a message cannot be played again. Little-endian throughout.
 #pragma once
-#include "hive_identity.h"
+#include "rhizome_identity.h"
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
 
-namespace xpu2::interactive::hive {
+namespace xpu2::interactive::rhizome {
 
-constexpr uint32_t Magic = 0x31564948u;  // "HIV1"
+constexpr uint32_t Magic = 0x315A4852u;  // "RHZ1"
 constexpr size_t HeaderBytes = 4 + 2 + 2 + 8 + 32 + 4;
 constexpr size_t SignatureBytes = 64;
 constexpr uint32_t MaxPayload = 256u << 20;  // a contribution of a large cell with its AOVs stays well under
 
 enum class Type : uint16_t {
-    Hello = 1,         // a node introduces itself: its public key, what it has, a challenge, its proof of the hive key
+    Hello = 1,         // a node introduces itself: its public key, what it has, a challenge, its proof of the rhizome key
     Welcome = 2,       // the answer: the receiver's key, its proof for the challenge, the members it knows
     Heartbeat = 3,     // alive: the sender's clock (for the round trip), its members' digest
     Echo = 4,          // a heartbeat's answer: its clock back
@@ -129,7 +129,7 @@ inline Bytes encode(const Identity& id, Type type, uint64_t sequence, const Byte
     return w.b;
 }
 
-// A frame's header read: the payload's length, or nothing (not a Hive frame).
+// A frame's header read: the payload's length, or nothing (not a Rhizome frame).
 inline std::optional<uint32_t> payloadLength(const unsigned char* header) {
     Reader r(header, HeaderBytes);
     if (r.u32() != Magic) return std::nullopt;
@@ -176,4 +176,4 @@ struct Capabilities {
     }
 };
 
-}  // namespace xpu2::interactive::hive
+}  // namespace xpu2::interactive::rhizome

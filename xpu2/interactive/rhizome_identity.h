@@ -1,7 +1,7 @@
-// Hive's node identity (HIVE.md, 1): an ECDSA P-256 key pair made once and kept in the node's folder, and the node's
+// Rhizome's node identity (RHIZOME.md, 1): an ECDSA P-256 key pair made once and kept in the node's folder, and the node's
 // unique hash, the SHA-256 of its public key. Every message a node sends is signed with its key; a receiver checks
 // the signature with the public key the node introduced itself with, and that the key hashes to the hash it claims.
-// The hive key, a secret every member is given, proves membership: a keyed hash (HMAC-SHA-256) of the other's
+// The rhizome key, a secret every member is given, proves membership: a keyed hash (HMAC-SHA-256) of the other's
 // challenge. Windows CNG (bcrypt) does the hashing and the signatures.
 #pragma once
 #include <windows.h>
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace xpu2::interactive::hive {
+namespace xpu2::interactive::rhizome {
 
 using Bytes = std::vector<unsigned char>;
 // A node's unique hash: the SHA-256 of its public key.
@@ -62,12 +62,12 @@ inline void randomBytes(void* out, size_t n) {
     ok(BCryptGenRandom(nullptr, (PUCHAR)out, ULONG(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG), "random bytes");
 }
 
-// The hive key's proof: HMAC-SHA-256 of a challenge under the hive key, bound to the prover's hash.
-inline Hash membershipProof(const std::string& hiveKey, const Hash& challenge, const Hash& prover) {
+// The rhizome key's proof: HMAC-SHA-256 of a challenge under the rhizome key, bound to the prover's hash.
+inline Hash membershipProof(const std::string& rhizomeKey, const Hash& challenge, const Hash& prover) {
     unsigned char m[64];
     std::memcpy(m, challenge.data(), 32);
     std::memcpy(m + 32, prover.data(), 32);
-    return sha256(m, sizeof m, hiveKey.data(), hiveKey.size());
+    return sha256(m, sizeof m, rhizomeKey.data(), rhizomeKey.size());
 }
 
 // Checks a signature over data with a public key (BCRYPT_ECCPUBLIC_BLOB, P-256).
@@ -166,4 +166,4 @@ private:
 // Whether a public key is the one a hash names.
 inline bool keyMatches(const Bytes& publicBlob, const Hash& claimed) { return sha256(publicBlob) == claimed; }
 
-}  // namespace xpu2::interactive::hive
+}  // namespace xpu2::interactive::rhizome

@@ -96,7 +96,7 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
             kernels, kernel_flags = bc6h_kernels(source, out / 'bc6h')
             exe, report['native_build'] = build_units(source, [HERE / 'xpu2_session.cc', HERE / 'xpu2_scene.cc', HERE / 'xpu2_cpu.cc', HERE / 'xpu2_meshopt.cc', HERE / 'xpu2_bc6h.cc'], out / 'native',
                                                       [runtime / 'libembree4.dll', runtime / 'librendering_lpe.dll',
-                                                       runtime / 'librendering_displayfilter.dll', *kernels, '-lcfgmgr32', '-lwinmm'],
+                                                       runtime / 'librendering_displayfilter.dll', *kernels, '-lcfgmgr32', '-lwinmm', '-lbcrypt', '-lws2_32'],
                                                       ['-I' + str(v) for v in include] + ['-I' + str(source / 'upstream/meshoptimizer/src'), '-DXPU2_SPLIT_UNITS'] + kernel_flags)
         finally:
             geom_thread.join()
