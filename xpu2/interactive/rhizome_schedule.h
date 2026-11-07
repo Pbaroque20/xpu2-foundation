@@ -38,6 +38,11 @@ struct Node {
 
 struct FrameShape {
     U32 width = 0, height = 0, cellSize = 256, spp = 64, chunkSamples = 4;
+    // Adaptive sampling across the swarm (RHIZOME.md, plan 10): a cell's chunks past minSamples are cancelled once its
+    // pooled error is under targetError (0: uniform, every chunk rendered). The halves' error needs even chunks.
+    float targetError = 0;
+    U32 minSamples = 0;
+    bool adaptive() const { return targetError > 0 && chunkSamples % 2 == 0; }
     U32 cellsX() const { return (width + cellSize - 1) / cellSize; }
     U32 cellsY() const { return (height + cellSize - 1) / cellSize; }
     U32 cells() const { return cellsX() * cellsY(); }
@@ -197,6 +202,20 @@ public:
         return true;
     }
     bool returned(const Chunk& c) const { return returned_.count(c) != 0; }
+    // A cell converged (adaptive): its chunks not back are not needed; the ones cancelled.
+    std::vector<Chunk> cancel(U32 cell) {
+        std::vector<Chunk> out;
+        for (U32 k = 0; k < plan_.shape.chunksPerCell(); ++k) {
+            const Chunk c{cell, k};
+            if (!holder_.count(c) || returned_.count(c)) continue;
+            returned_.insert(c);
+            --outstanding_;
+            out.push_back(c);
+        }
+        cancelled_ += out.size();
+        return out;
+    }
+    size_t cancelled() const { return cancelled_; }
     size_t outstanding() const { return outstanding_; }
     bool complete() const { return outstanding_ == 0; }
     // A node lost (gone, or quarantined): the chunks it held that have not come back, each cell's given to the node
@@ -241,7 +260,7 @@ private:
     const Plan& plan_;
     std::map<Chunk, int> holder_;
     std::set<Chunk> returned_;
-    size_t outstanding_ = 0;
+    size_t outstanding_ = 0, cancelled_ = 0;
 };
 
 // A node's chunks: those its plan gave it, those granted to it; the order it works them and what it gives away.
@@ -279,6 +298,20 @@ public:
         current_ = best;
         sinceSwitch_ = 1;
         return take(*best);
+    }
+    // Every chunk this node holds, given up (a workstation stepping back).
+    std::vector<Chunk> takeAll() {
+        std::vector<Chunk> out;
+        for (const auto& [cell, ks] : held_)
+            for (U32 k : ks) out.push_back(Chunk{cell, k});
+        held_.clear();
+        current_.reset();
+        return out;
+    }
+    // A cell converged: its chunks dropped.
+    void drop(U32 cell) {
+        held_.erase(cell);
+        if (current_ && *current_ == cell) current_.reset();
     }
     // A node asks for work. The grant: from the cell with the most left that the thief may take (a slow node may not
     // take an important cell from a fast holder), half its remaining chunks, at least one, at most the thief's

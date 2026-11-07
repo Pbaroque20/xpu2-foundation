@@ -72,6 +72,13 @@ public:
         if (Member* m = find(h)) m->caps.rate = m->caps.rate > 0 ? 0.7 * m->caps.rate + 0.3 * samplesPerSecond : samplesPerSecond;
     }
     // Marks the silent: suspected, then gone. Returns the members that went this sweep.
+    // Bytes of a member's arrived (a message on its way, however long): it is not silent. Never brings back the gone.
+    void heardBytes(const Hash& h, double at) {
+        auto it = members_.find(h);
+        if (it == members_.end() || it->second.state == State::Gone || it->second.quarantined) return;
+        if (at > it->second.lastHeard) it->second.lastHeard = at;
+        if (it->second.state == State::Suspect) it->second.state = State::Alive;
+    }
     std::vector<Hash> sweep(double now) {
         std::vector<Hash> gone;
         for (auto& [h, m] : members_) {

@@ -27,9 +27,29 @@ struct Film {
     std::vector<float> odd;
     std::vector<double> aovs;
     std::vector<float> aovDepths;
+    // Cryptomatte's fragments of the film's pixels as sums, before finalizing (the caller's format; empty without).
+    Bytes crypto;
     uint32_t width() const { return rect[2] - rect[0]; }
     uint32_t height() const { return rect[3] - rect[1]; }
 };
+
+// One pixel's adaptive error from its sums, odd-index sums and count, as XPU2 works it out on either device
+// (async_integrator.h pixelError, MoonRay's estimatePixelErrorInternal): the luma of the even and odd halves'
+// difference over the square root of the pixel's luma, plus the alpha difference; -1 until both halves have a sample.
+inline float pixelError(const double total[4], const double odd[4], uint32_t samples) {
+    const double n = samples, nOdd = samples / 2, nEven = n - nOdd;
+    if (nOdd <= 0 || nEven <= 0) return -1.0f;
+    double diff[4], avg[3];
+    for (int c = 0; c < 4; ++c) {
+        if (total[c] != total[c] || odd[c] != odd[c]) return 0.0f;
+        diff[c] = std::fabs((total[c] * nOdd - odd[c] * n) / (nOdd * nEven));
+        if (c < 3) avg[c] = total[c] / n;
+    }
+    const double lumDiff = 0.299 * diff[0] + 0.587 * diff[1] + 0.114 * diff[2];
+    const double lumAvg = 0.299 * avg[0] + 0.587 * avg[1] + 0.114 * avg[2];
+    if (lumAvg <= 0) return float(diff[3]);
+    return float(lumDiff / std::sqrt(lumAvg) + diff[3]);
+}
 
 // What renders a pixel's samples again: its sums for samples [first, first + count).
 using PixelRenderer = std::function<void(uint32_t x, uint32_t y, uint32_t first, uint32_t count, float sum[4])>;

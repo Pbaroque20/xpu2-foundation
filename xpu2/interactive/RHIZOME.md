@@ -13,7 +13,7 @@ and less urgent its share.
 This note is the design and where it stands. The code is `rhizome_*.h`; `rhizome_test.cc` checks it:
 
 ```
-g++ -std=c++20 -O2 -o rhizome_test.exe xpu2/interactive/rhizome_test.cc -lbcrypt -lws2_32
+g++ -std=c++20 -O2 -o rhizome_test.exe xpu2/interactive/rhizome_test.cc -lbcrypt -lws2_32 -liphlpapi
 ```
 
 (the toolchain's `msys64/ucrt64` g++). `RHIZOME_TEST_LOG=1` prints what each node does.
@@ -34,12 +34,19 @@ A swarm also has a rhizome key, a secret every member is given. A node that cann
 of the other's challenge, in the handshake) is not let in. Rhizome is meant for a studio's own network; it is not built
 to resist a hostile machine inside it beyond what the audit catches.
 
+The traffic is encrypted (`rhizome_crypto.h`). Each connection makes a key exchange of its own: the two sides send a
+one-time ECDH P-256 key in their signed Hello and Welcome, so no machine in between can put its own in, and from the
+shared secret, the two nodes' hashes and the rhizome key come two AES-256 keys, one each way. Every frame after the
+handshake is sealed with AES-GCM, its nonce the count of frames that way: a frame changed, cut short, played again or
+out of order does not open, and the connection is closed. Scene files, pieces and films cross the network unread; the
+handshake's two frames, which carry only keys, hashes and what a machine has, are the only ones in the open.
+
 ## 2. The swarm
 
 A node starts with the address of any member (usually the master). It introduces itself (hash, public key, what it
 has: processor threads, NUMA nodes, graphics cards, a measured rate), learns the members from the one it reached, and
 connects to the others. Members are kept by heartbeats: a member not heard from for a few heartbeats is suspected,
-then dropped (`rhizome_swarm.h`, `Members`). The master's list is the one that counts when lists differ.
+then dropped (bytes of a message still arriving count as hearing it, so a large piece on a slow link is not silence) (`rhizome_swarm.h`, `Members`). The master's list is the one that counts when lists differ.
 
 A node joins and leaves at any time. One that joins mid-frame takes work from the next steals; one that leaves or
 falls silent has its unreturned work given out again (section 4).
@@ -145,7 +152,7 @@ picture.
 | Memory pool: RAM and card memory across the nodes, two copies a piece, copied again when a machine fails (`rhizome_memory.h`) | built, tested |
 | Loopback swarm: nodes over TCP on one machine, a stand-in renderer, the master's film, pieces moved between nodes (`rhizome_node.h`, `rhizome_test.cc`) | built, tested (96 checks) |
 | The XPU2 renderer as a node's renderer: a share of the frame (a cell's pixels, a range of its sample indices), its film back; the film's rows alone cleared and downloaded (`async_render.h`, `async_gpu.h`, `rhizome_session.inc`) | built; tested on Hydra (beauty as one machine's) |
-| AOVs and aux outputs: each node's accumulators merged at the master by each output's filter, resolved once, the scene's outputs written | built; Cryptomatte written empty (below) |
+| AOVs and aux outputs: each node's accumulators merged at the master by each output's filter, resolved once, the scene's outputs written | built; Cryptomatte merged too (plan 11) |
 | The scene's files (and the files they name, UDIM sets too) as pieces in the pool; a node fetches them and points the scene at its copies | built |
 | A machine's own processor, cards and NUMA nodes inside a node (its own grid, as now) | as now: a node is a whole XPU2 |
 
@@ -160,11 +167,11 @@ picture.
 | 5 | Status: this machine, the frame, each machine's role, state, tier, rate, progress and pool share, the deputy's copy and the succession, the memory pool; `--watch` | built (status.json, status.txt, `--watch`, the succession and the deputy's copy) |
 | 6 | Master failover: a signed succession list, the deputy's copy of film, AOVs and ledger, a takeover by the first live successor, approvals carried by its approver endorsement | built; tested: the master killed a third of the way into Hydra, a node took over and finished it as one machine renders it; unit checks for a late and an early failure |
 | 7 | Matching builds: the handshake compares the XPU2 build and shader hashes and refuses a machine whose samples would differ | built: the executable and its GPU programs hashed; tested in the unit checks |
-| 8 | Encrypted traffic: a key exchange each connection (ECDH, Windows CNG) and AES-GCM, so scene files cross the network unread | todo |
-| 9 | The indexer's probe as the master's importance (the first-hit probe per cell) | todo |
-| 10 | Adaptive sampling across machines: the nodes' errors pooled at the master, as the cards' are (`GpuLane::poolErrors`) | todo |
-| 11 | Cryptomatte: each node's fragments merged at the master | todo |
-| 12 | Workstations: a node stepping back while its machine is in use (paused, or fewer threads), hours it may render in | todo |
+| 8 | Encrypted traffic: a key exchange each connection (ECDH, Windows CNG) and AES-GCM, so scene files cross the network unread | built; tested: 15 checks (agreement, keys each way, sealing, a frame played again, out of order, changed, plain), and every swarm's traffic sealed after its handshake |
+| 9 | The indexer's probe as the master's importance (the first-hit probe per cell) | built (`rhizome_importance.h`): a camera ray every 8 px on the master's processor, each cell scored by its edges, the objects it sees and their slow features (hair, skin, glitter, layers, maps, displacement, cut-outs, mesh lights, volumes, glow); 8 checks; Hydra's probe 0.01 s, 26 of 49 cells important |
+| 10 | Adaptive sampling across machines: the nodes' errors pooled at the master, as the cards' are (`GpuLane::poolErrors`) | built: an adaptive scene's shares send their odd sums; the master works out each pixel's error from every node's films added, and a cell under the scene's target (one pixel in a hundred aside) has its chunks not back cancelled on every node (and on the deputy); 6 checks: the flat half of a frame stopped at its minimum, the noisy half took every sample, 56% of a uniform frame's samples |
+| 11 | Cryptomatte: each node's fragments merged at the master | built: a share's fragments stay sums; nodes send them with each film, the master merges them by ID (as the lanes' are) and finalizes once; the deputy keeps a copy; a share's film is given its fragments anew each share (it had none); Hydra across three processes: every Cryptomatte ID as the single machine's, coverages 99.96% equal (the sums' order) |
+| 12 | Workstations: a node stepping back while its machine is in use (paused, or fewer threads), hours it may render in | built: `--when-idle s`, `--hours 19-8`, `--busy-threads n`; stepped back, a node gives its chunks to the master, which gives them out and plans it no cells until it is back; status shows it stepped back; 3 checks |
 | 13 | Animation and a job queue: frame ranges, jobs one after another, the scene kept between frames and its changes alone sent | todo |
 | 14 | Checkpoints: the master's film and ledger saved as it goes, a job taken up again after every machine has stopped | todo |
 | 15 | Shaders on nodes: a node without compiled GPU programs offered to compile them on first start; status says which lack them | todo |

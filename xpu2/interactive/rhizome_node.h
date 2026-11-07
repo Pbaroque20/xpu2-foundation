@@ -3,6 +3,8 @@
 //
 // Joining: Hello (key, what it has, a challenge) -> Welcome (key, the proof for that challenge, a challenge back) ->
 // Join (the proof for it). Each side checks the other's key hashes to its hash and its proof holds the rhizome key.
+// Hello and Welcome carry each side's one-time ECDH key too; every frame after them (Join on) travels sealed with the
+// keys they make (rhizome_crypto.h), and a connection that sends a plain frame after its first is closed.
 // The master then sends the members (Members), and every pair of workers connects in the same way, for steals and
 // pieces. A frame: the master's plan (Assign) -> each node renders its chunks and sends their films (Contribution)
 // -> a node out of work asks its neighbours (StealAsk -> StealGrant, the grant copied to the master) -> the master
@@ -15,6 +17,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "rhizome_audit.h"
+#include "rhizome_crypto.h"
 #include "rhizome_memory.h"
 #include "rhizome_schedule.h"
 #include "rhizome_swarm.h"
@@ -42,6 +45,8 @@ enum : uint16_t {
     TypeTakeover = 26,    // a successor: it is the master now (the old master's signed succession as its right)
     TypeHeld = 27,        // a node -> its new master: the chunks it holds
     TypeReplicaState = 28,  // master -> a new deputy: the picture, counts and chunks back so far, and the caller's merge
+    TypeCancel = 29,        // master: cells converged (adaptive): their chunks not back are not rendered
+    TypeYield = 30,         // a workstation -> its master: stepping back (its chunks given up) or back at work
 };
 
 // A node's renderer: the film of a cell's rectangle for samples [first, first + count).
@@ -58,6 +63,9 @@ struct NodeOptions {
     // The master's: each film as it is taken into the picture (audited, the first of its chunk), under the node's
     // lock: the AOVs and aux outputs merged by the caller, which knows the scene's schema.
     std::function<void(const Film&)> onFilm;
+    // A workstation's (RHIZOME.md, plan 12): false while it may not render (its machine in use, outside its hours).
+    // Asked before each chunk; while false the node gives its chunks back and takes none.
+    std::function<bool()> mayWork;
     // Failover: the caller's merge (AOVs, aux) as bytes for a new deputy, taken in by it; and what the caller does when
     // this node takes over as master (it then waits for the picture and writes it).
     std::function<Bytes()> exportMerge;
@@ -108,6 +116,18 @@ public:
 
     const Hash& hash() const { return id_->hash(); }
     std::string address() const { return address_; }
+    // Master, adaptive: cells that converged, and the chunks left unrendered.
+    size_t convergedCells() {
+        std::lock_guard<std::mutex> g(m_);
+        return convergedCells_;
+    }
+    size_t cancelledChunks() {
+        std::lock_guard<std::mutex> g(m_);
+        return ledger_ ? ledger_->cancelled() : 0;
+    }
+    // Frames this node has read: plain (each connection's first, its Hello or Welcome) and sealed (all the rest).
+    uint64_t plainFramesIn() const { return plainIn_; }
+    uint64_t sealedFramesIn() const { return sealedIn_; }
 
     // Listens on 127.0.0.1 (a port the system picks) and, as a worker, joins the master.
     void start() {
@@ -189,12 +209,17 @@ public:
         std::vector<Node> nodes;
         if (o_.masterRenders) nodes.push_back(Node{hash(), o_.caps.rate, 0, false});
         for (const Member* mm : members_.working())
-            if (o_.readyAtJoin || ready_.count(mm->hash)) nodes.push_back(Node{mm->hash, mm->caps.rate, std::max(0.0, mm->rtt), false});
+            if ((o_.readyAtJoin || ready_.count(mm->hash)) && !paused_nodes_.count(mm->hash))
+                nodes.push_back(Node{mm->hash, mm->caps.rate, std::max(0.0, mm->rtt), false});
         plan_ = std::make_unique<Plan>(Plan::make(shape, nodes, importance));
         ledger_ = std::make_unique<Ledger>(*plan_);
         film_.assign(size_t(shape.width) * shape.height * 4, 0.0);
+        odd_.assign(shape.adaptive() ? size_t(shape.width) * shape.height * 4 : 0, 0.0);
         counts_.assign(size_t(shape.width) * shape.height, 0);
         byNode_.assign(plan_->nodes.size(), 0);
+        convergedCells_ = 0;
+        if (shape.targetError > 0 && !shape.adaptive())
+            log("adaptive sampling needs chunks of an even number of samples: every chunk is rendered");
         importantByFast_ = importantBySlow_ = 0;
         frameDone_ = false;
         Writer w;
@@ -383,25 +408,51 @@ private:
         // block in send while the other's reader waits for its node's lock).
         std::mutex send;
         std::condition_variable sendCv;
-        std::deque<Bytes> out;
+        // Each frame with whether it is sealed: sealed by the writer (a scene's pieces take time to seal, and the
+        // node's lock, which heartbeats need, is not held meanwhile), in the order queued, so the nonces follow.
+        std::deque<std::pair<Bytes, bool>> out;
         std::thread reader, writer;
         std::atomic<bool> open{true};
+        std::atomic<double> lastBytes{0};  // when the reader last took bytes from the peer (its clock: nowSeconds)
+        // Encryption: this side's one-time key (until the keys are made), the sending key (under send) and the
+        // receiving key (under keyM: the reader waits on it for a sealed frame that comes before the loop has made it).
+        bool dialler = false;
+        std::unique_ptr<Ephemeral> eph;
+        std::unique_ptr<Seal> tx;
+        std::mutex keyM;
+        std::condition_variable keyCv;
+        std::unique_ptr<Seal> rx;
         void close() {
             if (open.exchange(false)) {
                 shutdown(s, SD_BOTH);
                 closesocket(s);
             }
             sendCv.notify_all();
+            {
+                std::lock_guard<std::mutex> g(keyM);
+            }
+            keyCv.notify_all();
         }
         void write() {
             for (;;) {
                 Bytes frame;
+                bool sealed = false;
+                Seal* key = nullptr;
                 {
                     std::unique_lock<std::mutex> g(send);
                     sendCv.wait(g, [&] { return !out.empty() || !open; });
                     if (!open) return;
-                    frame = std::move(out.front());
+                    frame = std::move(out.front().first);
+                    sealed = out.front().second;
                     out.pop_front();
+                    key = tx.get();
+                }
+                if (sealed) {
+                    if (!key) {
+                        close();
+                        return;
+                    }
+                    frame = key->seal(frame);
                 }
                 size_t at = 0;
                 while (at < frame.size()) {
@@ -501,6 +552,8 @@ private:
             return false;
         }
         ConnPtr c = adopt(s);
+        c->dialler = true;
+        c->eph = std::make_unique<Ephemeral>();
         Hash challenge;
         randomBytes(challenge.data(), challenge.size());
         Writer w;
@@ -513,28 +566,55 @@ private:
         const std::vector<Bytes> shown = o_.trust ? o_.trust->shown() : std::vector<Bytes>{};
         w.u32(uint32_t(shown.size()));
         for (const auto& s : shown) w.bytes(s);
+        w.bytes(c->eph->publicKey());
         (void)toMaster;
         std::lock_guard<std::mutex> g(m_);
         c->challenge = challenge;
         sendOn(c, Type::Hello, w.b);
         return true;
     }
-    static bool readAll(SOCKET s, unsigned char* p, size_t n) {
+    static bool readAll(SOCKET s, unsigned char* p, size_t n, std::atomic<double>* heard = nullptr) {
         while (n) {
             const int got = recv(s, (char*)p, int(std::min<size_t>(n, 1 << 20)), 0);
             if (got <= 0) return false;
             p += got, n -= size_t(got);
+            if (heard) heard->store(nowSeconds());
         }
         return true;
     }
     void read(ConnPtr c) {
-        for (;;) {
-            Bytes frame(HeaderBytes);
-            if (!readAll(c->s, frame.data(), HeaderBytes)) break;
-            const auto n = payloadLength(frame.data());
-            if (!n) break;
-            frame.resize(HeaderBytes + *n + SignatureBytes);
-            if (!readAll(c->s, frame.data() + HeaderBytes, *n + SignatureBytes)) break;
+        for (bool first = true;; first = false) {
+            Bytes frame;
+            if (first) {
+                // The handshake's Hello or Welcome, the one frame in the open.
+                frame.resize(HeaderBytes);
+                if (!readAll(c->s, frame.data(), HeaderBytes, &c->lastBytes)) break;
+                const auto n = payloadLength(frame.data());
+                if (!n) break;
+                frame.resize(HeaderBytes + *n + SignatureBytes);
+                if (!readAll(c->s, frame.data() + HeaderBytes, *n + SignatureBytes, &c->lastBytes)) break;
+                ++plainIn_;
+            } else {
+                unsigned char head[SealedHeaderBytes];
+                if (!readAll(c->s, head, sizeof head, &c->lastBytes)) break;
+                const auto n = Seal::length(head, MaxPayload + uint32_t(HeaderBytes + SignatureBytes + TagBytes));
+                if (!n) {
+                    if (trace()) log("closed a connection: a frame that is not sealed");
+                    break;
+                }
+                Bytes body(*n);
+                if (!readAll(c->s, body.data(), body.size(), &c->lastBytes)) break;
+                std::unique_lock<std::mutex> k(c->keyM);
+                c->keyCv.wait_for(k, std::chrono::seconds(10), [&] { return c->rx || !c->open; });
+                if (!c->rx) break;
+                auto plain = c->rx->open(head, body);
+                if (!plain) {
+                    log("closed a connection: a sealed frame did not open (changed, or out of order)");
+                    break;
+                }
+                frame = std::move(*plain);
+                ++sealedIn_;
+            }
             {
                 std::lock_guard<std::mutex> g(m_);
                 inbox_.push_back({c, std::move(frame), nowSeconds()});
@@ -548,11 +628,11 @@ private:
         // Numbered under the connection's lock: two threads sending to one peer send in the order they number, and
         // the peer refuses a number at or below the last it took (a message played again).
         std::lock_guard<std::mutex> g(c->send);
-        const Bytes frame = encode(*id_, Type(type), ++sequence_, payload);
+        Bytes frame = encode(*id_, Type(type), ++sequence_, payload);
         if (trace() && type != uint16_t(Type::Heartbeat) && type != uint16_t(Type::Echo))
             log("sent type " + std::to_string(type) + " to " + shortHex(c->peer) + ", " + std::to_string(payload.size()) + " bytes" +
                 (payload.size() >= 6 ? " [" + hex(payload.data(), 6) + "]" : std::string()));
-        c->out.push_back(std::move(frame));
+        c->out.emplace_back(std::move(frame), c->tx != nullptr);
         c->sendCv.notify_one();
     }
     void sendOn(const ConnPtr& c, Type type, const Bytes& payload) { sendOn(c, uint16_t(type), payload); }
@@ -605,6 +685,9 @@ private:
                 Writer w;
                 w.f64(now);
                 broadcast(Type::Heartbeat, w.b);
+                // A member whose bytes are arriving is heard, though its message is not whole yet.
+                for (auto& cc : conns_)
+                    if (cc->joined && cc->open) members_.heardBytes(cc->peer, cc->lastBytes.load());
                 for (const Hash& h : members_.sweep(now)) {
                     if (!o_.master && h == masterHash_) masterGone(now);
                     else {
@@ -812,6 +895,12 @@ private:
         case TypeReplicaState:
             if (m.sender == masterHash_) takeReplicaState(r);
             break;
+        case TypeCancel:
+            if (m.sender == masterHash_) cancelled(r);
+            break;
+        case TypeYield:
+            if (o_.master) yielded(m.sender, r);
+            break;
         case TypeTakeover:
             takeTakeover(m.sender, r, now);
             break;
@@ -865,7 +954,16 @@ private:
             info.isMaster = r.u8() != 0;
             info.build = r.str();
             info.shown = readShown();
+            const Bytes theirs = r.bytes();
             if (r.bad || !authentic(frame, m, info.key) || members_.quarantined(m.sender) || revoked(m.sender)) return c->close();
+            if (c->dialler || c->eph) return c->close();  // a Hello on a connection this side dialled, or a second one
+            c->eph = std::make_unique<Ephemeral>();
+            const auto secret = c->eph->agree(theirs);
+            if (!secret) {
+                log("refused " + shortHex(m.sender) + ": no key exchange");
+                return c->close();
+            }
+            const SessionKeys keys = sessionKeys(*secret, o_.rhizomeKey, false, theirs, c->eph->publicKey(), m.sender, hash());
             c->peer = m.sender;
             Hash back;
             randomBytes(back.data(), back.size());
@@ -878,7 +976,9 @@ private:
             w.hash(membershipProof(o_.rhizomeKey, challenge, hash()));
             w.hash(back);
             writeOwn(w);
-            sendOn(c, Type::Welcome, w.b);
+            w.bytes(c->eph->publicKey());
+            sendOn(c, Type::Welcome, w.b);  // the last frame in the open: the keys are this connection's from here
+            useKeys(c, keys);
         } else if (m.type == Type::Welcome) {
             Pending info;
             info.key = r.bytes();
@@ -888,10 +988,18 @@ private:
             info.isMaster = r.u8() != 0;
             info.build = r.str();
             info.shown = readShown();
+            const Bytes theirs = r.bytes();
             if (r.bad || !authentic(frame, m, info.key) || proof != membershipProof(o_.rhizomeKey, c->challenge, m.sender)) {
                 log("refused " + shortHex(m.sender) + ": no proof of the rhizome key");
                 return c->close();
             }
+            if (!c->dialler || !c->eph || c->tx) return c->close();
+            const auto secret = c->eph->agree(theirs);
+            if (!secret) {
+                log("refused " + shortHex(m.sender) + ": no key exchange");
+                return c->close();
+            }
+            useKeys(c, sessionKeys(*secret, o_.rhizomeKey, true, c->eph->publicKey(), theirs, hash(), m.sender));
             c->peer = m.sender;
             Writer w;
             w.hash(membershipProof(o_.rhizomeKey, back, hash()));
@@ -909,6 +1017,19 @@ private:
             }
             decide(c, m.sender, info, now);
         }
+    }
+    // A connection's keys made: frames sent from here are sealed, and the reader may open what comes.
+    static void useKeys(const ConnPtr& c, const SessionKeys& keys) {
+        {
+            std::lock_guard<std::mutex> g(c->send);
+            c->tx = std::make_unique<Seal>(keys.out);
+        }
+        {
+            std::lock_guard<std::mutex> g(c->keyM);
+            c->rx = std::make_unique<Seal>(keys.in);
+        }
+        c->keyCv.notify_all();
+        c->eph.reset();
     }
     void decide(const ConnPtr& c, const Hash& h, const Pending& info, double now) {
         if (!o_.build.empty() && !info.build.empty() && info.build != o_.build) {
@@ -1104,10 +1225,11 @@ private:
                           mb(pool_.capacity(h, Tier::Ram) + pool_.capacity(h, Tier::Vram)).c_str());
             text += line;
         };
-        rows.push_back(row(hash(), address_, o_.master ? "master" : "node (this machine)", "alive", o_.caps.rate, 0));
-        textRow(hash(), address_, o_.master ? "master (this machine)" : "node (this machine)", "alive", o_.caps.rate, -1);
+        rows.push_back(row(hash(), address_, o_.master ? "master" : "node (this machine)", paused_ ? "stepped back" : "alive", o_.caps.rate, 0));
+        textRow(hash(), address_, o_.master ? "master (this machine)" : "node (this machine)", paused_ ? "stepped back" : "alive", o_.caps.rate, -1);
         for (const Member* mm : members_.all()) {
-            const char* st = mm->quarantined ? "refused" : mm->state == State::Alive ? "alive" : mm->state == State::Suspect ? "suspect" : "gone";
+            const char* st = mm->quarantined ? "refused" : paused_nodes_.count(mm->hash) && mm->state != State::Gone ? "stepped back"
+                             : mm->state == State::Alive ? "alive" : mm->state == State::Suspect ? "suspect" : "gone";
             std::string role = mm->quarantined ? (revoked(mm->hash) ? "revoked" : "quarantined") : mm->master || mm->hash == masterHash_ ? "master" : "node";
             if (o_.trust && o_.trust->blocked(mm->hash)) role = "blocked (here)";
             rows.push_back(row(mm->hash, mm->caps.address, role, st, mm->caps.rate, mm->rtt));
@@ -1185,6 +1307,7 @@ private:
     // ---- frames
     void writePlan(Writer& w, const Plan& p) {
         w.u32(p.shape.width), w.u32(p.shape.height), w.u32(p.shape.cellSize), w.u32(p.shape.spp), w.u32(p.shape.chunkSamples);
+        w.f32(p.shape.targetError), w.u32(p.shape.minSamples);
         w.u32(uint32_t(p.nodes.size()));
         for (const auto& n : p.nodes) w.hash(n.hash), w.f64(n.rate), w.f64(n.rtt), w.u8(n.fast);
         w.array(p.owner);
@@ -1194,6 +1317,7 @@ private:
     }
     bool readPlan(Reader& r, Plan& p) {
         p.shape.width = r.u32(), p.shape.height = r.u32(), p.shape.cellSize = r.u32(), p.shape.spp = r.u32(), p.shape.chunkSamples = r.u32();
+        p.shape.targetError = r.f32(), p.shape.minSamples = r.u32();
         const uint32_t n = r.u32();
         for (uint32_t i = 0; i < n && !r.bad; ++i) {
             Node x;
@@ -1228,6 +1352,24 @@ private:
     void work() {
         std::unique_lock<std::mutex> g(m_);
         while (running_) {
+            if (o_.mayWork && !o_.master) {
+                const auto may = o_.mayWork;
+                bool now = true;
+                g_unlock([&] { now = may(); });
+                if (!now) {
+                    // Stepped back: what it holds (and what comes to it meanwhile) goes back to the master.
+                    if (!paused_) log("stepping back: this machine is in use or outside its hours");
+                    if (!paused_ || (holder_ && holder_->remaining())) stepBack(true);
+                    paused_ = true;
+                    cv_.wait_for(g, std::chrono::milliseconds(200));
+                    continue;
+                }
+                if (paused_) {
+                    paused_ = false;
+                    log("back at work");
+                    stepBack(false);
+                }
+            }
             if (!holder_ || frameDone_) {
                 cv_.wait_for(g, std::chrono::milliseconds(20));
                 continue;
@@ -1261,6 +1403,7 @@ private:
                 w.array(f.odd);
                 w.array(f.aovs);
                 w.array(f.aovDepths);
+                w.bytes(f.crypto);
                 g.lock();
                 // To the master as it is now (one may have taken over while the film was rendering).
                 sendTo(o_.master ? hash() : masterHash_, Type::Contribution, w.b);
@@ -1285,6 +1428,45 @@ private:
         }
     }
 
+    // A workstation: stepping back (its chunks to the master) or back at work.
+    void stepBack(bool pausing) {
+        Writer w;
+        w.u8(pausing ? 1 : 0);
+        writeChunks(w, pausing && holder_ ? holder_->takeAll() : std::vector<Chunk>{});
+        if (masterHash_ != Hash{}) sendTo(masterHash_, uint16_t(TypeYield), w.b);
+    }
+    // Master: a workstation stepped back or came back. Its chunks not back go to the others, as a lost node's do;
+    // while stepped back it is given none.
+    void yielded(const Hash& from, Reader& r) {
+        const bool pausing = r.u8() != 0;
+        readChunks(r);
+        if (r.bad) return;
+        if (!pausing) {
+            if (paused_nodes_.erase(from)) log(shortHex(from) + " is back at work");
+            return;
+        }
+        if (paused_nodes_.insert(from).second) log(shortHex(from) + " stepped back (its machine in use)");
+        if (!ledger_ || frameDone_ || !plan_) return;
+        const int who = plan_->nodeIndex(from);
+        if (who < 0) return;
+        for (const auto& [to, chunks] : ledger_->lost(who, aliveNodes())) {
+            Writer w;
+            w.hash(plan_->nodes[size_t(to)].hash);
+            writeChunks(w, chunks);
+            sendTo(plan_->nodes[size_t(to)].hash, uint16_t(TypeReassign), w.b);
+            log("gave " + std::to_string(chunks.size()) + " chunks to " + shortHex(plan_->nodes[size_t(to)].hash));
+        }
+    }
+    // The plan's nodes that can take work: here, not refused, not stepped back.
+    std::vector<bool> aliveNodes() {
+        std::vector<bool> alive(plan_->nodes.size(), false);
+        for (size_t i = 0; i < plan_->nodes.size(); ++i) {
+            const Hash& n = plan_->nodes[i].hash;
+            const Member* mm = members_.find(n);
+            alive[i] = !paused_nodes_.count(n) && (n == hash() ? o_.masterRenders : (mm && mm->state != State::Gone && !mm->quarantined));
+        }
+        return alive;
+    }
     // Master: a film. Audited, then added once.
     static void writeFilm(Writer& w, const Chunk& c, const Film& f, double seconds) {
         w.u32(c.cell), w.u32(c.index);
@@ -1296,6 +1478,7 @@ private:
         w.array(f.odd);
         w.array(f.aovs);
         w.array(f.aovDepths);
+        w.bytes(f.crypto);
     }
     static bool readFilm(Reader& r, Chunk& c, Film& f, double& seconds) {
         c.cell = r.u32(), c.index = r.u32();
@@ -1307,6 +1490,7 @@ private:
         f.odd = r.array<float>();
         f.aovs = r.array<double>();
         f.aovDepths = r.array<float>();
+        f.crypto = r.bytes();
         return !r.bad;
     }
     void contribution(const Hash& from, Reader& r) {
@@ -1383,9 +1567,10 @@ private:
             ++byNode_[size_t(who)];
             if (plan_->important[c.cell]) (plan_->nodes[size_t(who)].fast ? importantByFast_ : importantBySlow_)++;
         }
-        addFilm(film_, counts_, f);
+        addFilm(film_, counts_, f, &odd_);
         if (o_.onFilm) o_.onFilm(f);
         replicate(from, c, f);
+        converge(c.cell);
         if (ledger_->complete()) {
             frameDone_ = true;
             broadcast(Type::FrameDone, {});
@@ -1404,12 +1589,8 @@ private:
         if (!ledger_ || frameDone_) return;
         const int dead = plan_->nodeIndex(h);
         if (dead < 0) return;
-        std::vector<bool> alive(plan_->nodes.size(), false);
-        for (size_t i = 0; i < plan_->nodes.size(); ++i) {
-            const Hash& n = plan_->nodes[i].hash;
-            const Member* mm = members_.find(n);
-            alive[i] = n == hash() ? o_.masterRenders : (mm && mm->state != State::Gone && !mm->quarantined);
-        }
+        std::vector<bool> alive = aliveNodes();
+        alive[size_t(dead)] = false;
         for (const auto& [to, chunks] : ledger_->lost(dead, alive)) {
             Writer w;
             w.hash(plan_->nodes[size_t(to)].hash);
@@ -1418,15 +1599,57 @@ private:
             log("gave " + std::to_string(chunks.size()) + " chunks to " + shortHex(plan_->nodes[size_t(to)].hash));
         }
     }
-    void addFilm(std::vector<double>& film, std::vector<uint32_t>& counts, const Film& f) const {
+    void addFilm(std::vector<double>& film, std::vector<uint32_t>& counts, const Film& f, std::vector<double>* odd = nullptr) const {
         const U32 W = plan_->shape.width;
+        const bool withOdd = odd && odd->size() == film.size() && f.odd.size() == f.sums.size();
         for (U32 y = f.rect[1]; y < f.rect[3]; ++y)
             for (U32 x = f.rect[0]; x < f.rect[2]; ++x) {
                 const size_t i = size_t(y - f.rect[1]) * f.width() + (x - f.rect[0]), o = size_t(y) * W + x;
                 if (o >= counts.size()) continue;
                 for (int k = 0; k < 4; ++k) film[o * 4 + k] += f.sums[i * 4 + k];
+                if (withOdd)
+                    for (int k = 0; k < 4; ++k) (*odd)[o * 4 + k] += f.odd[i * 4 + k];
                 counts[o] += f.counts[i];
             }
+    }
+    // Master, adaptive: a cell whose pixels all have their minimum samples and whose pooled error (every node's sums
+    // and odd sums added, the error worked out from them as one machine would) is under the target, but for one pixel
+    // in a hundred, is done: its chunks not back are cancelled across the swarm.
+    void converge(U32 cell) {
+        const FrameShape& s = plan_->shape;
+        if (!s.adaptive() || odd_.size() != film_.size() || ledger_->complete()) return;
+        U32 r[4];
+        s.rect(cell, r);
+        size_t pixels = 0, over = 0;
+        for (U32 y = r[1]; y < r[3]; ++y)
+            for (U32 x = r[0]; x < r[2]; ++x) {
+                const size_t o = size_t(y) * s.width + x;
+                ++pixels;
+                if (counts_[o] < std::max(2u, s.minSamples)) return;
+                if (counts_[o] >= s.spp) continue;
+                const float e = pixelError(&film_[o * 4], &odd_[o * 4], counts_[o]);
+                if (e < 0) return;
+                over += e > s.targetError;
+            }
+        if (over * 100 > pixels) return;
+        const auto chunks = ledger_->cancel(cell);
+        if (chunks.empty()) return;
+        ++convergedCells_;
+        if (holder_) holder_->drop(cell);
+        Writer w;
+        w.u32(1), w.u32(cell);
+        broadcast(Type(TypeCancel), w.b);
+        if (trace()) log("cell " + std::to_string(cell) + " converged: " + std::to_string(chunks.size()) + " chunks cancelled");
+    }
+    // A node: cells converged at the master.
+    void cancelled(Reader& r) {
+        const uint32_t n = r.u32();
+        for (uint32_t i = 0; i < n && !r.bad && plan_; ++i) {
+            const U32 cell = r.u32();
+            if (r.bad || cell >= plan_->shape.cells()) break;
+            if (holder_) holder_->drop(cell);
+            if (replicaLedger_) replicaLedger_->cancel(cell);
+        }
     }
 
     // ---- failover (RHIZOME.md, 3b)
@@ -1482,6 +1705,7 @@ private:
             s.array(back);
             s.array(byNode_);
             s.bytes(o_.exportMerge ? o_.exportMerge() : Bytes{});
+            s.array(odd_);
             sendTo(list[0], uint16_t(TypeReplicaState), s.b);
             log("deputy " + shortHex(list[0]) + " given the frame so far (" + std::to_string(back.size() / 2) + " chunks)");
         }
@@ -1502,6 +1726,7 @@ private:
         if (replicaLedger_ || !plan_) return;
         replicaLedger_ = std::make_unique<Ledger>(*plan_);
         replicaFilm_.assign(size_t(plan_->shape.width) * plan_->shape.height * 4, 0.0);
+        replicaOdd_.assign(plan_->shape.adaptive() ? replicaFilm_.size() : 0, 0.0);
         replicaCounts_.assign(size_t(plan_->shape.width) * plan_->shape.height, 0);
         replicaBy_.assign(plan_->nodes.size(), 0);
     }
@@ -1515,7 +1740,7 @@ private:
         if (!readFilm(r, c, f, seconds)) return;
         makeReplica();
         if (!replicaLedger_->arrived(c)) return;
-        addFilm(replicaFilm_, replicaCounts_, f);
+        addFilm(replicaFilm_, replicaCounts_, f, &replicaOdd_);
         const int who = plan_->nodeIndex(from);
         if (who >= 0) ++replicaBy_[size_t(who)];
         if (o_.onFilm) o_.onFilm(f);
@@ -1529,6 +1754,7 @@ private:
         const auto back = r.array<U32>();
         replicaBy_ = r.array<uint64_t>();
         const Bytes merge = r.bytes();
+        replicaOdd_ = r.array<double>();
         if (r.bad || replicaFilm_.size() != size_t(plan_->shape.width) * plan_->shape.height * 4) {
             replicaLedger_.reset();
             return;
@@ -1563,6 +1789,7 @@ private:
         makeReplica();
         ledger_ = std::move(replicaLedger_);
         film_ = std::move(replicaFilm_);
+        odd_ = std::move(replicaOdd_);
         counts_ = std::move(replicaCounts_);
         byNode_ = std::move(replicaBy_);
         byNode_.resize(plan_->nodes.size(), 0);
@@ -1729,6 +1956,7 @@ private:
     std::unique_ptr<Ledger> replicaLedger_;
     std::vector<double> replicaFilm_;
     std::vector<uint32_t> replicaCounts_;
+    std::vector<double> replicaOdd_;
     std::vector<uint64_t> replicaBy_;
     uint64_t replicasSent_ = 0;
     Hash tookOverFrom_{};
@@ -1736,6 +1964,7 @@ private:
     std::set<Hash> approverEndorsed_;
     std::map<Hash, std::pair<uint64_t, uint64_t>> given_;
     std::atomic<uint64_t> sequence_{0};
+    std::atomic<uint64_t> plainIn_{0}, sealedIn_{0};
     Members members_;
     Hash masterHash_{};
     std::unique_ptr<Plan> plan_;
@@ -1746,6 +1975,10 @@ private:
     double askedAt_ = 0;
     bool frameDone_ = false;
     std::vector<double> film_;
+    std::vector<double> odd_;  // the odd-index sums, adaptive frames (the error pooled from them)
+    bool paused_ = false;            // a workstation stepped back
+    std::set<Hash> paused_nodes_;    // master: the workstations stepped back
+    size_t convergedCells_ = 0;
     std::vector<uint32_t> counts_;
     std::vector<uint64_t> byNode_;
     uint64_t importantByFast_ = 0, importantBySlow_ = 0, auditsDone_ = 0;

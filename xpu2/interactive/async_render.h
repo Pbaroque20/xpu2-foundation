@@ -346,6 +346,8 @@ public:
                 shareFilm_->initAovs(cpuScene_.aovTables, plan_->aovs && plan_->aovs->heatMap);
             }
             shareFilm_->clearRows(rowFirst, rowEnd);
+            // Cryptomatte's fragments anew each share: the last share's went out with its result (moved, as sums).
+            shareFilm_->initCrypto(plan_->aovs.get());
         } else {
             ownFilm = std::make_unique<HostFilm>(plan_->width, plan_->height);
             ownFilm->initAovs(cpuScene_.aovTables, plan_->aovs && plan_->aovs->heatMap);
@@ -880,7 +882,8 @@ public:
         result.rgba.resize(pixels * 4);
         result.counts.resize(pixels);
         const bool aux = plan_->aovs && (plan_->aovs->beautyAux || plan_->aovs->alphaAux);
-        if (adaptive || aux) result.odd.resize(pixels * 4);
+        // A share of an adaptive frame too: whoever adds the shares (Rhizome's master) works out the error from them.
+        if (adaptive || aux || (share && plan_->adaptive)) result.odd.resize(pixels * 4);
         const auto& hs = film.sums();
         const auto& hc = film.counts();
         U64 planned = 0;
@@ -1087,7 +1090,8 @@ private:
         if (!film.crypto().empty()) {
             if (gpu) const_cast<GpuLane*>(gpu)->mergeCrypto(film.crypto());
             result.crypto = std::make_shared<aov::CryptoBuffer>(std::move(film.crypto()));
-            result.crypto->finalize(result.counts);
+            // A share's fragments stay sums: the shares of a frame are merged (Rhizome's master), then finalized once.
+            if (shareFilm_.get() != &film) result.crypto->finalize(result.counts);
         }
         if (!film.heat().empty()) {
             result.heat.resize(pixels);

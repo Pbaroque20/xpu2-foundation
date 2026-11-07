@@ -4,6 +4,7 @@
 //
 //   moonray_xpu2 rhizome node    --key <k> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2] [-threads n]
 //                                [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]
+//                                [--when-idle s] [--hours from-to] [--busy-threads n]
 //   moonray_xpu2 rhizome master  -in <scene> [-in ...] -out <image.pfm> --key <k> [--nodes N] [--node host:port ...]
 //                                [--wait s] [--approve] [--trust-first] [--trust <hash> ...] [--cell px] [--chunk n]
 //                                [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]
@@ -23,6 +24,7 @@
 // frame would give them, so the master's picture is the frame one machine would render. Included by xpu2_session.cc.
 #include "rhizome_node.h"
 #include "rhizome_discovery.h"
+#include "rhizome_importance.h"
 #include <future>
 
 namespace {
@@ -38,6 +40,11 @@ struct RhizomeArgs {
     std::vector<std::string> scenes, nodeAddresses, trust;
     std::string out, key, masterAddress, bind = "0.0.0.0", advertise, folder, subject;
     unsigned nodes = 0, threads = 0, cell = 256, chunk = 16;
+    // A workstation: renders only once no one has used it for whenIdle seconds (0: always), within hours [from, to) of
+    // the day (to below from: across midnight; -1: any hour); in use, busyThreads threads instead of stepping back.
+    double whenIdle = 0;
+    int hoursFrom = -1, hoursTo = -1;
+    unsigned busyThreads = 0;
     int port = -1;  // -1: the verb's own (NodePort, MasterPort)
     int mode = 2;
     double wait = 30;
@@ -49,9 +56,13 @@ inline const char* usage(Verb v) {
     case Verb::Node:
         return "moonray_xpu2 rhizome node --key <rhizome key> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2]\n"
                "    [-threads n] [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]\n"
+               "    [--when-idle seconds] [--hours from-to] [--busy-threads n]\n"
                "  A headless node: makes or reads its hash, listens and answers discovery, renders each job a master gives it\n"
                "  and waits for the next. --master: reach that master instead of waiting to be found. --trust: approvers this\n"
-               "  node trusts (else it trusts the master that first endorses it). Port 47100 by default.";
+               "  node trusts (else it trusts the master that first endorses it). Port 47100 by default.\n"
+               "  A workstation: --when-idle: render only once no one has touched the keyboard or mouse for that many seconds;\n"
+               "  --hours 19-8: only in those hours (across midnight too); --busy-threads: while the machine is in use, render\n"
+               "  on that many threads instead of stepping back. Stepped back, its work goes to the other machines.";
     case Verb::Master:
         return "moonray_xpu2 rhizome master -in <scene> [-in ...] -out <image.pfm> --key <rhizome key> [--nodes N]\n"
                "    [--node host:port ...] [--wait s] [--approve] [--trust-first] [--trust <approver hash> ...] [--cell px]\n"
@@ -109,6 +120,14 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--wait") a.wait = std::stod(next());
         else if (k == "--cell") a.cell = unsigned(std::stoul(next()));
         else if (k == "--chunk") a.chunk = unsigned(std::stoul(next()));
+        else if (k == "--when-idle") a.whenIdle = std::stod(next());
+        else if (k == "--busy-threads") a.busyThreads = unsigned(std::stoul(next()));
+        else if (k == "--hours") {
+            const std::string h = next();
+            const auto dash = h.find('-');
+            if (dash == std::string::npos) throw std::runtime_error("--hours wants from-to, as 19-8");
+            a.hoursFrom = std::stoi(h.substr(0, dash)) % 24, a.hoursTo = std::stoi(h.substr(dash + 1)) % 24;
+        }
         else if (k == "--mode") a.mode = std::stoi(next());
         else if (k == "-threads") a.threads = unsigned(std::stoul(next()));
         else if (k == "--folder") a.folder = next();
@@ -190,6 +209,8 @@ public:
         if (thread_.joinable()) thread_.join();
     }
     const cpu::Plan& plan() const { return *scene_.plan; }
+    // A workstation in use: the processor threads its shares render on (0: all it was given).
+    void setThreads(unsigned n) { busyThreads_ = n; }
     // A share of the frame: its film (sums and counts) for the rectangle, rendered on the feeder.
     rz::Film render(const uint32_t rect[4], uint32_t first, uint32_t count) {
         const uint32_t r[4] = {rect[0], rect[1], rect[2], rect[3]};
@@ -200,6 +221,45 @@ public:
         call([&] {
             pixelHere(x, y, first, count, sum);
             return 0;
+        });
+    }
+    // The master's importance of each rhizome cell (rhizome_importance.h): the indexer's first-hit probe, a camera ray
+    // every `spacing` pixels on the processor, what each hit scored. On the feeder, as the rest.
+    std::vector<float> importance(const rz::FrameShape& shape, uint32_t spacing, double* seconds = nullptr) {
+        return call([&] {
+            const auto began = std::chrono::steady_clock::now();
+            const cpu::Plan& p = *scene_.plan;
+            const auto config = mixed::config(scene_.plan);
+            async::CpuBackend backend{*scene_.cpuScene};
+            backend.setTime(0.5f);
+            const uint32_t w = (p.width + spacing - 1) / spacing, h = (p.height + spacing - 1) / spacing;
+            std::vector<rz::ProbeHit> lattice(size_t(w) * h);
+            volume::Crossing x[volume::MaxCrossings];
+            for (uint32_t j = 0; j < h; ++j)
+                for (uint32_t i = 0; i < w; ++i) {
+                    rz::ProbeHit& out = lattice[size_t(j) * w + i];
+                    const float px = std::min(float(p.width) - 0.5f, float(i * spacing + spacing / 2) + 0.5f);
+                    const float py = std::min(float(p.height) - 0.5f, float(j * spacing + spacing / 2) + 0.5f);
+                    surface::Ray ray;
+                    if (surface::cameraSample(config.camera, px, py, 0.5f, 0.5f, 0.5f, ray) != surface::CameraResult::Made) continue;
+                    ray.mask = 1u;  // a camera ray
+                    const auto hit = backend.trace(ray);
+                    if (hit.geom != ~0u && hit.geom < p.meshes.size()) {
+                        out.object = hit.geom;
+                        out.depth = hit.t;
+                        out.families = p.meshes[hit.geom].families;
+                    }
+                    const float until = out.object != ~0u ? hit.t : 3.402823466e38f;
+                    const U32 n = backend.volumeCrossings(ray.origin, ray.direction, ray.nearT, x, volume::MaxCrossings, 1u);
+                    for (U32 k = 0; k < n && x[k].t < until; ++k) {
+                        if (!(x[k].flags & volume::Entry) || x[k].volume >= p.volumes.size()) continue;
+                        const volume::Shader& v = p.volumes[x[k].volume];
+                        out.volumes = uint8_t(std::min(255, out.volumes + 1));
+                        out.glow = out.glow || v.emissionGrid != volume::NoGrid || v.emission.x + v.emission.y + v.emission.z > 0.0f;
+                    }
+                }
+            if (seconds) *seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+            return rz::importanceFromProbe(lattice, w, h, spacing, shape);
         });
     }
     // Card and processor memory this machine gives the swarm's pool.
@@ -257,7 +317,8 @@ public:
     }
     rz::Film renderHere(const uint32_t rect[4], uint32_t first, uint32_t count) {
         async::RenderOptions o;
-        o.threads = threads_;
+        const unsigned busy = busyThreads_;
+        o.threads = busy ? std::min(busy, threads_) : threads_;
         o.mode = gpu_ ? mode_ : 0;
         o.share = true;
         for (int k = 0; k < 4; ++k) o.region[k] = int(rect[k]);
@@ -297,12 +358,25 @@ public:
                     std::copy_n(r.aovRawDepths.begin() + b * t.closestCount, t.closestCount, f.aovDepths.begin() + i * t.closestCount);
                 }
             }
+        if (r.crypto && !r.crypto->empty()) {
+            rz::Writer cw;
+            const U32 cats = r.crypto->categories();
+            cw.u32(cats);
+            for (uint32_t y = rect[1]; y < rect[3]; ++y)
+                for (uint32_t x = rect[0]; x < rect[2]; ++x)
+                    for (U32 c = 0; c < cats; ++c) {
+                        const auto& list = r.crypto->fragments(c, size_t(y) * W + x);
+                        cw.u32(uint32_t(list.size()));
+                        cw.raw(list.data(), list.size() * sizeof(aov::CryptoBuffer::Fragment));
+                    }
+            f.crypto = std::move(cw.b);
+        }
         return f;
     }
     // The master's picture made whole: the merged films' AOVs resolved, the display filters run, and the scene's
     // render outputs written as a frame writes them (aov_write.h). film: sums a pixel; odd: odd-index sums.
     void writeOutputs(const std::vector<double>& film, const std::vector<uint32_t>& counts, const std::vector<double>& odd,
-                      const std::vector<double>& raw, const std::vector<float>& depths) {
+                      const std::vector<double>& raw, const std::vector<float>& depths, const aov::CryptoBuffer* crypto = nullptr) {
         call([&] {
             if (!scene_.plan->aovs) return 0;
             const size_t pixels = size_t(plan().width) * plan().height;
@@ -316,8 +390,11 @@ public:
                     if (!odd.empty()) result.odd[p * 4 + c] = counts[p] ? float(odd[p * 4 + c] / counts[p]) : 0.0f;
                 }
             if (!raw.empty()) renderer_->resolveMerged(raw, depths, result.counts, result.aov);
-            if (scene_.plan->aovs->cryptomatte)
-                std::printf("MoonRay XPU2 Rhizome: Cryptomatte is not merged across nodes yet: its layers are written empty\n");
+            // Cryptomatte: every node's fragments merged at the master, finalized once over the pixels' samples.
+            if (scene_.plan->aovs->cryptomatte && crypto && !crypto->empty()) {
+                result.crypto = std::make_shared<aov::CryptoBuffer>(*crypto);
+                result.crypto->finalize(result.counts);
+            }
             std::vector<std::string> warnings;
             if (!scene_.displayFilters.empty()) {
                 std::vector<std::vector<float>> filtered;
@@ -380,6 +457,7 @@ private:
     std::unique_ptr<async::Renderer> renderer_;
     int mode_ = 2;
     unsigned threads_ = 1;
+    std::atomic<unsigned> busyThreads_{0};
     std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> auditKey_{~0u, ~0u, 0, 0};
     rz::Film auditFilm_;
     std::thread thread_;
@@ -574,6 +652,8 @@ struct Merge {
     uint32_t width = 0;
     std::vector<double> aovs, odd;
     std::vector<float> depths;
+    std::shared_ptr<aov::CryptoBuffer> crypto;  // Cryptomatte's fragments as sums, every node's merged
+    bool multiPresence = false;
     void init(Local& l) {
         tables = l.aovTables();
         width = l.plan().width;
@@ -585,6 +665,31 @@ struct Merge {
             for (size_t p = 0; p < pixels; ++p) async::initAovPixel(tables, aovs.data() + p * tables.channels, depths.data() + p * tables.closestCount);
         }
         if (l.plan().aovs && (l.plan().aovs->beautyAux || l.plan().aovs->alphaAux)) odd.assign(pixels * 4, 0.0);
+        crypto.reset();
+        if (l.plan().aovs && l.plan().aovs->cryptomatte) {
+            crypto = std::make_shared<aov::CryptoBuffer>();
+            multiPresence = l.plan().aovs->cryptoMultiPresence;
+            crypto->init(l.plan().width, l.plan().height, l.plan().aovs->cryptoCategories, multiPresence);
+        }
+    }
+    // A film's (or a saved merge's) fragments, pixels in the rectangle's rows: each category's list, merged by ID.
+    bool addCrypto(const rz::Bytes& b, const uint32_t rect[4]) {
+        if (!crypto || b.empty()) return true;
+        rz::Reader r(b);
+        const U32 cats = r.u32();
+        if (cats != crypto->categories()) return false;
+        for (uint32_t y = rect[1]; y < rect[3] && !r.bad; ++y)
+            for (uint32_t x = rect[0]; x < rect[2] && !r.bad; ++x)
+                for (U32 c = 0; c < cats && !r.bad; ++c) {
+                    const uint32_t n = r.u32();
+                    if (n > 4096) return false;
+                    for (uint32_t k = 0; k < n && !r.bad; ++k) {
+                        aov::CryptoBuffer::Fragment g;
+                        if (!r.take(&g, sizeof g)) break;
+                        crypto->merge(size_t(y) * width + x, c, g);
+                    }
+                }
+        return !r.bad;
     }
     void add(const rz::Film& f) {
         size_t i = 0;
@@ -598,10 +703,26 @@ struct Merge {
                     async::mergeAovPixel(tables, aovs.data() + p * tables.channels, depths.data() + p * tables.closestCount,
                                          f.aovs.data() + i * tables.channels, f.aovDepths.data() + i * tables.closestCount);
             }
+        if (!addCrypto(f.crypto, f.rect)) std::printf("MoonRay XPU2 Rhizome: a film's Cryptomatte did not read; its fragments are left out\n");
+    }
+    // The whole frame's fragments, as a film's (a deputy's copy).
+    rz::Bytes saveCrypto() const {
+        rz::Writer w;
+        if (!crypto) return w.b;
+        const U32 cats = crypto->categories();
+        w.u32(cats);
+        for (size_t p = 0; p < pixels; ++p)
+            for (U32 c = 0; c < cats; ++c) {
+                const auto& list = crypto->fragments(c, p);
+                w.u32(uint32_t(list.size()));
+                w.raw(list.data(), list.size() * sizeof(aov::CryptoBuffer::Fragment));
+            }
+        return w.b;
     }
     rz::Bytes save() const {
         rz::Writer w;
         w.array(aovs), w.array(depths), w.array(odd);
+        w.bytes(saveCrypto());
         return w.b;
     }
     void load(const rz::Bytes& b) {
@@ -609,8 +730,14 @@ struct Merge {
         auto a = r.array<double>();
         auto d = r.array<float>();
         auto o = r.array<double>();
+        const rz::Bytes c = r.bytes();
         if (r.bad || a.size() != aovs.size() || d.size() != depths.size() || o.size() != odd.size()) return;
         aovs = std::move(a), depths = std::move(d), odd = std::move(o);
+        if (crypto) {
+            crypto->init(width, uint32_t(pixels / std::max<uint32_t>(1, width)), crypto->categories(), multiPresence);
+            const uint32_t all[4] = {0, 0, width, uint32_t(pixels / std::max<uint32_t>(1, width))};
+            addCrypto(c, all);
+        }
     }
 };
 
@@ -773,7 +900,7 @@ inline int run(int argc, char** argv) {
             std::error_code e;
             fs::create_directories(out.parent_path(), e);
             writePfm(out, l->plan().width, l->plan().height, film, counts);
-            l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths);
+            l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths, merge.crypto.get());
             std::printf("MoonRay XPU2 Rhizome: took over as master and finished the frame: wrote %s\n", out.u8string().c_str());
             std::fflush(stdout);
             finishing = false;
@@ -802,8 +929,39 @@ inline int run(int argc, char** argv) {
         return l->render(r, first, count);
     };
     o.renderPixel = [&](uint32_t x, uint32_t y, uint32_t first, uint32_t count, float sum[4]) { local()->pixel(x, y, first, count, sum); };
+    // A workstation: steps back while its machine is in use (or renders on fewer threads) and outside its hours.
+    if (!a.master && (a.whenIdle > 0 || a.hoursFrom >= 0)) {
+        o.mayWork = [&a, &local] {
+            bool inHours = true;
+            if (a.hoursFrom >= 0) {
+                SYSTEMTIME t;
+                GetLocalTime(&t);
+                const int h = t.wHour;
+                inHours = a.hoursFrom <= a.hoursTo ? (h >= a.hoursFrom && h < a.hoursTo) : (h >= a.hoursFrom || h < a.hoursTo);
+            }
+            bool idle = true;
+            if (a.whenIdle > 0) {
+                LASTINPUTINFO li{sizeof li, 0};
+                if (GetLastInputInfo(&li)) idle = double(GetTickCount() - li.dwTime) / 1000.0 >= a.whenIdle;
+            }
+            const std::shared_ptr<Local> l = local();
+            if (a.busyThreads && inHours) {
+                if (l) l->setThreads(idle ? 0 : a.busyThreads);
+                return true;
+            }
+            return inHours && idle;
+        };
+        std::printf("MoonRay XPU2 Rhizome: a workstation: %s%s%s\n",
+                    a.whenIdle > 0 ? ("renders once idle for " + std::to_string(int(a.whenIdle)) + " s").c_str() : "renders whenever it may",
+                    a.hoursFrom >= 0 ? (", from " + std::to_string(a.hoursFrom) + ":00 to " + std::to_string(a.hoursTo) + ":00").c_str() : "",
+                    a.busyThreads ? (", on " + std::to_string(a.busyThreads) + " threads while in use").c_str() : "");
+    }
+    // RHIZOME_TRACE=1: each line with the seconds since the start (who waited for whom).
     o.log = [](const std::string& s) {
-        std::printf("MoonRay XPU2 Rhizome: %s\n", s.c_str());
+        static const bool timed = std::getenv("RHIZOME_TRACE") && std::getenv("RHIZOME_TRACE")[0] == '1';
+        static const double began = rz::nowSeconds();
+        if (timed) std::printf("MoonRay XPU2 Rhizome: %9.3f %s\n", rz::nowSeconds() - began, s.c_str());
+        else std::printf("MoonRay XPU2 Rhizome: %s\n", s.c_str());
         std::fflush(stdout);
     };
     rz::RhizomeNode node(o, std::move(identity));
@@ -889,22 +1047,44 @@ inline int run(int argc, char** argv) {
     const cpu::Plan& p = l->plan();
     rz::FrameShape shape;
     shape.width = p.width, shape.height = p.height, shape.cellSize = a.cell, shape.spp = p.spp, shape.chunkSamples = std::min(a.chunk, p.spp);
+    // An adaptive scene: each cell stops once its error, pooled at the master from every node's films, is under the
+    // scene's target (its most samples, spp, the rest); chunks of an even number of samples for the error's halves.
+    if (p.adaptive) {
+        shape.targetError = p.targetError, shape.minSamples = p.minSamples;
+        if (shape.chunkSamples % 2) shape.chunkSamples = std::max(2u, shape.chunkSamples - 1);
+        std::printf("MoonRay XPU2 Rhizome: adaptive, %u to %u samples a pixel, a cell done under error %g\n", p.minSamples, p.spp,
+                    double(p.targetError));
+    }
     std::printf("MoonRay XPU2 Rhizome: %zu nodes joined, %zu ready; the frame in %u cells of %u px, chunks of %u samples\n", node.joined(),
                 node.ready(), shape.cells(), shape.cellSize, shape.chunkSamples);
+    // The cells' importance from the indexer's probe: the important ones to the fast tier.
+    double probeSeconds = 0;
+    const std::vector<float> importance = l->importance(shape, 8, &probeSeconds);
+    size_t above = 0;
+    {
+        double mean = 0;
+        for (float v : importance) mean += v;
+        mean /= std::max<size_t>(1, importance.size());
+        for (float v : importance) above += v > mean;
+    }
+    std::printf("MoonRay XPU2 Rhizome: the indexer's probe in %.2f s: %zu of %u cells important\n", probeSeconds, above, shape.cells());
     const auto frameBegan = Clock::now();
-    node.beginFrame(shape, {});
+    node.beginFrame(shape, importance);
     if (!node.waitFrame(24 * 3600.0)) throw std::runtime_error("the frame did not complete");
     const double seconds = std::chrono::duration<double>(Clock::now() - frameBegan).count();
     const std::vector<double> film = node.film();
     const std::vector<uint32_t> counts = node.counts();
     writePfm(fs::u8path(a.out), shape.width, shape.height, film, counts);
-    l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths);
+    l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths, merge.crypto.get());
     const auto by = node.chunksByNode();
     std::string share;
     for (size_t i = 0; i < by.size(); ++i)
         share += (i ? ", " : "") + rz::shortHex(node.plan()->nodes[i].hash) + " " + std::to_string(by[i]) + (node.plan()->nodes[i].fast ? " (fast)" : " (slow)");
     std::printf("MoonRay XPU2 Rhizome: the frame in %.2f s, %llu films audited; chunks by node: %s\n", seconds,
                 (unsigned long long)node.audits(), share.c_str());
+    if (shape.adaptive())
+        std::printf("MoonRay XPU2 Rhizome: adaptive: %zu of %u cells converged early, %zu chunks left unrendered\n", node.convergedCells(),
+                    shape.cells(), node.cancelledChunks());
     std::printf("MoonRay XPU2 Rhizome: wrote %s\n", a.out.c_str());
     std::fflush(stdout);
     prober.reset();
