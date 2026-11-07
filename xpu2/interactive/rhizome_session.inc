@@ -8,6 +8,8 @@
 //   moonray_xpu2 rhizome master  -in <scene> [-in ...] -out <image.pfm> --key <k> [--nodes N] [--node host:port ...]
 //                                [--wait s] [--approve] [--trust-first] [--trust <hash> ...] [--cell px] [--chunk n]
 //                                [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]
+//                                [--frames 1-24] [--delta <frame.####.rdla> ...] [--queue folder [--queue-watch]]
+//   moonray_xpu2 rhizome submit  --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24] [--delta ...] [--name n]
 //   moonray_xpu2 rhizome id      [--folder f]
 //   moonray_xpu2 rhizome trust   <approver hash> [--folder f]
 //   moonray_xpu2 rhizome approve <hash> [--approver] [--folder f]
@@ -25,6 +27,7 @@
 #include "rhizome_node.h"
 #include "rhizome_discovery.h"
 #include "rhizome_importance.h"
+#include "rhizome_jobs.h"
 #include <future>
 
 namespace {
@@ -33,12 +36,16 @@ namespace rz = xpu2::interactive::rhizome;
 
 constexpr uint16_t NodePort = 47100, MasterPort = 47110;
 
-enum class Verb { Node, Master, Id, Trust, Approve, Revoke, Status, Help };
+enum class Verb { Node, Master, Submit, Id, Trust, Approve, Revoke, Status, Help };
 struct RhizomeArgs {
     Verb verb = Verb::Help;
     bool master = false, help = false;
     std::vector<std::string> scenes, nodeAddresses, trust;
     std::string out, key, masterAddress, bind = "0.0.0.0", advertise, folder, subject;
+    // Jobs (plan 13): the frames, each frame's changes (read on top of the frame before), the queue folder.
+    std::vector<std::string> deltas;
+    std::string frames, queue, name;
+    bool queueWatch = false;
     unsigned nodes = 0, threads = 0, cell = 256, chunk = 16;
     // A workstation: renders only once no one has used it for whenIdle seconds (0: always), within hours [from, to) of
     // the day (to below from: across midnight; -1: any hour); in use, busyThreads threads instead of stepping back.
@@ -70,7 +77,18 @@ inline const char* usage(Verb v) {
                "  Finds the nodes on its networks (and those given with --node), waits for N of them ready (or --wait seconds),\n"
                "  renders the frame with them, and writes the picture and the scene's outputs. --approve: only approved\n"
                "  machines join (the others wait, their hash printed with the command to approve them); --trust-first:\n"
-               "  approve every machine met on this run. Port 47110 by default.";
+               "  approve every machine met on this run. Port 47110 by default.\n"
+               "  Animation: --frames 1-24 (1-24:2 every second, 1,5,9 a list); a path with a run of # is a file a frame\n"
+               "  (-in shot.####.rdla: the scene made each frame, its unchanged files not sent again). --delta shot.####.rdla:\n"
+               "  each frame's changes read on top of the frame before, the scene kept on every machine between frames.\n"
+               "  -out beauty.####.pfm (without #, .0001 and so on is added for more than one frame); the scene's outputs\n"
+               "  likewise, unless their names already carry the frame. --queue folder: then the jobs in that folder\n"
+               "  (moonray_xpu2 rhizome submit), one after another; --queue-watch: wait for more when it is empty.";
+    case Verb::Submit:
+        return "moonray_xpu2 rhizome submit --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24]\n"
+               "    [--delta <frame.####.rdla> ...] [--name n]\n"
+               "  Adds a job to a master's queue folder (rhizome master --queue folder renders them in turn). Its paths are\n"
+               "  made whole here: the master must reach them the same way.";
     case Verb::Id: return "moonray_xpu2 rhizome id [--folder f]\n  This machine's hash (made the first time).";
     case Verb::Trust: return "moonray_xpu2 rhizome trust <approver hash> [--folder f]\n  Trust an approver: its endorsements and revocations count here.";
     case Verb::Approve:
@@ -82,7 +100,7 @@ inline const char* usage(Verb v) {
                "  An approver: revoke a machine, signed, passed through the swarm. Another machine: block it here only.";
     case Verb::Status: return "moonray_xpu2 rhizome status [--folder f] [--watch]\n  The swarm as this machine sees it (a running node or master's status.json).";
     default:
-        return "moonray_xpu2 rhizome node | master | id | trust | approve | revoke | status   (each with --help)";
+        return "moonray_xpu2 rhizome node | master | submit | id | trust | approve | revoke | status   (each with --help)";
     }
 }
 
@@ -94,7 +112,7 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
     else if (first == "--rhizome-node") a.verb = Verb::Node, i = 2;
     else if (first == "rhizome") {
         const std::string v = argc > 2 ? argv[2] : "help";
-        a.verb = v == "node" ? Verb::Node : v == "master" ? Verb::Master : v == "id" ? Verb::Id : v == "trust" ? Verb::Trust
+        a.verb = v == "node" ? Verb::Node : v == "master" ? Verb::Master : v == "submit" ? Verb::Submit : v == "id" ? Verb::Id : v == "trust" ? Verb::Trust
                  : v == "approve" ? Verb::Approve : v == "revoke" ? Verb::Revoke : v == "status" ? Verb::Status : Verb::Help;
         if (a.verb == Verb::Help && v != "help" && v != "--help") throw std::runtime_error("unknown verb " + v + "\n" + usage(Verb::Help));
         i = 3;
@@ -136,6 +154,11 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--approver") a.approver = true;
         else if (k == "--watch") a.watch = true;
         else if (k == "--no-discovery") a.discovery = false;
+        else if (k == "--frames") a.frames = next();
+        else if (k == "--delta") a.deltas.push_back(next());
+        else if (k == "--queue") a.queue = next();
+        else if (k == "--queue-watch") a.queueWatch = true;
+        else if (k == "--name") a.name = next();
         else if (!k.empty() && k[0] != '-' && a.subject.empty() &&
                  (a.verb == Verb::Trust || a.verb == Verb::Approve || a.verb == Verb::Revoke)) a.subject = k;
         else throw std::runtime_error("unknown argument " + k + "\n" + usage(a.verb));
@@ -146,8 +169,14 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         if (a.cell == 0 || a.cell % 64) throw std::runtime_error("--cell must be a multiple of 64");
     }
     if (a.verb == Verb::Master) {
-        if (a.scenes.empty()) throw std::runtime_error("no scene (-in)\n" + std::string(usage(a.verb)));
-        if (a.out.empty()) throw std::runtime_error("no picture to write (-out)\n" + std::string(usage(a.verb)));
+        if (a.scenes.empty() && a.queue.empty()) throw std::runtime_error("no scene (-in) and no queue (--queue)\n" + std::string(usage(a.verb)));
+        if (!a.scenes.empty() && a.out.empty()) throw std::runtime_error("no picture to write (-out)\n" + std::string(usage(a.verb)));
+    }
+    if (a.verb == Verb::Submit && a.queue.empty()) throw std::runtime_error("no queue folder (--queue)\n" + std::string(usage(a.verb)));
+    if (!a.scenes.empty() || a.verb == Verb::Submit) {
+        rz::Job j;
+        j.scenes = a.scenes, j.deltas = a.deltas, j.frames = a.frames, j.out = a.out;
+        j.check();  // the frames read, the deltas named a frame each
     }
     if ((a.verb == Verb::Trust || a.verb == Verb::Approve || a.verb == Verb::Revoke) && !rz::parseHash(a.subject))
         throw std::runtime_error("a machine's hash, 64 hex digits, is needed\n" + std::string(usage(a.verb)));
@@ -180,12 +209,13 @@ inline std::string buildId() {
 // on one thread of its own, the renderer's feeder: a graphics card's lane is used only from the thread that made it.
 class Local {
 public:
-    Local(const RhizomeArgs& a, const fs::path& staging) : mode_(a.mode) {
+    // deltas: a frame's changes read on top of the scene before it is prepared (a node joining a job's later frame).
+    Local(const RhizomeArgs& a, const fs::path& staging, const std::vector<std::string>& deltas = {}) : mode_(a.mode) {
         std::promise<void> ready;
         auto made = ready.get_future();
         thread_ = std::thread([&, this] {
             try {
-                setup(a, staging);
+                setup(a, staging, deltas);
                 ready.set_value();
             } catch (...) {
                 ready.set_exception(std::current_exception());
@@ -209,6 +239,52 @@ public:
         if (thread_.joinable()) thread_.join();
     }
     const cpu::Plan& plan() const { return *scene_.plan; }
+    // A frame's changes (plan 13): its delta files read on top of the scene as it stands and the plan made again (the
+    // camera alone, or the placements alone, where that is all they changed, as Modo's session does: the card keeps
+    // its meshes and textures), the renderer made anew. Returns the seconds it took.
+    double apply(const std::vector<std::string>& deltas) {
+        return call([&] {
+            const auto began = std::chrono::steady_clock::now();
+            renderer_.reset();
+            auditKey_ = {~0u, ~0u, 0, 0};
+            for (const auto& d : deltas) scene_.apply(d);
+            scene_.prepare();
+            const char* how = "made again";
+            if (gpu_) {
+                if (scene_.cameraFrom && gpuPlan_ == scene_.cameraFrom) {
+                    gpu_->updateCamera(scene_.plan);
+                    how = "the camera alone";
+                } else if (scene_.placedFrom && gpuPlan_ == scene_.placedFrom && gpu_->updatePlacements(scene_.plan)) {
+                    how = "the placements alone";
+                } else {
+                    const std::string why = async::GpuLane::cpuOnly(scene_.plan);
+                    if (!why.empty()) {
+                        std::printf("MoonRay XPU2 Rhizome: the GPU leaves %s to the CPU; the CPU alone\n", why.c_str());
+                        gpu_.reset();
+                    } else {
+                        gpu_->prepare(scene_.plan);
+                    }
+                }
+            } else if (scene_.cameraFrom) {
+                how = "the camera alone";
+            }
+            gpuPlan_ = scene_.plan;
+            renderer_ = std::make_unique<async::Renderer>(scene_.plan, *scene_.cpuScene, gpu_.get());
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+            std::printf("MoonRay XPU2 Rhizome: the frame's changes read (%zu files, %s) in %.2f s\n", deltas.size(), how, s);
+            std::fflush(stdout);
+            return s;
+        });
+    }
+    // The scene's output files' names, as it stands.
+    std::vector<std::string> outputFiles() {
+        return call([&] {
+            std::vector<std::string> v;
+            if (scene_.plan->aovs)
+                for (const auto& f : scene_.plan->aovs->files) v.push_back(f.name);
+            return v;
+        });
+    }
     // A workstation in use: the processor threads its shares render on (0: all it was given).
     void setThreads(unsigned n) { busyThreads_ = n; }
     // A share of the frame: its film (sums and counts) for the rectangle, rendered on the feeder.
@@ -298,7 +374,7 @@ public:
         renderer_.reset();
         gpu_.reset();
     }
-    void setup(const RhizomeArgs& a, const fs::path& staging) {
+    void setup(const RhizomeArgs& a, const fs::path& staging, const std::vector<std::string>& deltas) {
         threads_ = a.threads ? a.threads : multi::logicalProcessors();
         scene_.coarseFirst = false;
         scene_.dso = executableFolder();
@@ -308,6 +384,7 @@ public:
         fs::create_directories(staging);
         cpu::sequenceDirectory() = executableFolder();
         scene_.load(a.scenes);
+        for (const auto& d : deltas) scene_.apply(d);
         scene_.prepare();
         if (mode_ != 0) makeGpu();
         renderer_ = std::make_unique<async::Renderer>(scene_.plan, *scene_.cpuScene, gpu_.get());
@@ -376,7 +453,8 @@ public:
     // The master's picture made whole: the merged films' AOVs resolved, the display filters run, and the scene's
     // render outputs written as a frame writes them (aov_write.h). film: sums a pixel; odd: odd-index sums.
     void writeOutputs(const std::vector<double>& film, const std::vector<uint32_t>& counts, const std::vector<double>& odd,
-                      const std::vector<double>& raw, const std::vector<float>& depths, const aov::CryptoBuffer* crypto = nullptr) {
+                      const std::vector<double>& raw, const std::vector<float>& depths, const aov::CryptoBuffer* crypto = nullptr,
+                      const std::function<std::string(const std::string&)>& rename = {}) {
         call([&] {
             if (!scene_.plan->aovs) return 0;
             const size_t pixels = size_t(plan().width) * plan().height;
@@ -403,7 +481,21 @@ public:
                 for (const aov::Output* out : scene_.plan->aovs->all)
                     if (out->result == aov::ResultDisplayFilter && k < filtered.size()) result.displayFilters[out->name] = std::move(filtered[k++]);
             }
-            const std::string error = aov::writeOutputs(*scene_.plan->aovs, result, plan().width, plan().height, warnings);
+            // A frame of a job: the files' names for it (rename) while they are written, then as they were. The plan
+            // holds its outputs' state machine and cannot be copied; only this thread (the feeder) reads the names.
+            auto& files = const_cast<std::vector<aov::File>&>(scene_.plan->aovs->files);
+            std::vector<std::string> names;
+            for (auto& f : files) names.push_back(f.name);
+            if (rename)
+                for (auto& f : files) f.name = rename(f.name);
+            std::string error;
+            try {
+                error = aov::writeOutputs(*scene_.plan->aovs, result, plan().width, plan().height, warnings);
+            } catch (...) {
+                for (size_t i = 0; i < files.size(); ++i) files[i].name = names[i];
+                throw;
+            }
+            for (size_t i = 0; i < files.size(); ++i) files[i].name = names[i];
             for (const auto& w : warnings) std::printf("MoonRay XPU2 Rhizome: %s\n", w.c_str());
             if (!error.empty()) throw std::runtime_error(error);
             std::printf("MoonRay XPU2 Rhizome: the scene's render outputs written\n");
@@ -450,9 +542,11 @@ public:
             return;
         }
         gpu_->prepare(scene_.plan);
+        gpuPlan_ = scene_.plan;
     }
 private:
     Scene scene_;
+    cpu::PlanView gpuPlan_;  // the plan the card's scene was made for (a frame's changes: the camera or placements alone)
     std::unique_ptr<async::GpuLane> gpu_;
     std::unique_ptr<async::Renderer> renderer_;
     int mode_ = 2;
@@ -644,6 +738,60 @@ inline std::vector<std::string> receiveScene(rz::RhizomeNode& node, const rz::By
     return scenes;
 }
 
+// A frame's manifest (plan 13): the job, the frame, the scene's files (a manifest of publishScene) and the frame's
+// changes so far in the job, one manifest each, in the order they are read. A node that holds the scene and the first of
+// the changes reads the rest alone; one that does not makes the scene and reads them all.
+constexpr uint32_t ManifestMagic = 0x324D5A52u;  // "RZM2"
+struct JobManifest {
+    std::string job;
+    uint32_t frame = 0, frames = 0;  // the frame, and the job's count of frames (0: the scene as it is)
+    rz::Bytes scene;
+    std::vector<rz::Bytes> deltas;
+};
+inline rz::Bytes writeManifest(const JobManifest& m) {
+    rz::Writer w;
+    w.u32(ManifestMagic);
+    w.str(m.job);
+    w.u32(m.frame), w.u32(m.frames);
+    w.bytes(m.scene);
+    w.u32(uint32_t(m.deltas.size()));
+    for (const auto& d : m.deltas) w.bytes(d);
+    return w.b;
+}
+inline JobManifest readManifest(const rz::Bytes& b) {
+    JobManifest m;
+    rz::Reader r(b);
+    if (r.u32() != ManifestMagic) {
+        m.scene = b;  // a scene alone
+        return m;
+    }
+    m.job = r.str();
+    m.frame = r.u32(), m.frames = r.u32();
+    m.scene = r.bytes();
+    const uint32_t n = r.u32();
+    if (n > 1000000) throw std::runtime_error("the master's manifest does not read");
+    for (uint32_t i = 0; i < n && !r.bad; ++i) m.deltas.push_back(r.bytes());
+    if (r.bad) throw std::runtime_error("the master's manifest does not read");
+    return m;
+}
+// A scene's output file name for a frame of a job: its run of # filled; without one, in a job of more than one frame,
+// .NNNN added, unless the name already has the frame's number in it (the scene names its frames itself).
+inline std::string frameOutputName(const std::string& name, int frame, bool many) {
+    if (rz::hasFrameSlot(name) || !many) return rz::frameOutput(name, frame, many);
+    const size_t from = name.find_last_of("/\\") == std::string::npos ? 0 : name.find_last_of("/\\") + 1;
+    for (size_t i = from; i < name.size();) {
+        if (name[i] < '0' || name[i] > '9') {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j < name.size() && name[j] >= '0' && name[j] <= '9') ++j;
+        if (j - i <= 9 && std::stoll(name.substr(i, j - i)) == frame) return name;
+        i = j;
+    }
+    return rz::frameOutput(name, frame, true);
+}
+
 // The merge of a frame's AOVs and aux outputs, as films are taken in (by each output's filter, async::mergeAovPixel):
 // the master's, and its deputy's copy (failover), which a new deputy is given whole.
 struct Merge {
@@ -832,6 +980,17 @@ inline int run(int argc, char** argv) {
         std::printf("%s\n", usage(a.verb));
         return 0;
     }
+    if (a.verb == Verb::Submit) {
+        rz::Job j;
+        for (const auto& s : a.scenes) j.scenes.push_back(fs::absolute(fs::u8path(s)).u8string());
+        for (const auto& d : a.deltas) j.deltas.push_back(fs::absolute(fs::u8path(d)).u8string());
+        j.frames = a.frames;
+        j.out = fs::absolute(fs::u8path(a.out)).u8string();
+        j.name = a.name.empty() ? fs::u8path(a.scenes.front()).filename().u8string() : a.name;
+        const fs::path at = rz::queue::submit(fs::u8path(a.queue), j);
+        std::printf("MoonRay XPU2 Rhizome: job %s queued: %s\n", j.name.c_str(), at.u8string().c_str());
+        return 0;
+    }
     if (a.verb != Verb::Node && a.verb != Verb::Master) return identityVerb(a);
     rz::Winsock winsock;
     const fs::path folder = roleFolder(a);
@@ -851,10 +1010,10 @@ inline int run(int argc, char** argv) {
                 folder.u8string().c_str());
     std::fflush(stdout);
     const fs::path base = fs::temp_directory_path() / ("xpu2-rhizome-" + std::to_string(GetCurrentProcessId()));
-    // The master reads the scene where it is; a node makes each job's from the swarm's memory.
+    // The master reads each job's scene where it is (in the frame loop below); a node makes each job's from the swarm's
+    // memory.
     std::shared_ptr<Local> current;
     std::mutex currentMutex;
-    if (a.master) current = std::make_shared<Local>(a, base / "staging");
     auto local = [&] {
         std::lock_guard<std::mutex> g(currentMutex);
         return current;
@@ -877,14 +1036,15 @@ inline int run(int argc, char** argv) {
     o.onFilm = [&](const rz::Film& f) { merge.add(f); };
     o.exportMerge = [&] { return merge.save(); };
     o.importMerge = [&](const rz::Bytes& b) { merge.load(b); };
-    if (a.master) {
-        merge.init(*current);
-        o.job = fs::u8path(a.scenes.front()).filename().u8string();
-    }
+    if (a.master) o.job = a.scenes.empty() ? std::string("the queue") : fs::u8path(a.scenes.front()).filename().u8string();
     // A node that takes over as master (its master failed): it waits for the picture, then writes it and the scene's
     // outputs as the master would have (the beauty beside its folder, output\<scene>.pfm).
     std::thread finisher;
     std::atomic<bool> finishing{false};
+    // The frame a node holds the scene of, and its job's count of frames (0: no frames): a takeover's outputs named as
+    // the master names them.
+    std::atomic<int> jobFrame{0};
+    std::atomic<uint32_t> jobFrames{0};
     rz::RhizomeNode* nodeRef = nullptr;
     o.onTakeover = [&] {
         if (finishing.exchange(true)) return;
@@ -896,16 +1056,24 @@ inline int run(int argc, char** argv) {
             if (!l) return;
             const std::vector<double> film = n.film();
             const std::vector<uint32_t> counts = n.counts();
-            const fs::path out = folder / "output" / (fs::u8path(o.job).stem().u8string() + ".pfm");
+            const int frame = jobFrame;
+            const uint32_t frames = jobFrames;
+            const std::string stem = fs::u8path(o.job).stem().u8string();
+            const fs::path out = folder / "output" / fs::u8path(frames ? rz::frameOutput(stem + ".pfm", frame, frames > 1) : stem + ".pfm");
             std::error_code e;
             fs::create_directories(out.parent_path(), e);
             writePfm(out, l->plan().width, l->plan().height, film, counts);
-            l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths, merge.crypto.get());
+            std::function<std::string(const std::string&)> rename;
+            if (frames) rename = [frame, frames](const std::string& n) { return frameOutputName(n, frame, frames > 1); };
+            l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths, merge.crypto.get(), rename);
             std::printf("MoonRay XPU2 Rhizome: took over as master and finished the frame: wrote %s\n", out.u8string().c_str());
             std::fflush(stdout);
             finishing = false;
         });
     };
+    // Silence a real machine is allowed: a busy machine's (every core rendering, a large piece being sealed) can last a
+    // second or two, and taking a live master for gone splits the swarm. A failed one is still noticed in seconds.
+    o.suspectAfter = 2.0, o.goneAfter = 6.0;
     o.rhizomeKey = a.key;
     o.master = a.master;
     o.masterAddress = a.masterAddress;
@@ -996,97 +1164,249 @@ inline int run(int argc, char** argv) {
         std::printf("MoonRay XPU2 Rhizome: node waiting for a master%s\n", a.masterAddress.empty() ? " to find it" : "");
         std::fflush(stdout);
         rz::Hash last{};
+        // What the scene here is made of: the scene's manifest and the changes read into it since, in order.
+        rz::Hash heldScene{};
+        std::vector<rz::Hash> heldDeltas;
         for (unsigned job = 1;; ++job) {
             rz::Bytes m;
             {
                 std::unique_lock<std::mutex> g(jobsMutex);
                 jobsCv.wait(g, [&] { return !manifests.empty(); });
-                m = std::move(manifests.back());
+                m = std::move(manifests.back());  // frames it missed meanwhile: their changes are in this one's
                 manifests.clear();
             }
             const rz::Hash which = rz::sha256(m);
             if (which == last) continue;  // the same job sent again (a master reaching it once more)
             last = which;
             try {
-                RhizomeArgs j = a;
-                j.scenes = receiveScene(node, m, base / ("job" + std::to_string(job)));
-                auto made = std::make_shared<Local>(j, base / ("staging" + std::to_string(job)));
-                {
-                    std::lock_guard<std::mutex> g(currentMutex);
-                    current = made;  // the last job's goes once no chunk of it is rendering
+                const JobManifest jm = readManifest(m);
+                const fs::path into = base / ("job" + std::to_string(job));
+                std::vector<rz::Hash> deltas;
+                for (const auto& d : jm.deltas) deltas.push_back(rz::sha256(d));
+                const std::shared_ptr<Local> held = local();
+                // The scene here, and its changes the first of this frame's: the rest of them read alone.
+                const bool keep = held && heldScene == rz::sha256(jm.scene) && heldDeltas.size() <= deltas.size() &&
+                                  std::equal(heldDeltas.begin(), heldDeltas.end(), deltas.begin());
+                std::string name;
+                if (keep) {
+                    std::vector<std::string> files;
+                    for (size_t i = heldDeltas.size(); i < jm.deltas.size(); ++i) {
+                        const auto got = receiveScene(node, jm.deltas[i], into / ("delta" + std::to_string(i)));
+                        files.insert(files.end(), got.begin(), got.end());
+                    }
+                    if (!files.empty()) held->apply(files);
+                    heldDeltas = deltas;
+                    merge.init(*held);  // the frame's copy, should it be a deputy (failover)
+                } else {
+                    RhizomeArgs j = a;
+                    j.scenes = receiveScene(node, jm.scene, into);
+                    std::vector<std::string> files;
+                    for (size_t i = 0; i < jm.deltas.size(); ++i) {
+                        const auto got = receiveScene(node, jm.deltas[i], into / ("delta" + std::to_string(i)));
+                        files.insert(files.end(), got.begin(), got.end());
+                    }
+                    auto made = std::make_shared<Local>(j, base / ("staging" + std::to_string(job)), files);
+                    {
+                        std::lock_guard<std::mutex> g(currentMutex);
+                        current = made;  // the last job's goes once no chunk of it is rendering
+                    }
+                    heldScene = rz::sha256(jm.scene);
+                    heldDeltas = deltas;
+                    merge.init(*made);  // its copy, should it be a deputy (failover)
+                    name = fs::u8path(j.scenes.front()).filename().u8string();
+                    o.job = name;
                 }
-                merge.init(*made);  // its copy, should it be a deputy (failover)
-                o.job = fs::u8path(j.scenes.front()).filename().u8string();
-                node.markReady();
-                std::printf("MoonRay XPU2 Rhizome: node ready for job %u (%s)\n", job, fs::u8path(j.scenes.front()).filename().u8string().c_str());
+                if (!jm.job.empty()) o.job = jm.job;
+                jobFrame = int(jm.frame), jobFrames = jm.frames;
+                const std::string what = jm.job.empty() ? o.job : jm.job + " frame " + std::to_string(jm.frame);
+                node.setJob(what);
+                node.markReady(which);
+                std::printf("MoonRay XPU2 Rhizome: node ready for %s%s\n", what.c_str(), keep ? " (the scene kept, its changes read)" : "");
             } catch (const std::exception& e) {
                 std::printf("MoonRay XPU2 Rhizome: job %u could not be made here: %s\n", job, e.what());
             }
             std::fflush(stdout);
         }
     }
+    // The master's jobs (plan 13): the one on its command line, then the queue's, one after another; each frame of each.
+    std::vector<rz::Job> given;
+    if (!a.scenes.empty()) {
+        rz::Job j;
+        j.scenes = a.scenes, j.deltas = a.deltas, j.frames = a.frames, j.out = a.out;
+        j.name = a.name.empty() ? fs::u8path(a.scenes.front()).filename().u8string() : a.name;
+        given.push_back(j);
+    }
+    const fs::path queueFolder = a.queue.empty() ? fs::path() : fs::u8path(a.queue);
+    // The files placed in the pool, by their paths (a job's scene is placed once for all its frames).
+    std::map<std::string, rz::Bytes> placed;
     uint64_t sceneBytes = 0;
-    node.publishManifest(publishScene(node, a.scenes, sceneBytes));
-    // The nodes: as many as asked (--nodes) or given (--node) ready, else every one found ready and none new for three
-    // seconds; --wait seconds at most.
-    const size_t needed = a.nodes ? a.nodes : a.nodeAddresses.size();
-    const auto began = Clock::now();
-    auto lastChange = Clock::now();
-    size_t seen = 0;
-    for (;;) {
-        const double t = std::chrono::duration<double>(Clock::now() - began).count();
-        const size_t joined = node.joined(), ready = node.ready();
-        if (joined != seen) seen = joined, lastChange = Clock::now();
-        const double quiet = std::chrono::duration<double>(Clock::now() - lastChange).count();
-        if (needed ? ready >= needed : (ready == joined && joined > 0 && quiet > 3.0)) break;
-        if (t > a.wait) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto publishFiles = [&](const std::vector<std::string>& files) {
+        std::string key;
+        for (const auto& f : files) key += f + "\n";
+        auto it = placed.find(key);
+        if (it == placed.end()) it = placed.emplace(key, publishScene(node, files, sceneBytes)).first;
+        return it->second;
+    };
+    std::vector<std::string> heldScenes;  // the files the master's scene was made of
+    std::vector<rz::Bytes> heldDeltas;    // this job's changes read into it, in order
+    uint32_t sequence = 0, staged = 0;
+    bool firstFrame = true;
+    // One frame of a job: the scene made (or its changes read), the nodes made ready, the frame rendered and written.
+    auto renderFrame = [&](const rz::Job& job, bool hasFrames, int frameNumber, size_t index, size_t total) {
+        const bool many = total > 1;
+        const std::vector<std::string> scenes = hasFrames ? job.scenesFor(frameNumber) : job.scenes;
+        const std::vector<std::string> deltas = hasFrames ? job.deltasFor(frameNumber) : std::vector<std::string>{};
+        std::shared_ptr<Local> l = local();
+        if (!l || scenes != heldScenes) {
+            RhizomeArgs j = a;
+            j.scenes = scenes;
+            auto made = std::make_shared<Local>(j, base / ("staging" + std::to_string(++staged)), deltas);
+            {
+                std::lock_guard<std::mutex> g(currentMutex);
+                current = made;
+            }
+            l = made;
+            heldScenes = scenes;
+            heldDeltas.clear();
+        } else if (!deltas.empty()) {
+            l->apply(deltas);
+        }
+        if (!deltas.empty()) heldDeltas.push_back(publishFiles(deltas));
+        merge.init(*l);
+        JobManifest jm;
+        jm.job = job.name;
+        jm.frame = uint32_t(frameNumber);
+        jm.frames = hasFrames ? uint32_t(total) : 0u;
+        jm.scene = publishFiles(scenes);
+        jm.deltas = heldDeltas;
+        const std::string what = hasFrames ? job.name + " frame " + std::to_string(frameNumber) + " (" + std::to_string(index + 1) + " of " +
+                                                 std::to_string(total) + ")"
+                                           : job.name;
+        o.job = job.name;
+        node.setJob(what);
+        node.publishManifest(writeManifest(jm));
+        // The nodes: for the run's first frame, as many as asked (--nodes) or given (--node) ready, else every one found
+        // ready and none new for three seconds; for the frames after, every one there ready for this frame; --wait
+        // seconds at most. A node not ready in time sits this frame out.
+        const size_t needed = a.nodes ? a.nodes : a.nodeAddresses.size();
+        const auto began = Clock::now();
+        auto lastChange = Clock::now();
+        size_t seen = 0;
+        for (;;) {
+            const double t = std::chrono::duration<double>(Clock::now() - began).count();
+            const size_t joined = node.joined(), ready = node.ready();
+            if (joined != seen) seen = joined, lastChange = Clock::now();
+            const double quiet = std::chrono::duration<double>(Clock::now() - lastChange).count();
+            if (firstFrame) {
+                if (needed ? ready >= needed : (ready == joined && joined > 0 && quiet > 3.0)) break;
+            } else if (ready >= joined) {
+                break;
+            }
+            if (t > a.wait) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(firstFrame ? 100 : 20));
+        }
+        if (firstFrame) std::this_thread::sleep_for(std::chrono::milliseconds(500));  // the nodes meet each other
+        firstFrame = false;
+        const cpu::Plan& p = l->plan();
+        rz::FrameShape shape;
+        shape.width = p.width, shape.height = p.height, shape.cellSize = a.cell, shape.spp = p.spp, shape.chunkSamples = std::min(a.chunk, p.spp);
+        shape.frame = ++sequence;  // the run's count: a late film of a frame before (even another job's) is not this one's
+        // An adaptive scene: each cell stops once its error, pooled at the master from every node's films, is under the
+        // scene's target (its most samples, spp, the rest); chunks of an even number of samples for the error's halves.
+        if (p.adaptive) {
+            shape.targetError = p.targetError, shape.minSamples = p.minSamples;
+            if (shape.chunkSamples % 2) shape.chunkSamples = std::max(2u, shape.chunkSamples - 1);
+            if (index == 0)
+                std::printf("MoonRay XPU2 Rhizome: adaptive, %u to %u samples a pixel, a cell done under error %g\n", p.minSamples, p.spp,
+                            double(p.targetError));
+        }
+        std::printf("MoonRay XPU2 Rhizome: %s: %zu nodes joined, %zu ready; the frame in %u cells of %u px, chunks of %u samples\n",
+                    what.c_str(), node.joined(), node.ready(), shape.cells(), shape.cellSize, shape.chunkSamples);
+        // The cells' importance from the indexer's probe: the important ones to the fast tier.
+        double probeSeconds = 0;
+        const std::vector<float> importance = l->importance(shape, 8, &probeSeconds);
+        size_t above = 0;
+        {
+            double mean = 0;
+            for (float v : importance) mean += v;
+            mean /= std::max<size_t>(1, importance.size());
+            for (float v : importance) above += v > mean;
+        }
+        std::printf("MoonRay XPU2 Rhizome: the indexer's probe in %.2f s: %zu of %u cells important\n", probeSeconds, above, shape.cells());
+        const auto frameBegan = Clock::now();
+        node.beginFrame(shape, importance);
+        if (!node.waitFrame(24 * 3600.0)) throw std::runtime_error("the frame did not complete");
+        const double seconds = std::chrono::duration<double>(Clock::now() - frameBegan).count();
+        const std::vector<double> film = node.film();
+        const std::vector<uint32_t> counts = node.counts();
+        const std::string out = hasFrames ? rz::frameOutput(job.out, frameNumber, many) : job.out;
+        {
+            std::error_code e;
+            const fs::path parent = fs::u8path(out).parent_path();
+            if (!parent.empty()) fs::create_directories(parent, e);
+        }
+        writePfm(fs::u8path(out), shape.width, shape.height, film, counts);
+        std::function<std::string(const std::string&)> rename;
+        if (hasFrames) rename = [frameNumber, many](const std::string& n) { return frameOutputName(n, frameNumber, many); };
+        l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths, merge.crypto.get(), rename);
+        const auto by = node.chunksByNode();
+        std::string share;
+        for (size_t i = 0; i < by.size(); ++i)
+            share += (i ? ", " : "") + rz::shortHex(node.plan()->nodes[i].hash) + " " + std::to_string(by[i]) + (node.plan()->nodes[i].fast ? " (fast)" : " (slow)");
+        std::printf("MoonRay XPU2 Rhizome: the frame in %.2f s, %llu films audited; chunks by node: %s\n", seconds,
+                    (unsigned long long)node.audits(), share.c_str());
+        if (shape.adaptive())
+            std::printf("MoonRay XPU2 Rhizome: adaptive: %zu of %u cells converged early, %zu chunks left unrendered\n", node.convergedCells(),
+                        shape.cells(), node.cancelledChunks());
+        std::printf("MoonRay XPU2 Rhizome: wrote %s\n", out.c_str());
+        std::fflush(stdout);
+    };
+    // A job: each of its frames. A job's scene is placed in the pool anew (its files may have been written again).
+    auto renderJob = [&](const rz::Job& job) {
+        job.check();
+        placed.clear();
+        heldScenes.clear();
+        heldDeltas.clear();
+        const std::vector<int> frames = job.frameList();
+        const bool hasFrames = !frames.empty();
+        const auto began = Clock::now();
+        const size_t total = hasFrames ? frames.size() : 1;
+        for (size_t i = 0; i < total; ++i) renderFrame(job, hasFrames, hasFrames ? frames[i] : 0, i, total);
+        const double s = std::chrono::duration<double>(Clock::now() - began).count();
+        std::printf("MoonRay XPU2 Rhizome: job %s: %zu frame%s in %.1f s\n", job.name.c_str(), total, total == 1 ? "" : "s", s);
+        std::fflush(stdout);
+        return std::to_string(total) + (total == 1 ? " frame in " : " frames in ") + std::to_string(int(s + 0.5)) + " s";
+    };
+    for (const auto& job : given) renderJob(job);
+    if (!queueFolder.empty()) {
+        std::printf("MoonRay XPU2 Rhizome: the queue %s%s\n", queueFolder.u8string().c_str(), a.queueWatch ? ", watched for new jobs" : "");
+        std::fflush(stdout);
+        for (;;) {
+            rz::Job job;
+            fs::path running;
+            try {
+                running = rz::queue::take(queueFolder, job);
+            } catch (const std::exception& e) {
+                std::printf("MoonRay XPU2 Rhizome: a job in the queue does not read: %s\n", e.what());
+                std::fflush(stdout);
+                continue;
+            }
+            if (running.empty()) {
+                if (!a.queueWatch) break;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+            std::printf("MoonRay XPU2 Rhizome: job %s from the queue\n", job.name.c_str());
+            std::fflush(stdout);
+            try {
+                rz::queue::finish(running, queueFolder, true, renderJob(job));
+            } catch (const std::exception& e) {
+                std::printf("MoonRay XPU2 Rhizome: job %s failed: %s\n", job.name.c_str(), e.what());
+                std::fflush(stdout);
+                rz::queue::finish(running, queueFolder, false, e.what());
+            }
+        }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // the nodes meet each other
-    Local* l = current.get();
-    const cpu::Plan& p = l->plan();
-    rz::FrameShape shape;
-    shape.width = p.width, shape.height = p.height, shape.cellSize = a.cell, shape.spp = p.spp, shape.chunkSamples = std::min(a.chunk, p.spp);
-    // An adaptive scene: each cell stops once its error, pooled at the master from every node's films, is under the
-    // scene's target (its most samples, spp, the rest); chunks of an even number of samples for the error's halves.
-    if (p.adaptive) {
-        shape.targetError = p.targetError, shape.minSamples = p.minSamples;
-        if (shape.chunkSamples % 2) shape.chunkSamples = std::max(2u, shape.chunkSamples - 1);
-        std::printf("MoonRay XPU2 Rhizome: adaptive, %u to %u samples a pixel, a cell done under error %g\n", p.minSamples, p.spp,
-                    double(p.targetError));
-    }
-    std::printf("MoonRay XPU2 Rhizome: %zu nodes joined, %zu ready; the frame in %u cells of %u px, chunks of %u samples\n", node.joined(),
-                node.ready(), shape.cells(), shape.cellSize, shape.chunkSamples);
-    // The cells' importance from the indexer's probe: the important ones to the fast tier.
-    double probeSeconds = 0;
-    const std::vector<float> importance = l->importance(shape, 8, &probeSeconds);
-    size_t above = 0;
-    {
-        double mean = 0;
-        for (float v : importance) mean += v;
-        mean /= std::max<size_t>(1, importance.size());
-        for (float v : importance) above += v > mean;
-    }
-    std::printf("MoonRay XPU2 Rhizome: the indexer's probe in %.2f s: %zu of %u cells important\n", probeSeconds, above, shape.cells());
-    const auto frameBegan = Clock::now();
-    node.beginFrame(shape, importance);
-    if (!node.waitFrame(24 * 3600.0)) throw std::runtime_error("the frame did not complete");
-    const double seconds = std::chrono::duration<double>(Clock::now() - frameBegan).count();
-    const std::vector<double> film = node.film();
-    const std::vector<uint32_t> counts = node.counts();
-    writePfm(fs::u8path(a.out), shape.width, shape.height, film, counts);
-    l->writeOutputs(film, counts, merge.odd, merge.aovs, merge.depths, merge.crypto.get());
-    const auto by = node.chunksByNode();
-    std::string share;
-    for (size_t i = 0; i < by.size(); ++i)
-        share += (i ? ", " : "") + rz::shortHex(node.plan()->nodes[i].hash) + " " + std::to_string(by[i]) + (node.plan()->nodes[i].fast ? " (fast)" : " (slow)");
-    std::printf("MoonRay XPU2 Rhizome: the frame in %.2f s, %llu films audited; chunks by node: %s\n", seconds,
-                (unsigned long long)node.audits(), share.c_str());
-    if (shape.adaptive())
-        std::printf("MoonRay XPU2 Rhizome: adaptive: %zu of %u cells converged early, %zu chunks left unrendered\n", node.convergedCells(),
-                    shape.cells(), node.cancelledChunks());
-    std::printf("MoonRay XPU2 Rhizome: wrote %s\n", a.out.c_str());
-    std::fflush(stdout);
     prober.reset();
     node.stop();
     if (finisher.joinable()) finisher.join();

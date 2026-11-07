@@ -17,6 +17,7 @@ namespace xpu2::interactive::rhizome {
 // A film for a cell's sample range: its rectangle (half open), the samples [first, first + count), and per pixel
 // four floats of sums (RGB and alpha, the film's order: rows from the top) and a count.
 struct Film {
+    uint32_t frame = 0;  // the frame it was rendered for (FrameShape::frame)
     uint32_t rect[4] = {0, 0, 0, 0};
     uint32_t first = 0, count = 0;
     std::vector<float> sums;

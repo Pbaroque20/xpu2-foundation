@@ -46,7 +46,10 @@ handshake's two frames, which carry only keys, hashes and what a machine has, ar
 A node starts with the address of any member (usually the master). It introduces itself (hash, public key, what it
 has: processor threads, NUMA nodes, graphics cards, a measured rate), learns the members from the one it reached, and
 connects to the others. Members are kept by heartbeats: a member not heard from for a few heartbeats is suspected,
-then dropped (bytes of a message still arriving count as hearing it, so a large piece on a slow link is not silence) (`rhizome_swarm.h`, `Members`). The master's list is the one that counts when lists differ.
+then dropped (bytes of a message still arriving count as hearing it, so a large piece on a slow link is not silence;
+a machine is suspected after 2 s of silence and dropped after 6 s). The swarm's threads run above the renderer's, so a
+machine whose every core renders still answers on time: at normal priority its heartbeats waited seconds for a core
+and a node took over from a live master (`rhizome_swarm.h`, `Members`). The master's list is the one that counts when lists differ.
 
 A node joins and leaves at any time. One that joins mid-frame takes work from the next steals; one that leaves or
 falls silent has its unreturned work given out again (section 4).
@@ -137,7 +140,8 @@ the contribution arrives by a seed the nodes do not know, and comparing them. On
 and every sample of a node's first contribution's first pixel row.
 
 A contribution that matches is added to the film. One that does not is thrown away whole, its node is quarantined
-(its hash refused for the rest of the session) and its ranges given out again. A comparison allows for the
+(its hash refused for the rest of the session) and its ranges given out again. The node is told so before its
+connection closes; a refused node takes no more work and never takes over as master. A comparison allows for the
 difference between a processor's and a graphics card's floating point (a relative tolerance), not for a different
 picture.
 
@@ -172,7 +176,7 @@ picture.
 | 10 | Adaptive sampling across machines: the nodes' errors pooled at the master, as the cards' are (`GpuLane::poolErrors`) | built: an adaptive scene's shares send their odd sums; the master works out each pixel's error from every node's films added, and a cell under the scene's target (one pixel in a hundred aside) has its chunks not back cancelled on every node (and on the deputy); 6 checks: the flat half of a frame stopped at its minimum, the noisy half took every sample, 56% of a uniform frame's samples |
 | 11 | Cryptomatte: each node's fragments merged at the master | built: a share's fragments stay sums; nodes send them with each film, the master merges them by ID (as the lanes' are) and finalizes once; the deputy keeps a copy; a share's film is given its fragments anew each share (it had none); Hydra across three processes: every Cryptomatte ID as the single machine's, coverages 99.96% equal (the sums' order) |
 | 12 | Workstations: a node stepping back while its machine is in use (paused, or fewer threads), hours it may render in | built: `--when-idle s`, `--hours 19-8`, `--busy-threads n`; stepped back, a node gives its chunks to the master, which gives them out and plans it no cells until it is back; status shows it stepped back; 3 checks |
-| 13 | Animation and a job queue: frame ranges, jobs one after another, the scene kept between frames and its changes alone sent | todo |
+| 13 | Animation and a job queue: frame ranges, jobs one after another, the scene kept between frames and its changes alone sent | built (`rhizome_jobs.h`): `--frames 1-24` (`1-24:2`, `1,5,9`); a path with a run of # is a file a frame (`-in shot.####.rdla`: the scene made each frame, its unchanged files not sent again, the pool's pieces being their own hashes); `--delta shot.####.rdla`: each frame's changes read on top of the frame before, the scene kept on every machine (a node joining late reads them all); `-out beauty.####.pfm`, the scene's outputs likewise; `--queue folder [--queue-watch]` and `rhizome submit`; a frame number on every plan and film (a late film of the frame before is left out) and readiness for each frame's manifest; 23 checks; tested on the VDB scene, three processes, CPU alone and with the graphics card: frames 1-3 by deltas and a queued job of two frames given whole, each frame as one machine renders it (block error 0) |
 | 14 | Checkpoints: the master's film and ledger saved as it goes, a job taken up again after every machine has stopped | todo |
 | 15 | Shaders on nodes: a node without compiled GPU programs offered to compile them on first start; status says which lack them | todo |
 | 16 | Real distributed memory: texture tiles fetched from the pool as a node renders, in place of a whole copy of the scene each | todo |

@@ -42,6 +42,8 @@ struct FrameShape {
     // pooled error is under targetError (0: uniform, every chunk rendered). The halves' error needs even chunks.
     float targetError = 0;
     U32 minSamples = 0;
+    // The frame's number in its job (plan 13): a film rendered for another frame is not this one's.
+    U32 frame = 0;
     bool adaptive() const { return targetError > 0 && chunkSamples % 2 == 0; }
     U32 cellsX() const { return (width + cellSize - 1) / cellSize; }
     U32 cellsY() const { return (height + cellSize - 1) / cellSize; }

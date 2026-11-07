@@ -93,6 +93,14 @@ struct NodeOptions {
     std::function<void(const std::string&)> log;
 };
 
+// The swarm's threads run above the renderer's (XPU2's workers run above normal, its feeder at highest): on a
+// machine whose every core renders, a thread of normal priority waited seconds for a core, its heartbeats with it, and
+// the others took the machine for gone (a node took over from a live master). They mostly wait on the network or on
+// the node's lock, so they take little from the render. The heartbeat loop is above them all.
+inline void swarmThread(bool heartbeats = false) {
+    SetThreadPriority(GetCurrentThread(), heartbeats ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_HIGHEST);
+}
+
 inline double nowSeconds() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -153,17 +161,34 @@ public:
                    std::to_string(ntohs(a.sin_port));
         o_.caps.address = address_;
         running_ = true;
-        threads_.emplace_back([this] { acceptLoop(); });
-        threads_.emplace_back([this] { loop(); });
-        threads_.emplace_back([this] { work(); });
-        threads_.emplace_back([this] { auditLoop(); });  // every node: one may become the master (failover)
+        threads_.emplace_back([this] {
+            swarmThread();
+            acceptLoop();
+        });
+        threads_.emplace_back([this] {
+            swarmThread(true);
+            loop();
+        });
+        // The work and audit threads hold the node's lock now and then, and hand the rendering to the renderer's own.
+        threads_.emplace_back([this] {
+            swarmThread();
+            work();
+        });
+        threads_.emplace_back([this] {  // every node: one may become the master (failover)
+            swarmThread();
+            auditLoop();
+        });
         if (o_.master) {
             std::lock_guard<std::mutex> g(m_);
             pool_.addNode(hash(), o_.ramBytes, o_.vramBytes);
         } else {
             // Given a master: it may not listen yet (it reads the scene first) or may go and come back: tried until it
             // answers. Not given one (a headless node): it waits to be found.
-            if (!o_.masterAddress.empty()) threads_.emplace_back([this] { reachMaster(); });
+            if (!o_.masterAddress.empty())
+                threads_.emplace_back([this] {
+                    swarmThread();
+                    reachMaster();
+                });
         }
     }
     // Stops everything (a node leaving, or one that fails in a test: its peers then find it silent).
@@ -209,7 +234,7 @@ public:
         std::vector<Node> nodes;
         if (o_.masterRenders) nodes.push_back(Node{hash(), o_.caps.rate, 0, false});
         for (const Member* mm : members_.working())
-            if ((o_.readyAtJoin || ready_.count(mm->hash)) && !paused_nodes_.count(mm->hash))
+            if ((o_.readyAtJoin || isReady(mm->hash)) && !paused_nodes_.count(mm->hash))
                 nodes.push_back(Node{mm->hash, mm->caps.rate, std::max(0.0, mm->rtt), false});
         plan_ = std::make_unique<Plan>(Plan::make(shape, nodes, importance));
         ledger_ = std::make_unique<Ledger>(*plan_);
@@ -285,6 +310,7 @@ public:
     void dial(const std::string& address) {
         std::lock_guard<std::mutex> g(dialsMutex_);
         dials_.emplace_back([this, address] {
+            swarmThread();
             if (running_) connectTo(address, false);
         });
     }
@@ -305,6 +331,11 @@ public:
         std::lock_guard<std::mutex> g(m_);
         return o_.master;
     }
+    // Whether its master refused it (quarantined it and said so).
+    bool refused() {
+        std::lock_guard<std::mutex> g(m_);
+        return refused_;
+    }
     Hash masterOf() {
         std::lock_guard<std::mutex> g(m_);
         return o_.master ? hash() : masterHash_;
@@ -322,6 +353,7 @@ public:
     void publishManifest(const Bytes& manifest) {
         std::lock_guard<std::mutex> g(m_);
         manifest_ = manifest;
+        manifestHash_ = sha256(manifest);  // the nodes ready for the last one are not for this one until they say
         Writer w;
         w.bytes(manifest_);
         broadcast(Type(TypeManifest), w.b);
@@ -352,13 +384,27 @@ public:
     size_t ready() {
         std::lock_guard<std::mutex> g(m_);
         size_t n = 0;
-        for (const Member* mm : members_.working()) n += ready_.count(mm->hash);
+        for (const Member* mm : members_.working()) n += isReady(mm->hash);
         return n;
     }
     // A node: its scene is made; it may be given cells.
     void markReady() {
         std::lock_guard<std::mutex> g(m_);
-        sendTo(masterHash_, uint16_t(TypeReady), {});
+        Writer w;
+        w.hash(sha256(manifest_));
+        sendTo(masterHash_, uint16_t(TypeReady), w.b);
+    }
+    // A node: the scene of this manifest is made here (one that came after it is not).
+    void markReady(const Hash& manifest) {
+        std::lock_guard<std::mutex> g(m_);
+        Writer w;
+        w.hash(manifest);
+        sendTo(masterHash_, uint16_t(TypeReady), w.b);
+    }
+    // What status says of the job (its name, its frame), as it changes.
+    void setJob(const std::string& job) {
+        std::lock_guard<std::mutex> g(m_);
+        o_.job = job;
     }
     // A node: the pieces asked for, each fetched from a node the pool placed it on (spread over them, the master's
     // source last), again from another every two seconds until it lands. False: not all within the time.
@@ -413,6 +459,7 @@ private:
         std::deque<std::pair<Bytes, bool>> out;
         std::thread reader, writer;
         std::atomic<bool> open{true};
+        std::atomic<bool> closing{false};  // closed once what is queued has gone (a refused machine told why first)
         std::atomic<double> lastBytes{0};  // when the reader last took bytes from the peer (its clock: nowSeconds)
         // Encryption: this side's one-time key (until the keys are made), the sending key (under send) and the
         // receiving key (under keyM: the reader waits on it for a sealed frame that comes before the loop has made it).
@@ -422,6 +469,13 @@ private:
         std::mutex keyM;
         std::condition_variable keyCv;
         std::unique_ptr<Seal> rx;
+        void closeAfterSent() {
+            {
+                std::lock_guard<std::mutex> g(send);
+                closing = true;
+            }
+            sendCv.notify_all();
+        }
         void close() {
             if (open.exchange(false)) {
                 shutdown(s, SD_BOTH);
@@ -440,8 +494,15 @@ private:
                 Seal* key = nullptr;
                 {
                     std::unique_lock<std::mutex> g(send);
-                    sendCv.wait(g, [&] { return !out.empty() || !open; });
+                    sendCv.wait(g, [&] { return !out.empty() || !open || closing; });
                     if (!open) return;
+                    if (out.empty()) {
+                        // Its sending side alone shut: what was sent is read (closing both, the peer's next bytes
+                        // would reset the connection and lose it); the peer closes once it has read it, and the
+                        // reader then sees the end.
+                        shutdown(s, SD_SEND);
+                        return;
+                    }
                     frame = std::move(out.front().first);
                     sealed = out.front().second;
                     out.pop_front();
@@ -510,8 +571,14 @@ private:
             c->close();
             return c;
         }
-        c->reader = std::thread([this, c] { read(c); });
-        c->writer = std::thread([c] { c->write(); });
+        c->reader = std::thread([this, c] {
+            swarmThread();
+            read(c);
+        });
+        c->writer = std::thread([c] {
+            swarmThread();
+            c->write();
+        });
         conns_.push_back(c);
         return c;
     }
@@ -805,9 +872,21 @@ private:
             frameDone_ = true;
             holder_.reset();
             break;
-        case uint16_t(Type::Quarantine):
-            members_.quarantine(r.hash());
+        case uint16_t(Type::Quarantine): {
+            const Hash who = r.hash();
+            if (r.bad) break;
+            if (who != hash()) {
+                members_.quarantine(who);
+            } else if (!o_.master && m.sender == masterHash_ && !refused_) {
+                // Refused by its master (an audit failed): no more work, and it never takes over.
+                refused_ = true;
+                holder_.reset();
+                succession_.clear();
+                log("refused by the master " + shortHex(m.sender) + " (quarantined): this machine takes no more work");
+                if (c) c->close();  // the master sends nothing more on it
+            }
             break;
+        }
         case TypePieceMoves: {
             const uint32_t n = r.u32();
             for (uint32_t i = 0; i < n && !r.bad; ++i) {
@@ -909,8 +988,9 @@ private:
             break;
         case TypeReady:
             if (o_.master) {
-                ready_.insert(m.sender);
-                log("ready " + shortHex(m.sender));
+                const Hash forManifest = r.hash();
+                ready_[m.sender] = r.bad ? manifestHash_ : forManifest;
+                if (isReady(m.sender)) log("ready " + shortHex(m.sender));
             }
             break;
         default:
@@ -1307,7 +1387,7 @@ private:
     // ---- frames
     void writePlan(Writer& w, const Plan& p) {
         w.u32(p.shape.width), w.u32(p.shape.height), w.u32(p.shape.cellSize), w.u32(p.shape.spp), w.u32(p.shape.chunkSamples);
-        w.f32(p.shape.targetError), w.u32(p.shape.minSamples);
+        w.f32(p.shape.targetError), w.u32(p.shape.minSamples), w.u32(p.shape.frame);
         w.u32(uint32_t(p.nodes.size()));
         for (const auto& n : p.nodes) w.hash(n.hash), w.f64(n.rate), w.f64(n.rtt), w.u8(n.fast);
         w.array(p.owner);
@@ -1317,7 +1397,7 @@ private:
     }
     bool readPlan(Reader& r, Plan& p) {
         p.shape.width = r.u32(), p.shape.height = r.u32(), p.shape.cellSize = r.u32(), p.shape.spp = r.u32(), p.shape.chunkSamples = r.u32();
-        p.shape.targetError = r.f32(), p.shape.minSamples = r.u32();
+        p.shape.targetError = r.f32(), p.shape.minSamples = r.u32(), p.shape.frame = r.u32();
         const uint32_t n = r.u32();
         for (uint32_t i = 0; i < n && !r.bad; ++i) {
             Node x;
@@ -1393,17 +1473,9 @@ private:
                     continue;
                 }
                 const double seconds = nowSeconds() - began;
+                f.frame = plan.shape.frame;  // the frame it was given for, whatever frame the swarm is on when it lands
                 Writer w;
-                w.u32(chunk->cell), w.u32(chunk->index);
-                for (int k = 0; k < 4; ++k) w.u32(f.rect[k]);
-                w.u32(f.first), w.u32(f.count);
-                w.array(f.sums);
-                w.array(f.counts);
-                w.f64(seconds);
-                w.array(f.odd);
-                w.array(f.aovs);
-                w.array(f.aovDepths);
-                w.bytes(f.crypto);
+                writeFilm(w, *chunk, f, seconds);
                 g.lock();
                 // To the master as it is now (one may have taken over while the film was rendering).
                 sendTo(o_.master ? hash() : masterHash_, Type::Contribution, w.b);
@@ -1469,6 +1541,7 @@ private:
     }
     // Master: a film. Audited, then added once.
     static void writeFilm(Writer& w, const Chunk& c, const Film& f, double seconds) {
+        w.u32(f.frame);
         w.u32(c.cell), w.u32(c.index);
         for (int k = 0; k < 4; ++k) w.u32(f.rect[k]);
         w.u32(f.first), w.u32(f.count);
@@ -1481,6 +1554,7 @@ private:
         w.bytes(f.crypto);
     }
     static bool readFilm(Reader& r, Chunk& c, Film& f, double& seconds) {
+        f.frame = r.u32();
         c.cell = r.u32(), c.index = r.u32();
         for (int k = 0; k < 4; ++k) f.rect[k] = r.u32();
         f.first = r.u32(), f.count = r.u32();
@@ -1499,6 +1573,7 @@ private:
         Film f;
         double seconds = 0;
         if (!readFilm(r, c, f, seconds)) return;
+        if (f.frame != plan_->shape.frame) return;  // a frame before's, late
         // The node's rate, measured: the next frame's plan uses it.
         if (seconds > 0 && from != hash()) members_.rate(from, double(f.width()) * f.height() * f.count / seconds);
         if (seconds > 0 && from == hash()) o_.caps.rate = o_.caps.rate > 0 ? 0.7 * o_.caps.rate + 0.3 * double(f.width()) * f.height() * f.count / seconds
@@ -1556,8 +1631,13 @@ private:
             Writer w;
             w.hash(from);
             broadcast(Type::Quarantine, w.b);
+            // The machine itself told, then let go: one that only saw its connection close would take its master for
+            // gone, and a deputy would take over.
             for (auto& cc : conns_)
-                if (cc->peer == from) cc->close();
+                if (cc->peer == from) {
+                    sendOn(cc, uint16_t(Type::Quarantine), w.b);
+                    cc->closeAfterSent();
+                }
             lose(from, "quarantined");
             return;
         }
@@ -1737,7 +1817,7 @@ private:
         Chunk c;
         Film f;
         double seconds = 0;
-        if (!readFilm(r, c, f, seconds)) return;
+        if (!readFilm(r, c, f, seconds) || f.frame != plan_->shape.frame) return;
         makeReplica();
         if (!replicaLedger_->arrived(c)) return;
         addFilm(replicaFilm_, replicaCounts_, f, &replicaOdd_);
@@ -1766,6 +1846,7 @@ private:
     // A node: its master gone. The first successor of the signed list still here takes over: this node, or one it
     // waits to hear from (its takeover is checked as it comes).
     void masterGone(double now) {
+        if (refused_) return;
         if (o_.master || succession_.empty() || !plan_ || frameDone_) return;
         for (const Hash& h : succession_) {
             if (h == hash()) {
@@ -1989,7 +2070,13 @@ private:
     std::map<Hash, std::vector<Hash>> holders_;  // where the pool placed each piece (PieceMoves)
     std::map<Hash, std::pair<double, size_t>> placed_;  // pieces placed here not landed yet: when last asked, how often
     Bytes manifest_;
-    std::set<Hash> ready_;
+    bool refused_ = false;  // quarantined by its master: told so (Type::Quarantine with its own hash)
+    Hash manifestHash_{};
+    std::map<Hash, Hash> ready_;  // a node: the manifest it said it is ready for
+    bool isReady(const Hash& h) const {
+        const auto it = ready_.find(h);
+        return it != ready_.end() && (manifest_.empty() || it->second == manifestHash_);
+    }
     std::map<Hash, Piece> sourcePieces_;
 };
 

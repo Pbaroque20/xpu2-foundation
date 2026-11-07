@@ -6,6 +6,7 @@
 #include "rhizome_node.h"
 #include "rhizome_discovery.h"
 #include "rhizome_importance.h"
+#include "rhizome_jobs.h"
 #include <future>
 #include <cstdio>
 #include <filesystem>
@@ -34,9 +35,12 @@ static void pixelSum(uint32_t x, uint32_t y, uint32_t first, uint32_t count, flo
     for (uint32_t s = first; s < first + count; ++s)
         for (int c = 0; c < 4; ++c) sum[c] += sampleValue(x, y, s, c);
 }
+// The frames checks: the scene's value as the frame changes it, added to every sample (0 elsewhere).
+static std::atomic<float> sceneFrame{0};
 // A node's renderer at a rate (samples a second; the stand-in sleeps to keep it), and a bias for a cheat.
 static CellRenderer renderer(double rate, float bias = 0) {
     return [rate, bias](const uint32_t r[4], uint32_t first, uint32_t count) {
+        const float frame = sceneFrame.load();
         Film f;
         for (int k = 0; k < 4; ++k) f.rect[k] = r[k];
         f.first = first, f.count = count;
@@ -49,6 +53,7 @@ static CellRenderer renderer(double rate, float bias = 0) {
             for (uint32_t x = r[0]; x < r[2]; ++x, ++i) {
                 pixelSum(x, y, first, count, &f.sums[i * 4]);
                 f.sums[i * 4] += bias * count;
+                f.sums[i * 4 + 1] += frame * count;
                 for (uint32_t s = first | 1u; s < first + count; s += 2)
                     for (int c = 0; c < 4; ++c) f.odd[i * 4 + c] += sampleValue(x, y, s, c);
             }
@@ -506,6 +511,11 @@ static void swarms() {
         const bool done = sw.master->waitFrame(60);
         check(sw.master->quarantined(cheat), "a node sending a wrong film is quarantined");
         check(done && exact(*sw.master, s), "and the picture is the honest one");
+        // Told it is refused, it never takes the master for gone (a deputy cut off took over from a live master).
+        for (int k = 0; k < 100 && !sw.workers[1]->refused(); ++k) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        check(sw.workers[1]->refused(), "the quarantined node is told so");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // past goneAfter
+        check(!sw.workers[1]->isMaster(), "and does not take over");
     }
     {
         // A node without the rhizome key is not let in.
@@ -853,8 +863,138 @@ static void failover(bool early) {
     for (auto& w : sw.workers) w->stop();
 }
 
+// Jobs (plan 13): frame ranges, a frame's files by their slots, a picture's name a frame, job files and the queue.
+static void jobs() {
+    check(parseFrames("1-5") == std::vector<int>{1, 2, 3, 4, 5}, "frames 1-5");
+    check(parseFrames("1-9:4") == std::vector<int>{1, 5, 9}, "frames 1-9:4, every fourth");
+    check(parseFrames("3, 7,10-12") == std::vector<int>{3, 7, 10, 11, 12}, "a list of frames and ranges");
+    check(parseFrames("-2-1") == std::vector<int>{-2, -1, 0, 1} && parseFrames("").empty(), "negative frames; none");
+    bool threw = false;
+    try {
+        parseFrames("9-1");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    check(threw, "a range that goes down is refused");
+    check(framePath("C:/shot/shot.####.rdla", 12) == "C:/shot/shot.0012.rdla", "#### is the frame, padded");
+    check(framePath("shot.#.rdla", 120) == "shot.120.rdla" && framePath("shot.%04d.rdla", 7) == "shot.0007.rdla" &&
+              framePath("shot.%d.rdla", 7) == "shot.7.rdla",
+          "# and printf slots");
+    check(framePath("C:/take#2/shot.rdla", 5) == "C:/take#2/shot.rdla", "a # in a folder is not a slot");
+    check(frameOutput("out/beauty.pfm", 3, true) == "out/beauty.0003.pfm" && frameOutput("out/beauty.pfm", 3, false) == "out/beauty.pfm" &&
+              frameOutput("out/b.####.exr", 3, false) == "out/b.0003.exr",
+          "a picture a frame: its slot, else .NNNN for more than one frame");
+    Job j;
+    j.name = "hydra spin";
+    j.scenes = {"C:/s/hydra.rdla", "C:/s/hydra.rdlb"};
+    j.deltas = {"C:/s/hydra.####.delta.rdla"};
+    j.frames = "1-24:2";
+    j.out = "C:/out/hydra.####.pfm";
+    const Job back = readJob(writeJob(j));
+    check(back.name == j.name && back.scenes == j.scenes && back.deltas == j.deltas && back.frames == j.frames && back.out == j.out,
+          "a job file reads back as written");
+    check(back.scenesFor(5) == j.scenes && back.deltasFor(5) == std::vector<std::string>{"C:/s/hydra.0005.delta.rdla"} &&
+              back.frameList().size() == 12,
+          "a frame's scene and delta files");
+    Job bad = j;
+    bad.deltas = {"C:/s/no-slot.rdla"};
+    threw = false;
+    try {
+        bad.check();
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    check(threw, "a delta without a slot is refused");
+    // The queue: jobs taken in the order they came, finished into done\ and failed\.
+    namespace fs = std::filesystem;
+    const fs::path q = fs::temp_directory_path() / ("rhizome-queue-" + std::to_string(GetCurrentProcessId()));
+    std::error_code e;
+    fs::remove_all(q, e);
+    Job one = j, two = j;
+    one.name = "one", two.name = "two";
+    queue::submit(q, one);
+    queue::submit(q, two);
+    check(queue::waiting(q).size() == 2, "two jobs queued");
+    Job taken;
+    const fs::path r1 = queue::take(q, taken);
+    check(!r1.empty() && taken.name == "one" && fs::exists(q / "running" / r1.filename()) && queue::waiting(q).size() == 1,
+          "the first job taken, moved to running");
+    queue::finish(r1, q, true, "12 frames in 40 s");
+    Job taken2;
+    const fs::path r2 = queue::take(q, taken2);
+    queue::finish(r2, q, false, "the scene did not load");
+    Job none;
+    check(taken2.name == "two" && queue::take(q, none).empty(), "then the second; then none");
+    std::ifstream done(q / "done" / r1.filename());
+    const std::string doneText((std::istreambuf_iterator<char>(done)), std::istreambuf_iterator<char>());
+    check(doneText.find("# done: 12 frames in 40 s") != std::string::npos && fs::exists(q / "failed" / r2.filename()),
+          "finished jobs moved to done and failed, with what came of them");
+    done.close();
+    fs::remove_all(q, e);
+}
+
+// Frames one after another on one swarm (plan 13): each frame's picture its own, a film of the frame before that lands
+// late left out; a node ready for one manifest is not ready for the next until it says so.
+static void frames() {
+    std::atomic<int> answering{1};
+    struct Worker {
+        RhizomeNode* node = nullptr;
+    };
+    std::vector<std::shared_ptr<Worker>> ws;
+    Swarm sw;
+    NodeOptions mo = options("studio rhizome key", true, 4e6);
+    mo.readyAtJoin = false;
+    sw.master = std::make_unique<RhizomeNode>(mo);
+    sw.master->start();
+    for (int k = 0; k < 3; ++k) {
+        auto w = std::make_shared<Worker>();
+        // One slow node: its chunks are still rendering as a frame ends, their films landing in the next.
+        NodeOptions o = options("studio rhizome key", false, k == 2 ? 2e5 : 4e6);
+        o.masterAddress = sw.master->address();
+        o.readyAtJoin = false;
+        o.onManifest = [w, &answering](const Bytes& m) {
+            if (answering && w->node) w->node->markReady(sha256(m));
+        };
+        sw.workers.push_back(std::make_unique<RhizomeNode>(o));
+        w->node = sw.workers.back().get();
+        ws.push_back(w);
+        sw.workers.back()->start();
+    }
+    for (int k = 0; k < 200 && sw.master->joined() < 3; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    sw.master->publishManifest(Bytes{'f', '1'});
+    check(until([&] { return sw.master->ready() == 3; }), "three nodes ready for the first frame");
+    answering = 0;
+    sw.master->publishManifest(Bytes{'f', '2'});
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    check(sw.master->ready() == 0, "none ready for the next frame's manifest until they say so");
+    answering = 1;
+    sw.master->publishManifest(Bytes{'f', '3'});
+    check(until([&] { return sw.master->ready() == 3; }), "then all three");
+    FrameShape s = shape();
+    bool each = true;
+    for (U32 f = 1; f <= 3; ++f) {
+        s.frame = f;
+        sceneFrame = float(f);
+        sw.master->beginFrame(s, importance(s));
+        const bool done = sw.master->waitFrame(60);
+        const auto film = sw.master->film();
+        const auto counts = sw.master->counts();
+        bool ok = done;
+        for (size_t i = 0; ok && i < counts.size(); ++i) {
+            const U32 x = U32(i % s.width), y = U32(i / s.width);
+            float ref[4];
+            pixelSum(x, y, 0, s.spp, ref);
+            ok = counts[i] == s.spp && std::fabs(film[i * 4 + 1] - (ref[1] + float(f) * s.spp)) < 1e-3f * (ref[1] + float(f) * s.spp);
+        }
+        each = each && ok;
+        check(ok, "frame " + std::to_string(f) + ": its own picture, every sample once, none of the frame before's");
+    }
+    sceneFrame = 0;
+    check(each, "three frames in a row on one swarm");
+}
+
 int main() {
-    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, scene, approvals,
+    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, jobs, frames, scene, approvals,
     // discovery, failover).
     const char* only = std::getenv("RHIZOME_TEST_ONLY");
     auto run = [&](const char* name, const std::function<void()>& f) {
@@ -872,6 +1012,8 @@ int main() {
     run("swarms", swarms);
     run("adaptive", adaptive);
     run("workstations", workstations);
+    run("jobs", jobs);
+    run("frames", frames);
     run("scene", [] {
         sceneThroughSwarm(false);
         sceneThroughSwarm(true);
