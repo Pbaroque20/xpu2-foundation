@@ -9,6 +9,7 @@
 //                                [--wait s] [--approve] [--trust-first] [--trust <hash> ...] [--cell px] [--chunk n]
 //                                [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]
 //                                [--frames 1-24] [--delta <frame.####.rdla> ...] [--queue folder [--queue-watch]]
+//                                [--checkpoint s] [--fresh]
 //   moonray_xpu2 rhizome submit  --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24] [--delta ...] [--name n]
 //   moonray_xpu2 rhizome id      [--folder f]
 //   moonray_xpu2 rhizome trust   <approver hash> [--folder f]
@@ -46,6 +47,9 @@ struct RhizomeArgs {
     std::vector<std::string> deltas;
     std::string frames, queue, name;
     bool queueWatch = false;
+    // Checkpoints (plan 14): every so many seconds (0: none), and whether a job's checkpoint is left unused.
+    double checkpointSeconds = 60;
+    bool fresh = false;
     unsigned nodes = 0, threads = 0, cell = 256, chunk = 16;
     // A workstation: renders only once no one has used it for whenIdle seconds (0: always), within hours [from, to) of
     // the day (to below from: across midnight; -1: any hour); in use, busyThreads threads instead of stepping back.
@@ -83,7 +87,11 @@ inline const char* usage(Verb v) {
                "  each frame's changes read on top of the frame before, the scene kept on every machine between frames.\n"
                "  -out beauty.####.pfm (without #, .0001 and so on is added for more than one frame); the scene's outputs\n"
                "  likewise, unless their names already carry the frame. --queue folder: then the jobs in that folder\n"
-               "  (moonray_xpu2 rhizome submit), one after another; --queue-watch: wait for more when it is empty.";
+               "  (moonray_xpu2 rhizome submit), one after another; --queue-watch: wait for more when it is empty.\n"
+               "  Checkpoints: the job's frames done and the frame under way are saved in the master's folder every 60 s\n"
+               "  (--checkpoint s; 0: never) and after each frame; started again on the same job (every machine stopped,\n"
+               "  the queue's too), the master takes it up where it was, and skips a job it finished; a job whose scene or\n"
+               "  delta files were written again since begins anew. --fresh: begin it anew anyway.";
     case Verb::Submit:
         return "moonray_xpu2 rhizome submit --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24]\n"
                "    [--delta <frame.####.rdla> ...] [--name n]\n"
@@ -159,6 +167,8 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--queue") a.queue = next();
         else if (k == "--queue-watch") a.queueWatch = true;
         else if (k == "--name") a.name = next();
+        else if (k == "--checkpoint") a.checkpointSeconds = std::stod(next());
+        else if (k == "--fresh") a.fresh = true;
         else if (!k.empty() && k[0] != '-' && a.subject.empty() &&
                  (a.verb == Verb::Trust || a.verb == Verb::Approve || a.verb == Verb::Revoke)) a.subject = k;
         else throw std::runtime_error("unknown argument " + k + "\n" + usage(a.verb));
@@ -774,6 +784,86 @@ inline JobManifest readManifest(const rz::Bytes& b) {
     if (r.bad) throw std::runtime_error("the master's manifest does not read");
     return m;
 }
+// A job's checkpoint (plan 14): which job (the XPU2 build and the job, hashed), its frames done, and the frame under way
+// so far: its number, its manifest's hash (the scene's files and changes as they were: another scene's partial frame
+// is not used) and the swarm's state of it (RhizomeNode::checkpoint). Written whole, then named.
+struct JobCheckpoint {
+    rz::Hash job{};
+    rz::Hash files{};       // the job's scene and delta files as they were (each one's path, size and time)
+    bool finished = false;  // every frame done: the same job again is skipped
+    std::vector<int> done;
+    bool partial = false;
+    int frame = 0;
+    rz::Hash manifest{};
+    rz::Bytes state;
+};
+constexpr uint32_t CheckpointMagic = 0x324A5A52u;  // "RZJ2"
+// The job's files as they stand: every frame's scene and delta files, each one's path, size and last write. A file
+// written again changes it (the files those name, textures and the like, are not looked at).
+inline rz::Hash jobFiles(const rz::Job& job) {
+    std::string all;
+    auto add = [&](const std::string& path) {
+        std::error_code e;
+        const fs::path f = fs::u8path(path);
+        const auto size = fs::file_size(f, e);
+        const auto when = fs::last_write_time(f, e).time_since_epoch().count();
+        all += path + "|" + std::to_string(e ? 0 : size) + "|" + std::to_string(e ? 0 : (long long)when) + "\n";
+    };
+    const std::vector<int> frames = job.frameList();
+    if (frames.empty())
+        for (const auto& s : job.scenes) add(s);
+    for (int f : frames) {
+        for (const auto& s : job.scenesFor(f)) add(s);
+        for (const auto& d : job.deltasFor(f)) add(d);
+    }
+    return rz::sha256(rz::Bytes(all.begin(), all.end()));
+}
+inline void writeCheckpoint(const fs::path& path, const JobCheckpoint& c) {
+    rz::Writer w;
+    w.u32(CheckpointMagic);
+    w.hash(c.job);
+    w.hash(c.files);
+    w.u8(c.finished);
+    w.u32(uint32_t(c.done.size()));
+    for (int f : c.done) w.u32(uint32_t(f));
+    w.u8(c.partial);
+    w.u32(uint32_t(c.frame));
+    w.hash(c.manifest);
+    w.bytes(c.state);
+    std::error_code e;
+    fs::create_directories(path.parent_path(), e);
+    const fs::path part = path.u8string() + ".part";
+    {
+        std::ofstream out(part, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(w.b.data()), std::streamsize(w.b.size()));
+        if (!out) {
+            std::printf("MoonRay XPU2 Rhizome: the checkpoint could not be written: %s\n", part.u8string().c_str());
+            return;
+        }
+    }
+    fs::rename(part, path, e);
+    if (e) std::printf("MoonRay XPU2 Rhizome: the checkpoint could not be named %s: %s\n", path.u8string().c_str(), e.message().c_str());
+}
+inline bool readCheckpoint(const fs::path& path, JobCheckpoint& c) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    const rz::Bytes b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    rz::Reader r(b);
+    if (r.u32() != CheckpointMagic) return false;
+    c.job = r.hash();
+    c.files = r.hash();
+    c.finished = r.u8() != 0;
+    const uint32_t n = r.u32();
+    if (n > 10000000) return false;
+    c.done.clear();
+    for (uint32_t i = 0; i < n && !r.bad; ++i) c.done.push_back(int(r.u32()));
+    c.partial = r.u8() != 0;
+    c.frame = int(r.u32());
+    c.manifest = r.hash();
+    c.state = r.bytes();
+    return !r.bad;
+}
+
 // A scene's output file name for a frame of a job: its run of # filled; without one, in a job of more than one frame,
 // .NNNN added, unless the name already has the frame's number in it (the scene names its frames itself).
 inline std::string frameOutputName(const std::string& name, int frame, bool many) {
@@ -976,6 +1066,9 @@ inline bool portFree(const std::string& bind, uint16_t port) {
 
 inline int run(int argc, char** argv) {
     RhizomeArgs a = parseRhizome(argc, argv);
+    // This thread takes the node's lock too (checkpoints, status, the frame's start): above the renderer's, as the
+    // swarm's own (a thread of normal priority holding the lock while the cores render holds up the heartbeats).
+    rz::swarmThread();
     if (a.help || a.verb == Verb::Help) {
         std::printf("%s\n", usage(a.verb));
         return 0;
@@ -1124,13 +1217,55 @@ inline int run(int argc, char** argv) {
                     a.hoursFrom >= 0 ? (", from " + std::to_string(a.hoursFrom) + ":00 to " + std::to_string(a.hoursTo) + ":00").c_str() : "",
                     a.busyThreads ? (", on " + std::to_string(a.busyThreads) + " threads while in use").c_str() : "");
     }
-    // RHIZOME_TRACE=1: each line with the seconds since the start (who waited for whom).
+    // The node's log lines: queued (they are said under the node's lock) and written by a thread of their own, so a
+    // write that waits (the disk busy, a file being scanned) never holds up the heartbeats. RHIZOME_TRACE=1: each line
+    // with the seconds since the start (who waited for whom).
+    struct Logger {
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool stopping = false;
+        std::thread writer;
+        Logger() {
+            writer = std::thread([this] {
+                std::unique_lock<std::mutex> g(m);
+                for (;;) {
+                    cv.wait(g, [&] { return stopping || !lines.empty(); });
+                    std::deque<std::string> out;
+                    out.swap(lines);
+                    const bool last = stopping;
+                    g.unlock();
+                    for (const auto& s : out) std::fputs(s.c_str(), stdout);
+                    std::fflush(stdout);
+                    g.lock();
+                    if (last && lines.empty()) return;
+                }
+            });
+        }
+        ~Logger() {
+            {
+                std::lock_guard<std::mutex> g(m);
+                stopping = true;
+            }
+            cv.notify_all();
+            writer.join();
+        }
+        void say(std::string s) {
+            {
+                std::lock_guard<std::mutex> g(m);
+                lines.push_back(std::move(s));
+            }
+            cv.notify_all();
+        }
+    };
+    static Logger logger;
     o.log = [](const std::string& s) {
         static const bool timed = std::getenv("RHIZOME_TRACE") && std::getenv("RHIZOME_TRACE")[0] == '1';
         static const double began = rz::nowSeconds();
-        if (timed) std::printf("MoonRay XPU2 Rhizome: %9.3f %s\n", rz::nowSeconds() - began, s.c_str());
-        else std::printf("MoonRay XPU2 Rhizome: %s\n", s.c_str());
-        std::fflush(stdout);
+        char head[64];
+        if (timed) std::snprintf(head, sizeof head, "MoonRay XPU2 Rhizome: %9.3f ", rz::nowSeconds() - began);
+        else std::snprintf(head, sizeof head, "MoonRay XPU2 Rhizome: ");
+        logger.say(head + s + "\n");
     };
     rz::RhizomeNode node(o, std::move(identity));
     nodeRef = &node;
@@ -1252,7 +1387,10 @@ inline int run(int argc, char** argv) {
     uint32_t sequence = 0, staged = 0;
     bool firstFrame = true;
     // One frame of a job: the scene made (or its changes read), the nodes made ready, the frame rendered and written.
-    auto renderFrame = [&](const rz::Job& job, bool hasFrames, int frameNumber, size_t index, size_t total) {
+    // skip: a frame its checkpoint has done (its changes read, so the frames after it are right; nothing rendered).
+    auto renderFrame = [&](const rz::Job& job, bool hasFrames, int frameNumber, size_t index, size_t total, JobCheckpoint& ck,
+                           const fs::path& ckPath, bool skip) {
+        if (skip && job.deltas.empty()) return;  // a frame made from its own files: nothing to carry to the next
         const bool many = total > 1;
         const std::vector<std::string> scenes = hasFrames ? job.scenesFor(frameNumber) : job.scenes;
         const std::vector<std::string> deltas = hasFrames ? job.deltasFor(frameNumber) : std::vector<std::string>{};
@@ -1272,6 +1410,7 @@ inline int run(int argc, char** argv) {
             l->apply(deltas);
         }
         if (!deltas.empty()) heldDeltas.push_back(publishFiles(deltas));
+        if (skip) return;
         merge.init(*l);
         JobManifest jm;
         jm.job = job.name;
@@ -1284,7 +1423,9 @@ inline int run(int argc, char** argv) {
                                            : job.name;
         o.job = job.name;
         node.setJob(what);
-        node.publishManifest(writeManifest(jm));
+        const rz::Bytes manifest = writeManifest(jm);
+        const rz::Hash manifestHash = rz::sha256(manifest);
+        node.publishManifest(manifest);
         // The nodes: for the run's first frame, as many as asked (--nodes) or given (--node) ready, else every one found
         // ready and none new for three seconds; for the frames after, every one there ready for this frame; --wait
         // seconds at most. A node not ready in time sits this frame out.
@@ -1334,8 +1475,25 @@ inline int run(int argc, char** argv) {
         }
         std::printf("MoonRay XPU2 Rhizome: the indexer's probe in %.2f s: %zu of %u cells important\n", probeSeconds, above, shape.cells());
         const auto frameBegan = Clock::now();
-        node.beginFrame(shape, importance);
-        if (!node.waitFrame(24 * 3600.0)) throw std::runtime_error("the frame did not complete");
+        // The frame so far from the job's checkpoint, when it is this frame of the same scene.
+        const rz::Bytes* resume = nullptr;
+        if (ck.partial && ck.frame == frameNumber) {
+            if (ck.manifest == manifestHash) resume = &ck.state;
+            else std::printf("MoonRay XPU2 Rhizome: the scene changed since its checkpoint: the frame begun anew\n");
+        }
+        if (node.beginFrame(shape, importance, resume)) {
+            const auto [back, all] = node.chunksBack();
+            std::printf("MoonRay XPU2 Rhizome: the frame taken up from its checkpoint: %zu of %zu chunks done\n", back, all);
+        }
+        std::fflush(stdout);
+        // Waited for, its checkpoint written every --checkpoint seconds meanwhile.
+        for (;;) {
+            if (node.waitFrame(a.checkpointSeconds > 0 ? a.checkpointSeconds : 24 * 3600.0)) break;
+            if (a.checkpointSeconds <= 0) throw std::runtime_error("the frame did not complete");
+            ck.partial = true, ck.frame = frameNumber, ck.manifest = manifestHash;
+            ck.state = node.checkpoint();
+            writeCheckpoint(ckPath, ck);
+        }
         const double seconds = std::chrono::duration<double>(Clock::now() - frameBegan).count();
         const std::vector<double> film = node.film();
         const std::vector<uint32_t> counts = node.counts();
@@ -1360,6 +1518,9 @@ inline int run(int argc, char** argv) {
                         shape.cells(), node.cancelledChunks());
         std::printf("MoonRay XPU2 Rhizome: wrote %s\n", out.c_str());
         std::fflush(stdout);
+        ck.done.push_back(frameNumber);
+        ck.partial = false, ck.state.clear();
+        if (a.checkpointSeconds > 0) writeCheckpoint(ckPath, ck);
     };
     // A job: each of its frames. A job's scene is placed in the pool anew (its files may have been written again).
     auto renderJob = [&](const rz::Job& job) {
@@ -1371,7 +1532,41 @@ inline int run(int argc, char** argv) {
         const bool hasFrames = !frames.empty();
         const auto began = Clock::now();
         const size_t total = hasFrames ? frames.size() : 1;
-        for (size_t i = 0; i < total; ++i) renderFrame(job, hasFrames, hasFrames ? frames[i] : 0, i, total);
+        // Its checkpoint: the XPU2 build and the job, hashed, name it; one there (every machine stopped before) is
+        // taken up, unless --fresh.
+        rz::Bytes key(o.build.begin(), o.build.end());
+        const std::string text = rz::writeJob(job);
+        key.insert(key.end(), text.begin(), text.end());
+        JobCheckpoint ck;
+        ck.job = rz::sha256(key);
+        ck.files = jobFiles(job);
+        const fs::path ckPath = folder / "checkpoints" / (rz::hex(ck.job).substr(0, 16) + ".rzj");
+        {
+            JobCheckpoint was;
+            if (!a.fresh && readCheckpoint(ckPath, was) && was.job == ck.job) {
+                if (was.files != ck.files) {
+                    std::printf("MoonRay XPU2 Rhizome: job %s: its files changed since its checkpoint: begun anew\n", job.name.c_str());
+                } else if (was.finished) {
+                    std::printf("MoonRay XPU2 Rhizome: job %s was finished by an earlier run: skipped (--fresh renders it again)\n",
+                                job.name.c_str());
+                    std::fflush(stdout);
+                    return std::string("finished by an earlier run");
+                } else {
+                    ck = was;
+                    std::printf("MoonRay XPU2 Rhizome: job %s taken up from its checkpoint: %zu of %zu frames done%s\n", job.name.c_str(),
+                                ck.done.size(), total, ck.partial ? (", frame " + std::to_string(ck.frame) + " under way").c_str() : "");
+                }
+                std::fflush(stdout);
+            }
+        }
+        for (size_t i = 0; i < total; ++i) {
+            const int f = hasFrames ? frames[i] : 0;
+            const bool skip = std::find(ck.done.begin(), ck.done.end(), f) != ck.done.end();
+            renderFrame(job, hasFrames, f, i, total, ck, ckPath, skip);
+        }
+        // The job done: its checkpoint says so (the same job again is skipped while its files are as they were).
+        ck.finished = true, ck.partial = false, ck.state.clear();
+        if (a.checkpointSeconds > 0) writeCheckpoint(ckPath, ck);
         const double s = std::chrono::duration<double>(Clock::now() - began).count();
         std::printf("MoonRay XPU2 Rhizome: job %s: %zu frame%s in %.1f s\n", job.name.c_str(), total, total == 1 ? "" : "s", s);
         std::fflush(stdout);
@@ -1380,6 +1575,16 @@ inline int run(int argc, char** argv) {
     for (const auto& job : given) renderJob(job);
     if (!queueFolder.empty()) {
         std::printf("MoonRay XPU2 Rhizome: the queue %s%s\n", queueFolder.u8string().c_str(), a.queueWatch ? ", watched for new jobs" : "");
+        // Jobs left running (the master stopped in them): back in the queue, in their order, their checkpoints kept.
+        for (const fs::path& was : rz::queue::waiting(queueFolder / "running")) {
+            try {
+                rz::queue::move(was, queueFolder);
+                std::printf("MoonRay XPU2 Rhizome: job %s was under way when the master stopped: back in the queue\n",
+                            was.stem().u8string().c_str());
+            } catch (const std::exception& e) {
+                std::printf("MoonRay XPU2 Rhizome: %s\n", e.what());
+            }
+        }
         std::fflush(stdout);
         for (;;) {
             rz::Job job;

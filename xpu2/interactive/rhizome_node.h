@@ -228,8 +228,40 @@ public:
         std::lock_guard<std::mutex> g(m_);
         return members_.working().size();
     }
-    // Master: a frame with the members there now. importance: a value a rhizome cell (empty: flat).
-    void beginFrame(const FrameShape& shape, const std::vector<float>& importance) {
+    // Master: the frame so far, to take it up again after every machine has stopped (plan 14): its shape, picture,
+    // counts and odd sums, the chunks back (cancelled ones too), and the caller's merge (exportMerge). Empty without
+    // a frame.
+    Bytes checkpoint() {
+        std::lock_guard<std::mutex> g(m_);
+        Writer w;
+        if (!o_.master || !plan_ || !ledger_) return w.b;
+        const FrameShape& s = plan_->shape;
+        w.u32(0x31435A52u);  // "RZC1"
+        w.u32(s.width), w.u32(s.height), w.u32(s.cellSize), w.u32(s.spp), w.u32(s.chunkSamples);
+        w.f32(s.targetError), w.u32(s.minSamples);
+        w.array(film_);
+        w.array(counts_);
+        w.array(odd_);
+        std::vector<U32> back;
+        const U32 per = s.chunksPerCell();
+        for (U32 c = 0; c < s.cells(); ++c)
+            for (U32 k = 0; k < per; ++k)
+                if (ledger_->returned(Chunk{c, k})) back.push_back(c * per + k);
+        w.array(back);
+        w.bytes(o_.exportMerge ? o_.exportMerge() : Bytes{});
+        return w.b;
+    }
+    // Master: the chunks of the frame back, and all of them.
+    std::pair<size_t, size_t> chunksBack() {
+        std::lock_guard<std::mutex> g(m_);
+        if (!plan_ || !ledger_) return {0, 0};
+        const size_t all = size_t(plan_->shape.cells()) * plan_->shape.chunksPerCell();
+        return {all - ledger_->outstanding(), all};
+    }
+    // Master: a frame with the members there now. importance: a value a rhizome cell (empty: flat). resume: a
+    // checkpoint of this frame (checkpoint()): its picture taken as it was, its chunks back given to no one; one of
+    // another shape is not used. Returns whether it was.
+    bool beginFrame(const FrameShape& shape, const std::vector<float>& importance, const Bytes* resume = nullptr) {
         std::lock_guard<std::mutex> g(m_);
         std::vector<Node> nodes;
         if (o_.masterRenders) nodes.push_back(Node{hash(), o_.caps.rate, 0, false});
@@ -237,10 +269,33 @@ public:
             if ((o_.readyAtJoin || isReady(mm->hash)) && !paused_nodes_.count(mm->hash))
                 nodes.push_back(Node{mm->hash, mm->caps.rate, std::max(0.0, mm->rtt), false});
         plan_ = std::make_unique<Plan>(Plan::make(shape, nodes, importance));
-        ledger_ = std::make_unique<Ledger>(*plan_);
         film_.assign(size_t(shape.width) * shape.height * 4, 0.0);
         odd_.assign(shape.adaptive() ? size_t(shape.width) * shape.height * 4 : 0, 0.0);
         counts_.assign(size_t(shape.width) * shape.height, 0);
+        bool resumed = false;
+        if (resume && !resume->empty()) {
+            Reader r(*resume);
+            bool same = r.u32() == 0x31435A52u;
+            same = same && r.u32() == shape.width && r.u32() == shape.height && r.u32() == shape.cellSize && r.u32() == shape.spp &&
+                   r.u32() == shape.chunkSamples;
+            same = same && r.f32() == shape.targetError && r.u32() == shape.minSamples;
+            if (same) {
+                auto film = r.array<double>();
+                auto counts = r.array<uint32_t>();
+                auto odd = r.array<double>();
+                auto back = r.array<U32>();
+                const Bytes merge = r.bytes();
+                if (!r.bad && film.size() == film_.size() && counts.size() == counts_.size() && odd.size() == odd_.size()) {
+                    film_ = std::move(film), counts_ = std::move(counts), odd_ = std::move(odd);
+                    std::sort(back.begin(), back.end());
+                    plan_->done = std::move(back);
+                    if (o_.importMerge) o_.importMerge(merge);
+                    resumed = true;
+                }
+            }
+            if (!resumed) log("a checkpoint of another frame's shape: the frame begun anew");
+        }
+        ledger_ = std::make_unique<Ledger>(*plan_);
         byNode_.assign(plan_->nodes.size(), 0);
         convergedCells_ = 0;
         if (shape.targetError > 0 && !shape.adaptive())
@@ -253,7 +308,16 @@ public:
         startPlan();
         frameId_ = nowSeconds() * 1e6;
         announceSuccession();
-        log("frame: " + std::to_string(shape.cells()) + " cells, " + std::to_string(plan_->nodes.size()) + " nodes");
+        log("frame: " + std::to_string(shape.cells()) + " cells, " + std::to_string(plan_->nodes.size()) + " nodes" +
+            (resumed ? ", " + std::to_string(plan_->done.size()) + " chunks from its checkpoint" : std::string()));
+        if (ledger_->complete()) {  // every chunk was back already
+            frameDone_ = true;
+            broadcast(Type::FrameDone, {});
+            holder_.reset();
+            doneCv_.notify_all();
+            log("frame complete");
+        }
+        return resumed;
     }
     // Master: waits for the picture (false: timed out).
     bool waitFrame(double seconds) {
@@ -726,10 +790,18 @@ private:
 
     // ---- the loop
     void loop() {
-        double nextBeat = 0, nextTrust = 0;
+        double nextBeat = 0, nextTrust = 0, lastTurn = nowSeconds();
         std::unique_lock<std::mutex> g(m_);
         while (running_) {
             cv_.wait_for(g, std::chrono::milliseconds(20), [&] { return !inbox_.empty() || !self_.empty() || !running_; });
+            // The loop held up (the node's lock kept by another thread, or the machine): the others may take this
+            // machine for gone meanwhile, so it is said.
+            if (const double turn = nowSeconds(); turn - lastTurn > 1.0) {
+                log("the heartbeat loop was held " + std::to_string(int((turn - lastTurn) * 1000)) + " ms");
+                lastTurn = turn;
+            } else {
+                lastTurn = turn;
+            }
             while (!self_.empty()) {
                 Bytes f = std::move(self_.front());
                 self_.pop_front();
@@ -869,6 +941,9 @@ private:
             contribution(m.sender, r);
             break;
         case uint16_t(Type::FrameDone):
+            // From its master alone: a master that a successor took for gone (it was silent) heard the successor's
+            // end of the frame and wrote a picture with chunks missing.
+            if (o_.master || m.sender != masterHash_) break;
             frameDone_ = true;
             holder_.reset();
             break;
@@ -1394,6 +1469,7 @@ private:
         w.array(p.important);
         w.array(p.grantChunks);
         w.hash(hash());
+        w.array(p.done);
     }
     bool readPlan(Reader& r, Plan& p) {
         p.shape.width = r.u32(), p.shape.height = r.u32(), p.shape.cellSize = r.u32(), p.shape.spp = r.u32(), p.shape.chunkSamples = r.u32();
@@ -1408,6 +1484,7 @@ private:
         p.important = r.array<unsigned char>();
         p.grantChunks = r.array<U32>();
         masterHash_ = r.hash();
+        p.done = r.array<U32>();
         return !r.bad && p.owner.size() == p.shape.cells() && p.grantChunks.size() == p.nodes.size();
     }
     static void writeChunks(Writer& w, const std::vector<Chunk>& v) {

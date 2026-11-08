@@ -88,6 +88,13 @@ struct Plan {
     std::vector<unsigned char> important;
     std::vector<Node> nodes;
     std::vector<U32> grantChunks;   // a node's chunks a grant, at least one (far nodes take more at a time)
+    // Chunks already in the picture (a frame taken up again from its checkpoint, plan 14), as cell * chunksPerCell +
+    // index: no one is given them, the ledger has them back.
+    std::vector<U32> done;
+    bool isDone(U32 cell, U32 index) const {
+        const U32 id = cell * shape.chunksPerCell() + index;
+        return std::binary_search(done.begin(), done.end(), id);
+    }
 
     // Tiers by rate: a node is fast when its rate is at least fastShare of the fastest's. Then the important cells
     // (importance above the mean of the cells') go to the fast tier and the rest to the slow tier, each node's run of
@@ -190,6 +197,10 @@ public:
         for (U32 c = 0; c < plan.shape.cells(); ++c)
             for (U32 k = 0; k < per; ++k) holder_[Chunk{c, k}] = plan.owner[c];
         outstanding_ = holder_.size();
+        for (U32 id : plan.done) {
+            const Chunk c{id / per, id % per};
+            if (holder_.count(c) && returned_.insert(c).second) --outstanding_;
+        }
     }
     // A grant reported: the chunks are the thief's now.
     void granted(const std::vector<Chunk>& chunks, int to) {
@@ -273,7 +284,8 @@ public:
         const U32 per = plan.shape.chunksPerCell();
         for (U32 c = 0; c < plan.shape.cells(); ++c)
             if (plan.owner[c] == self)
-                for (U32 k = 0; k < per; ++k) held_[c].insert(k);
+                for (U32 k = 0; k < per; ++k)
+                    if (!plan.isDone(c, k)) held_[c].insert(k);
     }
     // Chunks given to this node (a grant, or a lost node's).
     void receive(const std::vector<Chunk>& chunks) {

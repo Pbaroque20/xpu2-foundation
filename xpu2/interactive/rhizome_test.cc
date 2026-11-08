@@ -8,6 +8,7 @@
 #include "rhizome_importance.h"
 #include "rhizome_jobs.h"
 #include <future>
+#include <tuple>
 #include <cstdio>
 #include <filesystem>
 
@@ -935,6 +936,59 @@ static void jobs() {
 
 // Frames one after another on one swarm (plan 13): each frame's picture its own, a film of the frame before that lands
 // late left out; a node ready for one manifest is not ready for the next until it says so.
+// Checkpoints (plan 14): a frame stopped part way and every machine gone; a new swarm (other machines) takes it up from
+// the master's checkpoint and renders only what was not back: the picture every sample once.
+static void checkpoints() {
+    const FrameShape s = shape();
+    Bytes ck;
+    size_t backThen = 0, all = 0;
+    {
+        Swarm sw = swarm({{4e5, 0}, {4e5, 0}}, 4e5);
+        sw.master->beginFrame(s, importance(s));
+        for (int k = 0; k < 400; ++k) {
+            std::tie(backThen, all) = sw.master->chunksBack();
+            if (backThen * 3 >= all) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        ck = sw.master->checkpoint();
+        std::tie(backThen, all) = sw.master->chunksBack();  // the checkpoint's (none more lands: taken under the lock)
+        check(!ck.empty() && backThen > 0 && backThen < all,
+              "a checkpoint part way: " + std::to_string(backThen) + " of " + std::to_string(all) + " chunks back");
+        sw.master->stop();
+        for (auto& w : sw.workers) w->stop();
+    }
+    {
+        Swarm sw = swarm({{4e6, 0}, {4e6, 0}, {2e6, 0}}, 4e6);
+        const bool resumed = sw.master->beginFrame(s, importance(s), &ck);
+        const bool done = sw.master->waitFrame(60);
+        uint64_t rendered = 0;
+        for (auto n : sw.master->chunksByNode()) rendered += n;
+        double worst = 0;
+        check(resumed && done && exact(*sw.master, s, &worst), "new machines take it up: every pixel its samples, each once");
+        const size_t fromCheckpoint = sw.master->plan()->done.size();
+        check(fromCheckpoint >= backThen && rendered + fromCheckpoint == all,
+              "only the chunks not back were rendered (" + std::to_string(rendered) + ", " + std::to_string(fromCheckpoint) +
+                  " from the checkpoint, of " + std::to_string(all) + ")");
+    }
+    {
+        // A checkpoint of another frame's shape is not used.
+        Swarm sw = swarm({{4e6, 0}}, 4e6);
+        FrameShape other = s;
+        other.spp = 32;
+        const bool resumed = sw.master->beginFrame(other, importance(other), &ck);
+        check(!resumed && sw.master->waitFrame(60), "a checkpoint of another shape is not used; the frame renders anew");
+    }
+    {
+        // A checkpoint with every chunk back: the frame completes at once.
+        Swarm sw = swarm({{4e6, 0}}, 4e6);
+        sw.master->beginFrame(s, importance(s));
+        sw.master->waitFrame(60);
+        const Bytes whole = sw.master->checkpoint();
+        sw.master->beginFrame(s, importance(s), &whole);
+        check(sw.master->waitFrame(1) && exact(*sw.master, s), "a checkpoint of a whole frame: complete at once, as it was");
+    }
+}
+
 static void frames() {
     std::atomic<int> answering{1};
     struct Worker {
@@ -994,7 +1048,7 @@ static void frames() {
 }
 
 int main() {
-    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, jobs, frames, scene, approvals,
+    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, jobs, frames, checkpoints, scene, approvals,
     // discovery, failover).
     const char* only = std::getenv("RHIZOME_TEST_ONLY");
     auto run = [&](const char* name, const std::function<void()>& f) {
@@ -1014,6 +1068,7 @@ int main() {
     run("workstations", workstations);
     run("jobs", jobs);
     run("frames", frames);
+    run("checkpoints", checkpoints);
     run("scene", [] {
         sceneThroughSwarm(false);
         sceneThroughSwarm(true);
