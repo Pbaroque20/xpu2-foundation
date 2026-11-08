@@ -567,6 +567,51 @@ static void workstations() {
     check(again && exact(*sw.master, s) && who2 >= 0 && by2[size_t(who2)] > 0, "back at work, it renders its share");
 }
 
+// Plan 15: each machine's GPU programs reach the others in its heartbeats, and its status shows them.
+static void shaderStates() {
+    Swarm sw;
+    NodeOptions mo = options("studio rhizome key", true, 4e6);
+    const std::string status = (std::filesystem::temp_directory_path() / ("rhizome-test-status-" + std::to_string(GetCurrentProcessId()) + ".json")).string();
+    mo.statusPath = status;
+    sw.master = std::make_unique<RhizomeNode>(mo);
+    sw.master->setShaders("compiled");
+    sw.master->start();
+    for (int k = 0; k < 2; ++k) {
+        NodeOptions o = options("studio rhizome key", false, 4e6);
+        o.masterAddress = sw.master->address();
+        sw.workers.push_back(std::make_unique<RhizomeNode>(o));
+        sw.workers.back()->setShaders(k == 0 ? "missing: Test Card" : "no graphics card");
+        sw.workers.back()->start();
+    }
+    for (int k = 0; k < 200 && sw.master->joined() < 2; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    check(sw.master->shadersOf(sw.workers[0]->hash()) == "missing: Test Card" && sw.master->shadersOf(sw.workers[1]->hash()) == "no graphics card",
+          "the master hears each node's GPU programs");
+    check(sw.workers[1]->shadersOf(sw.master->hash()) == "compiled", "a node hears the master's");
+    // A compile under way, then done: the change heard.
+    sw.workers[0]->setShaders("compiling: 3 of 9 tasks, 40 s");
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    check(sw.master->shadersOf(sw.workers[0]->hash()) == "compiling: 3 of 9 tasks, 40 s", "a compile's progress heard");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // a status written since
+    std::string j;
+    {
+        std::ifstream in(status, std::ios::binary);
+        j.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string txt = status.substr(0, status.size() - 4) + "txt";
+    std::string text;
+    {
+        std::ifstream in(txt, std::ios::binary);
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    check(j.find("\"gpuPrograms\": \"compiling: 3 of 9 tasks, 40 s\"") != std::string::npos && j.find("\"gpuPrograms\": \"no graphics card\"") != std::string::npos,
+          "status.json shows each machine's GPU programs");
+    check(text.find("GPU programs: compiled") != std::string::npos, "status.txt shows them");
+    std::error_code e;
+    std::filesystem::remove(status, e);
+    std::filesystem::remove(txt, e);
+}
+
 // Adaptive sampling across the swarm: the left half of the frame (flat) converges after its minimum samples and its
 // cells' chunks are cancelled on every node; the right half (noisy) takes every sample.
 static void adaptive() {
@@ -1048,7 +1093,7 @@ static void frames() {
 }
 
 int main() {
-    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, jobs, frames, checkpoints, scene, approvals,
+    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, shaders, jobs, frames, checkpoints, scene, approvals,
     // discovery, failover).
     const char* only = std::getenv("RHIZOME_TEST_ONLY");
     auto run = [&](const char* name, const std::function<void()>& f) {
@@ -1066,6 +1111,7 @@ int main() {
     run("swarms", swarms);
     run("adaptive", adaptive);
     run("workstations", workstations);
+    run("shaders", shaderStates);
     run("jobs", jobs);
     run("frames", frames);
     run("checkpoints", checkpoints);

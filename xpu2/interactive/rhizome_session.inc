@@ -4,12 +4,12 @@
 //
 //   moonray_xpu2 rhizome node    --key <k> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2] [-threads n]
 //                                [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]
-//                                [--when-idle s] [--hours from-to] [--busy-threads n]
+//                                [--when-idle s] [--hours from-to] [--busy-threads n] [--shaders ask|compile|skip]
 //   moonray_xpu2 rhizome master  -in <scene> [-in ...] -out <image.pfm> --key <k> [--nodes N] [--node host:port ...]
 //                                [--wait s] [--approve] [--trust-first] [--trust <hash> ...] [--cell px] [--chunk n]
 //                                [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]
 //                                [--frames 1-24] [--delta <frame.####.rdla> ...] [--queue folder [--queue-watch]]
-//                                [--checkpoint s] [--fresh]
+//                                [--checkpoint s] [--fresh] [--shaders ask|compile|skip]
 //   moonray_xpu2 rhizome submit  --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24] [--delta ...] [--name n]
 //   moonray_xpu2 rhizome id      [--folder f]
 //   moonray_xpu2 rhizome trust   <approver hash> [--folder f]
@@ -50,6 +50,8 @@ struct RhizomeArgs {
     // Checkpoints (plan 14): every so many seconds (0: none), and whether a job's checkpoint is left unused.
     double checkpointSeconds = 60;
     bool fresh = false;
+    // GPU programs not compiled here (plan 15): ask (on first start, the answer kept), compile, skip.
+    std::string shaders = "ask";
     unsigned nodes = 0, threads = 0, cell = 256, chunk = 16;
     // A workstation: renders only once no one has used it for whenIdle seconds (0: always), within hours [from, to) of
     // the day (to below from: across midnight; -1: any hour); in use, busyThreads threads instead of stepping back.
@@ -67,17 +69,22 @@ inline const char* usage(Verb v) {
     case Verb::Node:
         return "moonray_xpu2 rhizome node --key <rhizome key> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2]\n"
                "    [-threads n] [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]\n"
-               "    [--when-idle seconds] [--hours from-to] [--busy-threads n]\n"
+               "    [--when-idle seconds] [--hours from-to] [--busy-threads n] [--shaders ask|compile|skip]\n"
                "  A headless node: makes or reads its hash, listens and answers discovery, renders each job a master gives it\n"
                "  and waits for the next. --master: reach that master instead of waiting to be found. --trust: approvers this\n"
                "  node trusts (else it trusts the master that first endorses it). Port 47100 by default.\n"
                "  A workstation: --when-idle: render only once no one has touched the keyboard or mouse for that many seconds;\n"
                "  --hours 19-8: only in those hours (across midnight too); --busy-threads: while the machine is in use, render\n"
-               "  on that many threads instead of stepping back. Stepped back, its work goes to the other machines.";
+               "  on that many threads instead of stepping back. Stepped back, its work goes to the other machines.\n"
+               "  GPU programs: a machine whose cards have none compiled renders on its processor alone; on its first start it\n"
+               "  asks whether to compile them (--shaders ask; compile or skip decide it beforehand). The compile runs in the\n"
+               "  background (its lines in shaders-compile.txt in the folder), the cards rendering from the next job after;\n"
+               "  rhizome status shows each machine's GPU programs.";
     case Verb::Master:
         return "moonray_xpu2 rhizome master -in <scene> [-in ...] -out <image.pfm> --key <rhizome key> [--nodes N]\n"
                "    [--node host:port ...] [--wait s] [--approve] [--trust-first] [--trust <approver hash> ...] [--cell px]\n"
                "    [--chunk samples] [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]\n"
+               "    [--shaders ask|compile|skip]\n"
                "  Finds the nodes on its networks (and those given with --node), waits for N of them ready (or --wait seconds),\n"
                "  renders the frame with them, and writes the picture and the scene's outputs. --approve: only approved\n"
                "  machines join (the others wait, their hash printed with the command to approve them); --trust-first:\n"
@@ -91,7 +98,8 @@ inline const char* usage(Verb v) {
                "  Checkpoints: the job's frames done and the frame under way are saved in the master's folder every 60 s\n"
                "  (--checkpoint s; 0: never) and after each frame; started again on the same job (every machine stopped,\n"
                "  the queue's too), the master takes it up where it was, and skips a job it finished; a job whose scene or\n"
-               "  delta files were written again since begins anew. --fresh: begin it anew anyway.";
+               "  delta files were written again since begins anew. --fresh: begin it anew anyway.\n"
+               "  --shaders: as a node's (rhizome node --help).";
     case Verb::Submit:
         return "moonray_xpu2 rhizome submit --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24]\n"
                "    [--delta <frame.####.rdla> ...] [--name n]\n"
@@ -169,6 +177,11 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--name") a.name = next();
         else if (k == "--checkpoint") a.checkpointSeconds = std::stod(next());
         else if (k == "--fresh") a.fresh = true;
+        else if (k == "--shaders") {
+            a.shaders = next();
+            if (a.shaders != "ask" && a.shaders != "compile" && a.shaders != "skip")
+                throw std::runtime_error("--shaders takes ask, compile or skip");
+        }
         else if (!k.empty() && k[0] != '-' && a.subject.empty() &&
                  (a.verb == Verb::Trust || a.verb == Verb::Approve || a.verb == Verb::Revoke)) a.subject = k;
         else throw std::runtime_error("unknown argument " + k + "\n" + usage(a.verb));
@@ -1064,6 +1077,209 @@ inline bool portFree(const std::string& bind, uint16_t port) {
     return ok;
 }
 
+// Plan 15: the GPU programs on this machine. A machine whose cards have none compiled (moonray_xpu2 --compile-shaders,
+// about an hour the first time) renders on its processor alone; on its first start it is asked whether to compile them
+// (--shaders ask, the answer kept in its folder; no answer in 30 s: asked again the next start), --shaders compile and
+// skip decide it beforehand. The compile runs as a process of its own at low priority, its lines in the folder's
+// shaders-compile.txt, while the machine renders on its processor; its cards join from the next job. A start while
+// an earlier start's compile still runs (the file held by it) does not start another. Its state is said in the swarm's
+// heartbeats and shown in every machine's status.
+class ShaderWork {
+public:
+    ShaderWork(const RhizomeArgs& a, const fs::path& folder) : folder_(folder) {
+        if (a.mode == 0) {
+            state_ = "not used (the processor alone)";
+            return;
+        }
+        if (gpu::cardCount() == 0) {
+            state_ = "no graphics card";
+            return;
+        }
+        const auto missing = missingCards();
+        if (missing.empty()) {
+            state_ = "compiled";
+            return;
+        }
+        if (compileRunning()) {
+            say("the GPU programs are being compiled by an earlier start (" + log().u8string() + "): the CPU alone until they are");
+            compiling_ = true;
+            state_ = "compiling";
+            watch(nullptr);
+            return;
+        }
+        std::string choice = a.shaders;
+        const fs::path kept = folder_ / "shaders.txt";
+        if (choice == "ask") {
+            std::ifstream in(kept);
+            std::string k;
+            if (in >> k && (k == "compile" || k == "skip")) choice = k;
+        }
+        if (choice == "ask") {
+            std::printf("MoonRay XPU2 Rhizome: the GPU programs are not compiled for %s here: this machine renders on its processor\n"
+                        "  alone until they are. Compile them now (about an hour the first time; the processor renders meanwhile)?\n"
+                        "  [y]es / [n]o (kept in %s; --shaders compile|skip decides it beforehand; no answer in 30 s: asked again\n"
+                        "  next start) ",
+                        missing.c_str(), kept.u8string().c_str());
+            std::fflush(stdout);
+            const std::string answer = askLine(30);
+            if (!answer.empty() && (answer[0] == 'y' || answer[0] == 'Y')) choice = "compile";
+            else if (!answer.empty() && (answer[0] == 'n' || answer[0] == 'N')) choice = "skip";
+            if (choice != "ask") {
+                std::ofstream out(kept, std::ios::trunc);
+                out << choice << "\n";
+            } else {
+                std::printf("\n");
+            }
+        }
+        if (choice == "compile") {
+            begin();
+        } else if (choice == "skip") {
+            state_ = "missing: " + missing + " (declined here)";
+            say("the GPU programs are not compiled for " + missing + " (declined; moonray_xpu2 --compile-shaders, or --shaders compile): the CPU alone");
+        } else {
+            state_ = "missing: " + missing;
+            say("the GPU programs are not compiled for " + missing + " (moonray_xpu2 --compile-shaders, or --shaders compile): the CPU alone");
+        }
+    }
+    ~ShaderWork() {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        if (watcher_.joinable()) watcher_.join();
+        // The compile goes on without this run (its mark is left once it is done).
+        if (process_) CloseHandle(process_);
+    }
+    std::string state() {
+        std::lock_guard<std::mutex> g(m_);
+        return state_;
+    }
+    // Reported each time it changes (the node's heartbeats).
+    void follow(std::function<void(const std::string&)> f) {
+        std::lock_guard<std::mutex> g(m_);
+        report_ = std::move(f);
+        if (report_) report_(state_);
+    }
+
+private:
+    static void say(const std::string& s) {
+        std::printf("MoonRay XPU2 Rhizome: %s\n", s.c_str());
+        std::fflush(stdout);
+    }
+    fs::path log() const { return folder_ / "shaders-compile.txt"; }
+    // The kinds of the cards this machine renders with that have no programs compiled, by name.
+    static std::string missingCards() {
+        std::string names;
+        for (const auto& [card, kind] : uncompiledCards(shaderMark(programs(executableFolder())), false)) names += (names.empty() ? "" : ", ") + kind;
+        return names;
+    }
+    // An earlier start's compile holds its file (written by it alone).
+    bool compileRunning() const {
+        if (!fs::exists(log())) return false;
+        HANDLE h = CreateFileW(log().c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_SHARING_VIOLATION;
+        CloseHandle(h);
+        return false;
+    }
+    // A line from the console, or nothing in that many seconds (or no console: a service, a script).
+    static std::string askLine(double seconds) {
+        auto line = std::make_shared<std::promise<std::string>>();
+        auto got = line->get_future();
+        std::thread([line] {
+            std::string s;
+            if (!std::getline(std::cin, s)) s.clear();
+            line->set_value(s);
+        }).detach();
+        if (got.wait_for(std::chrono::duration<double>(seconds)) != std::future_status::ready) return {};
+        return got.get();
+    }
+    void begin() {
+        SECURITY_ATTRIBUTES inherit{sizeof inherit, nullptr, TRUE};
+        HANDLE out = CreateFileW(log().c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (out == INVALID_HANDLE_VALUE) {
+            state_ = "missing: " + missingCards() + " (the compile did not start)";
+            say("the GPU programs' compile did not start: " + log().u8string() + " cannot be written");
+            return;
+        }
+        STARTUPINFOW si{};
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = INVALID_HANDLE_VALUE;
+        si.hStdOutput = out;
+        si.hStdError = out;
+        PROCESS_INFORMATION pi{};
+        std::wstring command = L"\"" + (executableFolder() / "moonray_xpu2.exe").wstring() + L"\" --compile-shaders";
+        const BOOL made = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW, nullptr,
+                                         executableFolder().c_str(), &si, &pi);
+        CloseHandle(out);
+        if (!made) {
+            state_ = "missing: " + missingCards() + " (the compile did not start)";
+            say("the GPU programs' compile did not start (error " + std::to_string(GetLastError()) + ")");
+            return;
+        }
+        CloseHandle(pi.hThread);
+        process_ = pi.hProcess;
+        compiling_ = true;
+        state_ = "compiling";
+        say("compiling the GPU programs for " + missingCards() + " in the background (" + log().u8string() +
+            "): the CPU alone meanwhile, the cards from the next job after");
+        watch(process_);
+    }
+    // The compile's progress from its file every few seconds; its end (this start's process, or the file let go).
+    void watch(HANDLE process) {
+        watcher_ = std::thread([this, process] {
+            rz::swarmThread();
+            std::unique_lock<std::mutex> g(m_);
+            while (!stopping_) {
+                cv_.wait_for(g, std::chrono::seconds(3));
+                if (stopping_) break;
+                g.unlock();
+                std::string last, line;
+                {
+                    std::ifstream in(log());
+                    while (std::getline(in, line))
+                        if (!line.empty()) last = line;
+                }
+                if (!last.empty() && last.back() == '\r') last.pop_back();
+                bool ended = process ? WaitForSingleObject(process, 0) == WAIT_OBJECT_0 : !compileRunning();
+                DWORD code = 0;
+                if (ended && process) GetExitCodeProcess(process, &code);
+                std::string next;
+                if (ended) {
+                    const std::string missing = missingCards();
+                    next = missing.empty() ? "compiled" : "missing: " + missing + " (the compile failed: " + last.substr(0, 160) + ")";
+                    say(missing.empty() ? "the GPU programs are compiled: the cards render from the next job"
+                                        : "the GPU programs' compile failed (exit " + std::to_string(code) + "): " + last);
+                } else {
+                    // "MoonRay XPU2 shaders: 12 compile tasks done, 30 waiting, 120 s"
+                    unsigned done = 0, waiting = 0, s = 0;
+                    const size_t at = last.find(": ");
+                    if (at != std::string::npos && std::sscanf(last.c_str() + at + 2, "%u compile tasks done, %u waiting, %u s", &done, &waiting, &s) == 3)
+                        next = "compiling: " + std::to_string(done) + " of " + std::to_string(done + waiting) + " tasks, " + std::to_string(s) + " s";
+                    else
+                        next = "compiling";
+                }
+                g.lock();
+                if (next != state_) {
+                    state_ = next;
+                    if (report_) report_(state_);
+                }
+                if (ended) break;
+            }
+        });
+    }
+
+    fs::path folder_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::string state_;
+    std::function<void(const std::string&)> report_;
+    std::thread watcher_;
+    HANDLE process_ = nullptr;
+    bool compiling_ = false, stopping_ = false;
+};
+
 inline int run(int argc, char** argv) {
     RhizomeArgs a = parseRhizome(argc, argv);
     // This thread takes the node's lock too (checkpoints, status, the frame's start): above the renderer's, as the
@@ -1102,6 +1318,8 @@ inline int run(int argc, char** argv) {
     std::printf("MoonRay XPU2 Rhizome: this machine is %s (%s %s)\n", rz::hex(identity->hash()).c_str(), fresh ? "made now in" : "kept in",
                 folder.u8string().c_str());
     std::fflush(stdout);
+    // Its GPU programs: compiled, or offered to be (plan 15).
+    ShaderWork shaders(a, folder);
     const fs::path base = fs::temp_directory_path() / ("xpu2-rhizome-" + std::to_string(GetCurrentProcessId()));
     // The master reads each job's scene where it is (in the frame loop below); a node makes each job's from the swarm's
     // memory.
@@ -1269,6 +1487,12 @@ inline int run(int argc, char** argv) {
     };
     rz::RhizomeNode node(o, std::move(identity));
     nodeRef = &node;
+    shaders.follow([&node](const std::string& s) { node.setShaders(s); });
+    // Before the node goes: the compile's watcher no longer reports to it.
+    struct Unfollow {
+        ShaderWork& s;
+        ~Unfollow() { s.follow(nullptr); }
+    } unfollow{shaders};
     node.start();
     std::printf("MoonRay XPU2 Rhizome: %s %s listening at %s\n", a.master ? "master" : "node", rz::shortHex(node.hash()).c_str(),
                 node.address().c_str());

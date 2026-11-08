@@ -305,6 +305,9 @@ ShaderStamp shaderStamp(const Programs& p) {
     char name[32];
     std::snprintf(name, sizeof(name), "%016llx.compiled", (unsigned long long)h);
     stamp.mark = fs::u8path(local ? local : ".") / "MoonRayForModo" / "xpu2-shaders" / name;
+    // XPU2_SHADER_MARKS: the marks kept in that folder instead (a test of a machine with none compiled, OptiX's own cache
+    // left as it is).
+    if (const char* marks = std::getenv("XPU2_SHADER_MARKS"); marks && *marks) stamp.mark = fs::u8path(marks) / name;
     return stamp;
 }
 fs::path shaderMark(const Programs& p) { return shaderStamp(p).mark; }

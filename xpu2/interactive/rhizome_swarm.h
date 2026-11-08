@@ -23,6 +23,7 @@ struct Member {
     State state = State::Alive;
     bool quarantined = false;
     bool master = false;
+    std::string shaders;  // its GPU programs, as its heartbeats say (RhizomeNode::setShaders)
 };
 
 class Members {

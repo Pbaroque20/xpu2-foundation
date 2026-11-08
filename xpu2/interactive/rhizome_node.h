@@ -133,6 +133,19 @@ public:
         std::lock_guard<std::mutex> g(m_);
         return ledger_ ? ledger_->cancelled() : 0;
     }
+    // This machine's GPU programs, said in its heartbeats and shown in every machine's status: "no graphics card",
+    // "compiled", "missing: <cards>", "compiling: ...", "not compiled (declined)" (rhizome_session.inc, plan 15).
+    void setShaders(const std::string& s) {
+        std::lock_guard<std::mutex> g(m_);
+        shaders_ = s;
+    }
+    // A member's, as its heartbeats said (empty: not heard yet).
+    std::string shadersOf(const Hash& h) {
+        std::lock_guard<std::mutex> g(m_);
+        if (h == hash()) return shaders_;
+        const Member* mm = members_.find(h);
+        return mm ? mm->shaders : std::string();
+    }
     // Frames this node has read: plain (each connection's first, its Hello or Welcome) and sealed (all the rest).
     uint64_t plainFramesIn() const { return plainIn_; }
     uint64_t sealedFramesIn() const { return sealedIn_; }
@@ -823,6 +836,7 @@ private:
                 nextBeat = now + o_.heartbeat;
                 Writer w;
                 w.f64(now);
+                w.str(shaders_);  // its GPU programs (plan 15)
                 broadcast(Type::Heartbeat, w.b);
                 // A member whose bytes are arriving is heard, though its message is not whole yet.
                 for (auto& cc : conns_)
@@ -870,6 +884,14 @@ private:
             Writer w;
             w.f64(r.f64());
             sendOn(c, Type::Echo, w.b);
+            const std::string shaders = r.str();
+            if (!r.bad)
+                if (Member* mm = members_.find(m.sender)) {
+                    // Said when it changes kind (compiled, missing, compiling), not at each step of a compile.
+                    auto kind = [](const std::string& s) { return s.substr(0, s.find(':')); };
+                    if (!shaders.empty() && kind(shaders) != kind(mm->shaders)) log(shortHex(m.sender) + "'s GPU programs: " + shaders);
+                    mm->shaders = shaders;
+                }
             break;
         }
         case uint16_t(Type::Echo):
@@ -1349,6 +1371,11 @@ private:
         j += "  \"pool\": {\"ram\": " + std::to_string(pool_.total(Tier::Ram)) + ", \"vram\": " + std::to_string(pool_.total(Tier::Vram)) +
              ", \"pieces\": " + std::to_string(sourcePieces_.size()) + ", \"held\": " + std::to_string(store_.size()) + "},\n";
         j += "  \"members\": [\n";
+        auto shadersOf = [&](const Hash& h) {
+            if (h == hash()) return shaders_;
+            const Member* mm = members_.find(h);
+            return mm ? mm->shaders : std::string();
+        };
         auto row = [&](const Hash& h, const std::string& addr, const std::string& role, const std::string& state, double rate, double rtt) {
             const int i = plan_ ? plan_->nodeIndex(h) : -1;
             std::string tier = i < 0 ? "" : plan_->nodes[size_t(i)].fast ? "fast" : "slow";
@@ -1357,11 +1384,11 @@ private:
                    ", \"state\": " + jsonText(state) + ", \"tier\": " + jsonText(tier) + ", \"rate\": " + num(rate) + ", \"rtt\": " + num(rtt) +
                    ", \"chunks\": " + std::to_string(done) + ", \"ram\": " + std::to_string(pool_.used(h, Tier::Ram)) +
                    ", \"vram\": " + std::to_string(pool_.used(h, Tier::Vram)) + ", \"ramGiven\": " + std::to_string(pool_.capacity(h, Tier::Ram)) +
-                   ", \"vramGiven\": " + std::to_string(pool_.capacity(h, Tier::Vram)) + "}";
+                   ", \"vramGiven\": " + std::to_string(pool_.capacity(h, Tier::Vram)) + ", \"gpuPrograms\": " + jsonText(shadersOf(h)) + "}";
         };
         std::vector<std::string> rows;
         // The same as text (rhizome status prints it): a line a member.
-        char line[320];
+        char line[480];
         std::string text;
         auto mb = [](uint64_t v) {
             char t[24];
@@ -1375,9 +1402,11 @@ private:
             char rt[24], rr[24];
             std::snprintf(rt, sizeof rt, rtt >= 0 ? "%.1f ms" : "-", rtt * 1000.0);
             std::snprintf(rr, sizeof rr, rate > 0 ? "%.2f" : "-", rate / 1e6);
-            std::snprintf(line, sizeof line, "%-12s  %-21s  %-22s  %-8s  %-5s  %10s  %9s  %6llu  %s of %s MB\n", shortHex(h).c_str(), addr.c_str(),
-                          role.c_str(), state.c_str(), tier, rr, rt, (unsigned long long)done, mb(pool_.used(h, Tier::Ram) + pool_.used(h, Tier::Vram)).c_str(),
-                          mb(pool_.capacity(h, Tier::Ram) + pool_.capacity(h, Tier::Vram)).c_str());
+            const std::string sh = shadersOf(h);
+            std::snprintf(line, sizeof line, "%-12s  %-21s  %-22s  %-8s  %-5s  %10s  %9s  %6llu  %s of %s MB   GPU programs: %s\n", shortHex(h).c_str(),
+                          addr.c_str(), role.c_str(), state.c_str(), tier, rr, rt, (unsigned long long)done,
+                          mb(pool_.used(h, Tier::Ram) + pool_.used(h, Tier::Vram)).c_str(),
+                          mb(pool_.capacity(h, Tier::Ram) + pool_.capacity(h, Tier::Vram)).c_str(), sh.empty() ? "-" : sh.c_str());
             text += line;
         };
         rows.push_back(row(hash(), address_, o_.master ? "master" : "node (this machine)", paused_ ? "stepped back" : "alive", o_.caps.rate, 0));
@@ -2135,6 +2164,7 @@ private:
     std::vector<double> film_;
     std::vector<double> odd_;  // the odd-index sums, adaptive frames (the error pooled from them)
     bool paused_ = false;            // a workstation stepped back
+    std::string shaders_;            // this machine's GPU programs (setShaders)
     std::set<Hash> paused_nodes_;    // master: the workstations stepped back
     size_t convergedCells_ = 0;
     std::vector<uint32_t> counts_;
