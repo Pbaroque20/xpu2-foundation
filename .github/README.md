@@ -1,108 +1,87 @@
-# xpu2-foundation
+# Rhizome: XPU2 across machines
 
-![Cellular automata scheduling in XPU2](/xpu2/manual/xpu2-cellular-scheduling.gif)
+**Rhizome** is P2P, decentralized network rendering: one picture rendered on many machines, with no render server and
+no fixed manager. It is a swarm of peers: every machine that can, contributes. Each one finds the others, takes work
+and passes it on by the same cellular rules [XPU2](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-async)
+uses between a processor and a graphics card. Pieces of the scene live across the peers' memory, and work moves
+between neighbours directly.
 
-*Cellular automata scheduling in XPU2; both CPU/GPU contribute to the image without waiting. Footage Provided by Pixelwerk.*
+One peer, chosen by the user, takes the role of **master integrator** for a job. It holds the scene's indexer, sends
+the cells out, adds what comes back into the final picture and audits it. It is a role, not a server: any peer can
+hold it, and if the master falls silent the next peer in its signed succession list takes over.
 
-**XPU2** is an asynchronous CPU + GPU Monte Carlo path tracer. The CPU and GPU render collaborate on same image at once: each
-claims its own work, neither waits for the other, and any sample can be rendered on either device with the same
-result.
+Rhizome and XPU2 are designed by Raphael Tobar and implemented with AI assistance. The design was first described on
+5 November 2026. Not affiliated with or endorsed by DreamWorks Animation; MoonRay and OpenMoonRay are DreamWorks
+Animation's.
 
-XPU2 is designed by Raphael Tobar, implemented with AI-assistance. Not affiliated with or endorsed by DreamWorks
-Animation; MoonRay and OpenMoonRay are DreamWorks Animation's.
+Rhizome is released under the [MIT license](/LICENSE), as XPU2 is.
 
-The mantra for XPU2 is: "Use your silicon!"
+![Rhizome architecture](/xpu2/manual/rhizome_architecture.svg)
 
-![XPU2 architecture](/xpu2/manual/xpu2_architecture.svg)
+## Architecture
 
-## Core ideas
+Rhizome is the outer tier of XPU2's multi-device extension. Inside a machine, XPU2 already shares a frame between
+processor groups, NUMA nodes and graphics cards. Rhizome adds machines above them. A machine is a node of the swarm
+as a NUMA node is a node of the machine: the work it is given is near it, and the farther it is, the larger and less
+urgent its share. Every node is a whole XPU2 with its own work grid.
 
-- **Samples are defined by identity.** A sample is a pixel, a sample index and a frame seed, and its random numbers
-  derive from those alone. Either device produces the same result, so work moves between them freely.
-- **One integrator.** The path tracer is written once and compiled for both the CPU and the GPU.
-- **Cellular work grid.** The image is divided into cells, each owned by a device. Workers on both devices move
-  between cells by local rules, and every chunk of work is claimed exactly once.
-- **No waiting.** A broker thread keeps two GPU launches queued, sized from the GPU's measured rate. The host polls
-  the GPU and never blocks on it.
-- **Work goes where it runs best.** An indexer classifies each scene object by the devices that can render it. Cells
-  start on the better-suited device, and a GPU sample that hits a CPU-only feature is handed to the CPU.
-- **Motion on both devices.** Moving meshes, subdivision surfaces, instances, curves, points, volume bounds and any
-  number of moving lights render on the GPU as on the CPU, traced at each sample's time. Test scenes that used to send
-  those samples to the CPU finished 2.6 to 8.5 times sooner; a scene with nothing moving costs the GPU about 2 to 3%.
-  A deforming subdivision surface is tessellated once over its time steps, so adaptive tessellation and instanced
-  deforming prototypes render too.
-- **Lean card memory.** The GPU's stack is sized from the program's real call chains and from what the scene contains,
-  and each thread's scratch from what the scene uses. A launch is as wide as the card's cores can hold at once, and
-  narrower only when the card is short of memory. On an RTX 3090 a simple scene went from 10.9 GB of the card to 4.5 GB
-  at the same speed and with the same picture, so smaller cards can render. The parked-sample queue and the subsurface
-  stack are made only for scenes that use them, and the texture cache grows as tiles are read.
-- **Tiered texture memory.** Host RAM holds the coarse mip levels and the fine tiles read so far, which are decoded on
-  demand and let go under memory pressure. VRAM holds the coarse levels and a cache of fine tiles. A GPU sample that
-  misses a fine tile shades from a coarser level and is re-rendered in full before the frame ends. A scene that does
-  not fit has its textures compressed (BC6H), then made smaller, and the preview says so. Texels are kept as half
-  floats, grey maps in one channel and flat tiles as one value, so textures take about a third of the memory.
-- **Sampling generations.** One sampler handles both uniform and adaptive sampling, spending samples where the error
-  is highest. A frame runs for as long as uniform sampling would take, or to an exact sample count.
-- **Audited results.** Each device keeps its own film. When a frame ends the films merge and every pixel's sample
-  count is checked.
-- **Every device in the machine.** Extra graphics cards follow the first, each with its own scene and film, taking
-  cells from the same grid at their own rate. CPU workers span every Windows processor group. Realtime denoising goes
-  to the first card that can run OptiX's denoiser, then to Open Image Denoise on the CPU. Each card and processor
-  group can be switched off (`--list-devices` lists them).
-- **NUMA-aware.** Workers are placed a share on each NUMA node, each card is fed and its texture tiles decoded on the
-  node nearest it, and decoded tiles live in their node's memory. A node short of memory moves its oldest tiles to
-  another node before letting any go: a hop across the sockets instead of a decode from disk. A simulation app tests
-  cards, groups, nodes and denoiser hand-offs on one card.
+- **Nodes and their hashes.** Each node makes a key pair the first time it runs. Its hash, the SHA-256 of its public
+  key, is its identity in the swarm. Every message is signed, so every sample in the picture is known by the node
+  that made it.
+- **The swarm.** A node needs the address of one member, or finds the swarm by discovery on the local network. Members
+  are kept by heartbeats, and the distance between two nodes is their round-trip time. Nodes join and leave at any
+  time; a node that leaves has its unreturned work given out again.
+- **The master integrator.** The only node that reads the scene. Before a frame its indexer probes the picture and
+  scores each cell's importance: edges, many materials or lights, detailed maps, volumes, hair, subsurface. It sorts
+  the nodes into tiers by rate and gives the important cells to the fast tier and the rest to the slow tier.
+- **Cells, ownership and stealing.** The picture is cut into cells, each with one owner at a time, so no sample is
+  rendered twice. A node finishes its cell, then its own cells, then asks a neighbour for half of its remaining work.
+  Near nodes take small chunks, far ones larger ones.
+- **The audit.** Every XPU2 sample is defined by its identity, so any machine renders it to the same value. The master
+  renders again a few samples of each contribution, chosen by a seed the nodes do not know. A contribution that does
+  not match is thrown away, and its node is refused for the rest of the session.
+- **One film.** Each node sends back its sums, odd sums and sample counts. The master adds them as a graphics card's
+  film is added into the first card's, merges AOVs and Cryptomatte, pools the error for adaptive sampling across
+  machines and writes the scene's outputs once.
+- **Memory pool.** Every machine's RAM and graphics card memory form one pool. The scene's files, meshes and texture
+  tiles are pieces named by their SHA-256, each kept on two machines and copied again when one fails.
+- **Master failover.** The master signs a succession list, the fastest nodes first. The first successor, the deputy,
+  keeps a copy of the picture and its ledger. If the master falls silent, the deputy takes over and finishes the frame.
+- **Trust and the wire.** A swarm key admits members. Approvals are signed endorsements every machine can check, and
+  a revoked node is refused. Each connection makes its own key exchange (ECDH) and seals its traffic with AES-GCM, so
+  scene files cross the network unread. Machines must run the same XPU2 build and GPU programs to join.
+- **Jobs.** Frame ranges, a job queue folder, each frame's changes sent alone, and checkpoints so a job is taken up
+  again after every machine has stopped.
+- **Workstations.** A node can render only while its machine is idle or in set hours, and gives its work back when
+  someone sits down at it.
 
-## Reference renderer: MoonRay
+## Where it stands
 
-XPU2 currently implements [MoonRay](https://openmoonray.org/). MoonRay's path tracer and shader library (lights,
-BSDFs, materials, maps, volumes, subsurface, hair, cameras, outputs) are ported to XPU2's integrator, so XPU2's images
-converge to MoonRay's. Every port is checked against MoonRay renders, and scenes XPU2 can't render yet go to MoonRay
-XPU. [Feature progress](/xpu2/interactive/FEATURE_PROGRESS.md) lists each feature and its check.
+Parts 1 to 15 of the plan are built and tested on one machine, with a master and several nodes as separate
+processes. Hydra, a VDB scene and animated jobs render as one machine renders them (block error 0), through a master
+killed part way and through every machine stopped and started again.
 
-## Showcase: MoonRay for Modo
+Still to do: texture tiles fetched from the pool while rendering instead of a whole copy of the scene on each node;
+cells given to the nodes that hold their pieces; routed networks and VPNs; and a test on two real machines. The full
+design and the plan, part by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
 
-XPU2 renders previews in [MoonRay for Modo](https://www.github.com/pbaroque20/moonrayformodo/) on real production scenes, as part of the standard kit since 0.5, a
-pre-production release. Measured on an RTX 3090 and an i7-4930K (6 cores, 12 threads):
+## Running it
 
-| Scene | XPU2 (CPU + GPU) | MoonRay | Image vs MoonRay |
-|---|---|---|---|
-| Dragon from Modo, no HDRI, 1280×720, 16 samples/pixel | 9.1 s | 46.2 s (XPU) | mean ratio 1.002 |
-| Polygon test scene, 360×200, 1,024 samples/pixel | 12.2 s | 122.8 s (XPU) | block error 0.0006 |
-| Dose, 640×480, 64 samples/pixel, kit Source Overrides on | 9.5 s | 43 s (vector) | mean ratio 1.0006 |
-| 9 Spheres, 640×480, 64 samples/pixel, kit Source Overrides on | 64 s | 176 s (vector) | mean ratio 0.9997 |
-| Interior, 512×340, 64 samples/pixel | 51 s | 193 s (vector) | mean ratio 1.0003 |
-| Material fixtures, first 10 of the final benchmark, 64 samples/pixel | 86–92% less time | | all pass |
+```
+moonray_xpu2 rhizome id                                       this machine's hash
+moonray_xpu2 rhizome node --key <swarm key>                   a node: waits for a master and renders its jobs
+moonray_xpu2 rhizome master -in scene.rdla -out beauty.pfm --key <swarm key>
+moonray_xpu2 rhizome submit --queue jobs -in shot.####.rdla -out beauty.####.pfm --frames 1-24
+moonray_xpu2 rhizome status --watch                           every machine's role, progress and pool share
+```
 
-Test conditions are in the [kit history](/xpu2/interactive/KIT_ROADMAP.md) and the
-[indexer notes](/xpu2/interactive/INDEXER.md) (sections 14 and 15).
-
-## Start here
-
-| Topic | Read |
-|---|---|
-| How XPU2 works, with the files behind each part | [Engineer manual](/xpu2/manual/README.md) |
-| The core in depth | [Asynchronous renderer](/xpu2/interactive/ASYNC.md), [indexer and scheduling](/xpu2/interactive/INDEXER.md) |
-| The MoonRay port | [Path tracer and shaders](/xpu2/interactive/PATH_TRACER.md), [feature progress](/xpu2/interactive/FEATURE_PROGRESS.md) |
-| Running XPU2 in Modo | [Manual: XPU2 in MoonRay for Modo](/xpu2/manual/README.md#13-xpu2-in-moonray-for-modo), [tools](/xpu2/tools/README.md) |
-| Building | [Manual: building and running](/xpu2/manual/README.md#14-building-and-running) |
-
-## Repository layout
-
-| Layer | Location |
-|---|---|
-| Core | `xpu2/interactive/`: work grid, broker, CPU and GPU lanes, integrator framework, sampling, texture tiers, indexer |
-| MoonRay port | `xpu2/interactive/`: plan builder for MoonRay's RDL scenes, and the shading library (`shade_*.h`, `light_*.h`, `camera_core.h`, `volume_*.h`, `aov_*.h`) |
-| MoonRay for Modo host | `xpu2/interactive/xpu2_session.cc`, `xpu2/tools/` (headless Modo tools), and the MoonRay for Modo tree (`native-port/`, `kit/`, ...) |
-| Documentation | `xpu2/manual/` |
-| History | `xpu2/*.md`, `xpu2/*.cc`: the first attempt (the October 16 bridge experiments) |
-
-The core and the MoonRay port currently share a folder. The manual's file map assigns each file to its layer.
+Each verb has `--help`. Building XPU2 is in the [engineer manual](/xpu2/manual/README.md#14-building-and-running).
+The unit checks are `xpu2/interactive/rhizome_test.cc` and `rhizome_trust_test.cc`.
 
 ## Branches
 
-- `MoonLightIPR`, in MoonRay for Modo: where XPU2 is developed, with its host.
-- `xpu2-async` (this branch): XPU2's core and its documents, brought up to date from `MoonLightIPR`. Its kit stops at the 0.5 release.
-- `xpu-plus`: XPU+, the earlier synchronous approach (19–20 October 2026). It speeds up MoonRay XPU's own pipeline with
-  exact savings that keep images identical, rather than replacing it. Kept for its measurements and techniques.
+- `xpu2-network` (this branch): Rhizome, on top of XPU2's core.
+- [`xpu2-async`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-async): XPU2's core and its documents.
+- `xpu-plus`: XPU+, the earlier synchronous approach.
+
+The kit's side, a Rhizome render started from Modo, belongs to [MoonRay for Modo](https://github.com/Pbaroque20/MoonRayForModo).
