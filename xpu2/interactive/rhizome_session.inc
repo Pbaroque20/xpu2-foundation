@@ -5,6 +5,7 @@
 //   moonray_xpu2 rhizome node    --key <k> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2] [-threads n]
 //                                [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]
 //                                [--when-idle s] [--hours from-to] [--busy-threads n] [--shaders ask|compile|skip]
+//                                [--whole-textures]
 //   moonray_xpu2 rhizome master  -in <scene> [-in ...] -out <image.pfm> --key <k> [--nodes N] [--node host:port ...]
 //                                [--wait s] [--approve] [--trust-first] [--trust <hash> ...] [--cell px] [--chunk n]
 //                                [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]
@@ -50,6 +51,8 @@ struct RhizomeArgs {
     // Checkpoints (plan 14): every so many seconds (0: none), and whether a job's checkpoint is left unused.
     double checkpointSeconds = 60;
     bool fresh = false;
+    // Plan 16: a node's textures copied whole before it renders, instead of read from the swarm's memory as it renders.
+    bool wholeTextures = false;
     // GPU programs not compiled here (plan 15): ask (on first start, the answer kept), compile, skip.
     std::string shaders = "ask";
     unsigned nodes = 0, threads = 0, cell = 256, chunk = 16;
@@ -69,7 +72,7 @@ inline const char* usage(Verb v) {
     case Verb::Node:
         return "moonray_xpu2 rhizome node --key <rhizome key> [--master host:port] [--trust <approver hash> ...] [--mode 0|1|2]\n"
                "    [-threads n] [--folder f] [--bind host] [--port p] [--advertise host] [--no-discovery]\n"
-               "    [--when-idle seconds] [--hours from-to] [--busy-threads n] [--shaders ask|compile|skip]\n"
+               "    [--when-idle seconds] [--hours from-to] [--busy-threads n] [--shaders ask|compile|skip] [--whole-textures]\n"
                "  A headless node: makes or reads its hash, listens and answers discovery, renders each job a master gives it\n"
                "  and waits for the next. --master: reach that master instead of waiting to be found. --trust: approvers this\n"
                "  node trusts (else it trusts the master that first endorses it). Port 47100 by default.\n"
@@ -79,7 +82,9 @@ inline const char* usage(Verb v) {
                "  GPU programs: a machine whose cards have none compiled renders on its processor alone; on its first start it\n"
                "  asks whether to compile them (--shaders ask; compile or skip decide it beforehand). The compile runs in the\n"
                "  background (its lines in shaders-compile.txt in the folder), the cards rendering from the next job after;\n"
-               "  rhizome status shows each machine's GPU programs.";
+               "  rhizome status shows each machine's GPU programs.\n"
+               "  Textures: a scene's textures (.tx) stay in the swarm's memory, their tiles fetched as the render reads them\n"
+               "  (those it never reads never come); --whole-textures: each copied whole before the node renders.";
     case Verb::Master:
         return "moonray_xpu2 rhizome master -in <scene> [-in ...] -out <image.pfm> --key <rhizome key> [--nodes N]\n"
                "    [--node host:port ...] [--wait s] [--approve] [--trust-first] [--trust <approver hash> ...] [--cell px]\n"
@@ -177,6 +182,7 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--name") a.name = next();
         else if (k == "--checkpoint") a.checkpointSeconds = std::stod(next());
         else if (k == "--fresh") a.fresh = true;
+        else if (k == "--whole-textures") a.wholeTextures = true;
         else if (k == "--shaders") {
             a.shaders = next();
             if (a.shaders != "ask" && a.shaders != "compile" && a.shaders != "skip")
@@ -600,6 +606,15 @@ inline void writePfm(const fs::path& path, uint32_t w, uint32_t h, const std::ve
 // by their SHA-256 and placed in the pool. A node fetches the pieces, writes the files into its own folder, and points
 // the scene files' strings at them. Binary scenes (.rdlb) go as they are: what they name is not rewritten.
 constexpr size_t PieceBytes = 4u << 20;
+// A texture's pieces are smaller (plan 16): a node reads it from the pool as it renders, a piece for each tile read, so
+// a smaller piece fetches less of what the render never reads.
+constexpr size_t TexturePieceBytes = 256u << 10;
+inline bool textureFile(const std::string& name) {
+    std::string ext = fs::u8path(name).extension().u8string();
+    for (char& c : ext) c = char(std::tolower((unsigned char)c));
+    return ext == ".tx";
+}
+inline size_t pieceBytesFor(const std::string& name, bool scene) { return !scene && textureFile(name) ? TexturePieceBytes : PieceBytes; }
 struct SceneFile {
     std::string literal;  // as the scene writes it (a scene given with -in: its path), escapes and all
     std::string name;     // the file's own name (a UDIM set: one entry a tile, its literal the set's)
@@ -652,14 +667,14 @@ inline rz::Bytes publishScene(rz::RhizomeNode& node, const std::vector<std::stri
         SceneFile f;
         f.literal = literal, f.name = path.filename().u8string(), f.scene = scene;
         std::ifstream in(path, std::ios::binary);
-        rz::Bytes block(PieceBytes);
+        rz::Bytes block(pieceBytesFor(f.name, scene));
         for (;;) {
             in.read(reinterpret_cast<char*>(block.data()), std::streamsize(block.size()));
             const size_t got = size_t(in.gcount());
             if (!got) break;
             rz::Bytes data(block.begin(), block.begin() + got);
             const rz::Hash h = rz::sha256(data);
-            node.addPiece(rz::Piece{h, data.size(), rz::Tier::Ram}, data);
+            node.addPiece(rz::Piece{h, data.size(), rz::Tier::Ram}, data, false);
             f.pieces.push_back(h);
             f.bytes += got;
         }
@@ -692,6 +707,7 @@ inline rz::Bytes publishScene(rz::RhizomeNode& node, const std::vector<std::stri
             add(lit, fs::u8path(path), false);
         }
     }
+    node.announcePlacements();  // every piece placed, then the pool's list sent once
     rz::Writer w;
     w.u32(uint32_t(files.size()));
     for (const auto& f : files) {
@@ -703,8 +719,38 @@ inline rz::Bytes publishScene(rz::RhizomeNode& node, const std::vector<std::stri
     std::fflush(stdout);
     return w.b;
 }
-// A node: the scene's files fetched from the pool and written into folder, the scene files' strings pointed at them.
-// Returns the scene files to load.
+// Plan 16: whether a scene's file stays in the swarm's memory on a node, read as the renderer reads it (a texture: its
+// tiles; remote_files.h), an empty file of its name in its place for whatever lists the folder (a UDIM set's tiles).
+inline bool& wholeTextures() {
+    static bool whole = false;
+    return whole;
+}
+inline bool readFromPool(const SceneFile& f) {
+    return !f.scene && !wholeTextures() && f.bytes != 0 && textureFile(f.name);
+}
+// The textures read from the swarm's memory so far: their blocks fetched and the files' bytes in all.
+struct PoolTextures {
+    std::mutex m;
+    std::vector<std::shared_ptr<xpu2::remote::Source>> sources;
+};
+inline PoolTextures& poolTextures() {
+    static PoolTextures p;
+    return p;
+}
+inline std::string poolTexturesLine() {
+    auto& p = poolTextures();
+    std::lock_guard<std::mutex> g(p.m);
+    uint64_t held = 0, total = 0;
+    size_t blocks = 0, all = 0;
+    for (const auto& s : p.sources) held += s->bytesHeld(), total += s->size(), blocks += s->blocksHeld(), all += s->blocks();
+    if (p.sources.empty()) return {};
+    char t[200];
+    std::snprintf(t, sizeof t, "textures from the swarm's memory: %zu files, %.1f of %.1f MB fetched (%zu of %zu blocks)", p.sources.size(),
+                  double(held) / (1 << 20), double(total) / (1 << 20), blocks, all);
+    return t;
+}
+// A node: the scene's files fetched from the pool and written into folder, the scene files' strings pointed at them
+// (its textures left in the pool, readFromPool). Returns the scene files to load.
 inline std::vector<std::string> receiveScene(rz::RhizomeNode& node, const rz::Bytes& manifest, const fs::path& folder) {
     rz::Reader r(manifest);
     std::vector<SceneFile> files(r.u32());
@@ -713,7 +759,7 @@ inline std::vector<std::string> receiveScene(rz::RhizomeNode& node, const rz::By
         f.literal = r.str(), f.name = r.str(), f.scene = r.u8() != 0, f.bytes = r.u64();
         f.pieces.resize(r.u32());
         for (auto& h : f.pieces) h = r.hash();
-        all.insert(all.end(), f.pieces.begin(), f.pieces.end());
+        if (!readFromPool(f)) all.insert(all.end(), f.pieces.begin(), f.pieces.end());
     }
     if (r.bad) throw std::runtime_error("the master's manifest does not read");
     const auto began = Clock::now();
@@ -728,6 +774,26 @@ inline std::vector<std::string> receiveScene(rz::RhizomeNode& node, const rz::By
         fs::create_directories(it->second);
         const fs::path path = it->second / fs::u8path(f.name);
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (readFromPool(f)) {
+            // Its blocks fetched from the pool the first time a read touches them (from a holder, else the master).
+            auto pieces = std::make_shared<const std::vector<rz::Hash>>(f.pieces);
+            rz::RhizomeNode* from = &node;
+            auto source = std::make_shared<xpu2::remote::Source>(f.bytes, pieceBytesFor(f.name, false), [from, pieces](size_t i) -> xpu2::remote::Block {
+                if (i >= pieces->size()) return nullptr;
+                const rz::Hash& h = (*pieces)[i];
+                if (!from->holds(h) && !from->fetch({h}, 300)) return nullptr;
+                auto b = std::make_shared<std::vector<unsigned char>>(from->piece(h));
+                return b->empty() ? nullptr : b;
+            });
+            xpu2::remote::add(path.string(), source);
+            {
+                std::lock_guard<std::mutex> g(poolTextures().m);
+                poolTextures().sources.push_back(source);
+            }
+            if (!out) throw std::runtime_error("cannot write " + path.string());
+            total += f.bytes;
+            continue;
+        }
         for (const auto& h : f.pieces) {
             const rz::Bytes data = node.piece(h);
             out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
@@ -755,8 +821,11 @@ inline std::vector<std::string> receiveScene(rz::RhizomeNode& node, const rz::By
         }
         scenes.push_back(path.u8string());
     }
-    std::printf("MoonRay XPU2 Rhizome: the scene from the swarm: %zu files, %.1f MB in %.1f s\n", files.size(), double(total) / (1 << 20),
-                std::chrono::duration<double>(Clock::now() - began).count());
+    size_t pooled = 0;
+    for (const auto& f : files) pooled += readFromPool(f) ? 1 : 0;
+    std::printf("MoonRay XPU2 Rhizome: the scene from the swarm: %zu files, %.1f MB in %.1f s%s\n", files.size(), double(total) / (1 << 20),
+                std::chrono::duration<double>(Clock::now() - began).count(),
+                pooled ? (", " + std::to_string(pooled) + " textures read from the swarm's memory as the render reads them").c_str() : "");
     std::fflush(stdout);
     return scenes;
 }
@@ -1282,6 +1351,7 @@ private:
 
 inline int run(int argc, char** argv) {
     RhizomeArgs a = parseRhizome(argc, argv);
+    wholeTextures() = a.wholeTextures;
     // This thread takes the node's lock too (checkpoints, status, the frame's start): above the renderer's, as the
     // swarm's own (a thread of normal priority holding the lock while the cores render holds up the heartbeats).
     rz::swarmThread();
@@ -1405,7 +1475,21 @@ inline int run(int argc, char** argv) {
     o.render = [&](const uint32_t r[4], uint32_t first, uint32_t count) {
         const std::shared_ptr<Local> l = local();
         if (!l) throw std::runtime_error("the scene is not made here yet");
-        return l->render(r, first, count);
+        const uint64_t fetchedBefore = xpu2::remote::fetchedBlocks().load();
+        rz::Film f = l->render(r, first, count);
+        f.waited = xpu2::remote::fetchedBlocks().load() != fetchedBefore;
+        // The textures read from the swarm's memory so far (plan 16): said every 10 s while it renders, when it changed.
+        static double said = 0;
+        static std::string last;
+        if (const double now = rz::nowSeconds(); now - said > 10) {
+            said = now;
+            if (std::string t = poolTexturesLine(); !t.empty() && t != last) {
+                std::printf("MoonRay XPU2 Rhizome: %s\n", t.c_str());
+                std::fflush(stdout);
+                last = std::move(t);
+            }
+        }
+        return f;
     };
     o.renderPixel = [&](uint32_t x, uint32_t y, uint32_t first, uint32_t count, float sum[4]) { local()->pixel(x, y, first, count, sum); };
     // A workstation: steps back while its machine is in use (or renders on fewer threads) and outside its hours.
@@ -1581,6 +1665,7 @@ inline int run(int argc, char** argv) {
                 node.setJob(what);
                 node.markReady(which);
                 std::printf("MoonRay XPU2 Rhizome: node ready for %s%s\n", what.c_str(), keep ? " (the scene kept, its changes read)" : "");
+                if (const std::string t = poolTexturesLine(); !t.empty()) std::printf("MoonRay XPU2 Rhizome: %s\n", t.c_str());
             } catch (const std::exception& e) {
                 std::printf("MoonRay XPU2 Rhizome: job %u could not be made here: %s\n", job, e.what());
             }
@@ -1737,6 +1822,7 @@ inline int run(int argc, char** argv) {
             share += (i ? ", " : "") + rz::shortHex(node.plan()->nodes[i].hash) + " " + std::to_string(by[i]) + (node.plan()->nodes[i].fast ? " (fast)" : " (slow)");
         std::printf("MoonRay XPU2 Rhizome: the frame in %.2f s, %llu films audited; chunks by node: %s\n", seconds,
                     (unsigned long long)node.audits(), share.c_str());
+        if (const std::string audit = node.auditSummary(); !audit.empty()) std::printf("MoonRay XPU2 Rhizome: audits: %s\n", audit.c_str());
         if (shape.adaptive())
             std::printf("MoonRay XPU2 Rhizome: adaptive: %zu of %u cells converged early, %zu chunks left unrendered\n", node.convergedCells(),
                         shape.cells(), node.cancelledChunks());

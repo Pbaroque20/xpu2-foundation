@@ -273,6 +273,7 @@ static void plans() {
     for (U32 c = 0; c < s.cells(); ++c)
         for (U32 k = 0; k < s.chunksPerCell(); ++k) l.arrived(Chunk{c, k});
     check(l.complete(), "the ledger completes");
+
 }
 
 static void memory() {
@@ -357,6 +358,36 @@ static void audits() {
     Film short_ = honest;
     short_.counts[7] -= 1;
     check(!every.check(fakeHash(5), short_, pixelSum).passed, "a pixel short of its samples fails");
+    // A card's film beside a processor's: of a few samples, a path through a volume that turned another way leaves a
+    // pixel far off now and then. One outlier among a film's few picks is not a wrong film; a node with outliers far
+    // past the honest share over its films is.
+    const uint32_t small[4] = {0, 0, 2, 2};
+    auto withOutlier = [&](uint32_t first, bool off) {
+        Film f = renderer(1e12)(small, first, 4);
+        if (off)
+            for (int c = 0; c < 3; ++c) f.sums[c] *= 0.85f;  // its colour 15% darker (a path that split)
+        return f;
+    };
+    Auditor card;
+    card.rate = 1.0;
+    check(card.check(fakeHash(6), withOutlier(0, true), pixelSum).passed, "one pixel far off among a film's 4 picks passes");
+    bool cardPassed = true;
+    for (uint32_t k = 1; k < 60; ++k) cardPassed = cardPassed && card.check(fakeHash(6), withOutlier(4 * k, k % 10 == 0), pixelSum).passed;
+    check(cardPassed, "an outlier in one film of ten (2.5% of pixels) passes over 60 films (" + card.summary() + ")");
+    Auditor liar;
+    liar.rate = 1.0;
+    bool liarCaught = false;
+    uint32_t caughtAt = 0;
+    for (uint32_t k = 0; k < 60 && !liarCaught; ++k)
+        if (!liar.check(fakeHash(7), withOutlier(4 * k, true), pixelSum).passed) liarCaught = true, caughtAt = k + 1;
+    check(liarCaught, "an outlier in every film (25% of pixels) is caught, at film " + std::to_string(caughtAt));
+    // A film 3% darker everywhere: every pixel within the outlier limit, so the bias catches it.
+    Film dim = honest;
+    for (size_t i = 0; i < dim.counts.size(); ++i)
+        for (int c = 0; c < 3; ++c) dim.sums[i * 4 + c] *= 0.97f;
+    Auditor d;
+    d.rate = 1.0 / 64;
+    check(!d.check(fakeHash(8), dim, pixelSum).passed, "a film 3% darker everywhere fails by its bias");
 }
 
 struct Swarm {

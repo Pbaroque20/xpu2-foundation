@@ -191,6 +191,7 @@ public:
             swarmThread();
             auditLoop();
         });
+        if (!o_.statusPath.empty()) statusThread_ = std::thread([this] { statusWriter(); });
         if (o_.master) {
             std::lock_guard<std::mutex> g(m_);
             pool_.addNode(hash(), o_.ramBytes, o_.vramBytes);
@@ -216,6 +217,12 @@ public:
         for (auto& t : threads_)
             if (t.joinable()) t.join();
         threads_.clear();
+        {
+            std::lock_guard<std::mutex> g(statusMutex_);
+            statusStop_ = true;
+        }
+        statusCv_.notify_all();
+        if (statusThread_.joinable()) statusThread_.join();
         {
             std::lock_guard<std::mutex> g(dialsMutex_);
             for (auto& t : dials_)
@@ -361,11 +368,18 @@ public:
         return members_.quarantined(h);
     }
     // The memory pool: pieces to keep across the swarm (master), and what this node holds of them.
-    void addPiece(const Piece& p, const Bytes& data) {
+    // announce false: placed, its placement sent with the next announcePlacements (a scene's pieces added together: a
+    // placement list sent a piece was the pool's whole list each time, n squared over a scene of n pieces, and a node
+    // asked again for each piece not landed at every list).
+    void addPiece(const Piece& p, const Bytes& data, bool announce = true) {
         std::lock_guard<std::mutex> g(m_);
         store_[p.hash] = data;  // the master keeps the scene's pieces as their source
         sourcePieces_[p.hash] = p;
         pool_.add(p);
+        if (announce) sendPlacements(nullptr);
+    }
+    void announcePlacements() {
+        std::lock_guard<std::mutex> g(m_);
         sendPlacements(nullptr);
     }
     Pool& pool() { return pool_; }
@@ -381,6 +395,11 @@ public:
     uint64_t audits() {
         std::lock_guard<std::mutex> g(m_);
         return auditsDone_;
+    }
+    // Master: each node's audit so far (pixels checked, outliers, bias).
+    std::string auditSummary() {
+        std::lock_guard<std::mutex> g(m_);
+        return auditor_.summary();
     }
     // Reaches a member at host:port (a master dialling a node discovery found, or one given by address); the usual
     // handshake follows. On a thread of its own: connecting may take a while.
@@ -991,10 +1010,13 @@ private:
                 auto& known = holders_[piece];
                 if (std::find(known.begin(), known.end(), to) == known.end()) known.push_back(to);
                 if (to == hash() && !store_.count(piece)) {
+                    // Asked once: a list that names it again (the master's whole list, sent as the pool changes) does
+                    // not ask again; askPlaced asks again if it has not landed in 2 s.
+                    auto [at, fresh] = placed_.try_emplace(piece, nowSeconds(), 1);
+                    if (!fresh) continue;
                     Writer w;
                     w.hash(piece);
                     sendTo(from == Hash{} ? masterHash_ : from, uint16_t(TypePieceAsk), w.b);
-                    placed_[piece] = {nowSeconds(), 1};  // asked again until it lands (askPlaced)
                 }
             }
             break;
@@ -1425,13 +1447,6 @@ private:
         }
         for (size_t i = 0; i < rows.size(); ++i) j += rows[i] + (i + 1 < rows.size() ? ",\n" : "\n");
         j += "  ]\n}\n";
-        const std::string temp = o_.statusPath + ".part";
-        {
-            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-            out << j;
-        }
-        std::error_code e;
-        std::filesystem::rename(temp, o_.statusPath, e);
         // The text: this machine, the frame, the pool, then the members.
         std::string head;
         std::snprintf(line, sizeof line, "This machine  %s  %s%s   %s\n", hex(hash()).c_str(), o_.master ? "master" : "node",
@@ -1472,12 +1487,38 @@ private:
             head += "Master        this machine since it took over (the master before it failed)\n";
         }
         head += "\nHash          Address                Role                    State     Tier   Rate Ms/s        RTT  Chunks  Pool\n";
-        const std::string textPath = o_.statusPath.substr(0, o_.statusPath.size() - 5) + ".txt";
+        // Written by the status thread (statusWriter): the latest of them, the disk's waits not the loop's.
         {
-            std::ofstream out(textPath + ".part", std::ios::binary | std::ios::trunc);
-            out << head << text;
+            std::lock_guard<std::mutex> g(statusMutex_);
+            statusJson_ = std::move(j);
+            statusText_ = head + text;
+            statusPending_ = true;
         }
-        std::filesystem::rename(textPath + ".part", textPath, e);
+        statusCv_.notify_all();
+    }
+    // The status files, each written whole then named, from the latest status the loop made.
+    void statusWriter() {
+        const std::string textPath = o_.statusPath.substr(0, o_.statusPath.size() - 5) + ".txt";
+        std::unique_lock<std::mutex> g(statusMutex_);
+        for (;;) {
+            statusCv_.wait(g, [&] { return statusPending_ || statusStop_; });
+            if (!statusPending_) return;
+            const std::string j = std::move(statusJson_), text = std::move(statusText_);
+            statusPending_ = false;
+            g.unlock();
+            std::error_code e;
+            {
+                std::ofstream out(o_.statusPath + ".part", std::ios::binary | std::ios::trunc);
+                out << j;
+            }
+            std::filesystem::rename(o_.statusPath + ".part", o_.statusPath, e);
+            {
+                std::ofstream out(textPath + ".part", std::ios::binary | std::ios::trunc);
+                out << text;
+            }
+            std::filesystem::rename(textPath + ".part", textPath, e);
+            g.lock();
+        }
     }
     // A member refused from now on (quarantined, revoked or blocked): its connections closed, its work given out.
     void refuse(const Hash& h, const char* why) {
@@ -1578,7 +1619,8 @@ private:
                     cv_.wait_for(g, std::chrono::milliseconds(200));
                     continue;
                 }
-                const double seconds = nowSeconds() - began;
+                // A render that waited for the pool's pieces: no time sent, the machine's rate left as it was.
+                const double seconds = f.waited ? 0.0 : nowSeconds() - began;
                 f.frame = plan.shape.frame;  // the frame it was given for, whatever frame the swarm is on when it lands
                 Writer w;
                 writeFilm(w, *chunk, f, seconds);
@@ -1725,6 +1767,8 @@ private:
             }
             g.lock();
             ++auditsDone_;
+            // A film with an outlier that the node's audit so far allows is taken: said when tracing.
+            if (v.passed && v.failed && trace()) log("audit of " + shortHex(a.from) + ": an outlier allowed:" + v.detail);
             if (ledger_ && !frameDone_) settle(a.from, a.chunk, a.film, true, v);
         }
     }
@@ -2165,6 +2209,12 @@ private:
     std::vector<double> odd_;  // the odd-index sums, adaptive frames (the error pooled from them)
     bool paused_ = false;            // a workstation stepped back
     std::string shaders_;            // this machine's GPU programs (setShaders)
+    // The status files' writer and the latest status for it (writeStatus).
+    std::thread statusThread_;
+    std::mutex statusMutex_;
+    std::condition_variable statusCv_;
+    std::string statusJson_, statusText_;
+    bool statusPending_ = false, statusStop_ = false;
     std::set<Hash> paused_nodes_;    // master: the workstations stepped back
     size_t convergedCells_ = 0;
     std::vector<uint32_t> counts_;

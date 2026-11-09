@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <string>
 #include <functional>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -30,6 +31,9 @@ struct Film {
     std::vector<float> aovDepths;
     // Cryptomatte's fragments of the film's pixels as sums, before finalizing (the caller's format; empty without).
     Bytes crypto;
+    // Its render waited for pieces from the swarm's memory (a texture's tiles, plan 16): its time says nothing of the
+    // machine's rate, and is not sent (not on the wire).
+    bool waited = false;
     uint32_t width() const { return rect[2] - rect[0]; }
     uint32_t height() const { return rect[3] - rect[1]; }
 };
@@ -103,13 +107,51 @@ public:
         }
         return out;
     }
+    // What the audit has seen of a node so far (every film's picks): pixels checked, outliers, and the signed
+    // differences of the pixels within pixelLimit (their sum and sum of squares).
+    struct Tally {
+        uint64_t checked = 0, outliers = 0, inliers = 0;
+        double sum = 0, squares = 0, worst = 0;
+        double bias() const { return inliers ? sum / double(inliers) : 0.0; }
+        double sd() const {
+            if (inliers < 2) return 0.0;
+            const double m = bias();
+            return std::sqrt(std::max(0.0, (squares - double(inliers) * m * m) / double(inliers - 1)));
+        }
+    };
+    Tally tally(const Hash& node) const {
+        const auto it = tallies_.find(node);
+        return it == tallies_.end() ? Tally{} : it->second;
+    }
+    // The outliers an honest node may have among n pixels checked: outlierShare of them, four standard deviations
+    // more, and one (a node's first films: one path that split is not a wrong film).
+    double outliersAllowed(uint64_t n) const {
+        const double p = outlierShare, k = double(n);
+        return p * k + 4.0 * std::sqrt(p * (1.0 - p) * k) + 1.0;
+    }
+    // A line for the log: each node's audit so far.
+    std::string summary() const {
+        std::string s;
+        for (const auto& [h, t] : tallies_) {
+            char line[200];
+            std::snprintf(line, sizeof line, "%s%s %llu pixels, %llu outliers (%.2f%%), bias %+.4f%%, worst %.2f%%", s.empty() ? "" : "; ",
+                          hex(h.data(), 6).c_str(), (unsigned long long)t.checked, (unsigned long long)t.outliers,
+                          t.checked ? 100.0 * double(t.outliers) / double(t.checked) : 0.0, t.bias() * 100.0, t.worst * 100.0);
+            s += line;
+        }
+        return s;
+    }
+
     // Checks a film from a node by rendering its picks again. A processor and a graphics card give a sample a little
     // differently (a path through a volume or a glass can turn another way on a last bit), so a pixel's sum differs
-    // by a few tenths of a percent either way between devices; what a wrong film changes is checked instead:
-    //   counts: each pixel has exactly the film's samples;
-    //   no pixel is off by more than pixelLimit, but for outliers (a share of the pixels checked: a path that split);
-    //   no bias: the mean of the signed differences sits within biasLimit, or four standard errors where the pixels
-    //   checked are few or their differences wide (device noise averages out, a film made brighter or darker does not).
+    // by a few tenths of a percent either way between devices, and now and then (a path that split, of the few
+    // samples a film has) by far more; what a wrong film changes is checked instead, on all of the node's pixels
+    // checked so far (a film's few picks alone cannot tell a split path from a wrong film):
+    //   counts: each pixel has exactly the film's samples, none of them NaN or infinite (at once);
+    //   outliers (a pixel off by more than pixelLimit): no more than outliersAllowed of the node's pixels checked;
+    //   no bias: the mean of the signed differences of the pixels within pixelLimit sits within biasLimit, or four
+    //   standard errors where they are few or wide (device noise averages out, a film made brighter or darker does not;
+    //   one changed by more than pixelLimit is all outliers).
     Verdict check(const Hash& node, const Film& f, const PixelRenderer& render) {
         Verdict v;
         if (f.sums.size() != size_t(f.width()) * f.height() * 4 || f.counts.size() != size_t(f.width()) * f.height()) {
@@ -117,15 +159,14 @@ public:
             v.detail = " its film is not its rectangle's size;";
             return v;
         }
-        std::vector<double> signedDiffs;
-        uint32_t outliers = 0;
+        Tally t = tally(node);
         bool countsWrong = false;
         auto note = [&](uint32_t x, uint32_t y, size_t i, const float* ref) {
             if (++v.failed > 4) return;
-            char t[200];
-            std::snprintf(t, sizeof t, " (%u,%u) node %.5g %.5g %.5g %.5g n%u, master %.5g %.5g %.5g %.5g;", x, y, f.sums[i * 4], f.sums[i * 4 + 1],
+            char s[200];
+            std::snprintf(s, sizeof s, " (%u,%u) node %.5g %.5g %.5g %.5g n%u, master %.5g %.5g %.5g %.5g;", x, y, f.sums[i * 4], f.sums[i * 4 + 1],
                           f.sums[i * 4 + 2], f.sums[i * 4 + 3], f.counts[i], ref[0], ref[1], ref[2], ref[3]);
-            v.detail += t;
+            v.detail += s;
         };
         for (const auto& [x, y] : picks(node, f)) {
             const size_t i = size_t(y - f.rect[1]) * f.width() + (x - f.rect[0]);
@@ -149,34 +190,40 @@ public:
                 note(x, y, i, ref);
                 continue;
             }
+            ++t.checked;
             v.worst = std::max(v.worst, std::fabs(rel));
-            signedDiffs.push_back(rel);
+            t.worst = std::max(t.worst, std::fabs(rel));
             if (std::fabs(rel) > pixelLimit) {
-                ++outliers;
+                ++t.outliers;
                 note(x, y, i, ref);
+            } else {
+                ++t.inliers;
+                t.sum += rel, t.squares += rel * rel;
             }
         }
-        double mean = 0, spread = 0;
-        for (double d : signedDiffs) mean += d;
-        mean /= std::max<size_t>(1, signedDiffs.size());
-        for (double d : signedDiffs) spread += (d - mean) * (d - mean);
-        const double sd = signedDiffs.size() > 1 ? std::sqrt(spread / double(signedDiffs.size() - 1)) : 0.0;
-        const double allowed = std::max(biasLimit, 4.0 * sd / std::sqrt(double(std::max<size_t>(1, signedDiffs.size()))));
-        v.bias = mean;
-        const bool biased = std::fabs(mean) > allowed;
-        const bool tooMany = double(outliers) > outlierShare * double(std::max<uint32_t>(1, v.checked)) && outliers > 0;
+        tallies_[node] = t;
+        v.bias = t.bias();
+        const double allowed = std::max(biasLimit, 4.0 * t.sd() / std::sqrt(double(std::max<uint64_t>(1, t.inliers))));
+        const bool biased = t.inliers > 0 && std::fabs(t.bias()) > allowed;
+        const bool tooMany = double(t.outliers) > outliersAllowed(t.checked);
+        char s[200];
         if (biased) {
-            char t[120];
-            std::snprintf(t, sizeof t, " a bias of %.3f%% (at most %.3f%%);", mean * 100.0, allowed * 100.0);
-            v.detail += t;
+            std::snprintf(s, sizeof s, " a bias of %.3f%% (at most %.3f%%);", t.bias() * 100.0, allowed * 100.0);
+            v.detail += s;
         }
-        v.passed = !countsWrong && !biased && !tooMany && (outliers == 0 || double(outliers) <= outlierShare * double(v.checked));
+        if (tooMany || (v.failed && !countsWrong)) {
+            std::snprintf(s, sizeof s, " %llu outliers of %llu pixels checked so far (at most %.1f);", (unsigned long long)t.outliers,
+                          (unsigned long long)t.checked, outliersAllowed(t.checked));
+            v.detail += s;
+        }
+        v.passed = !countsWrong && !biased && !tooMany;
         return v;
     }
 
 private:
     Hash seed_{};
     std::set<Hash> audited_;
+    std::map<Hash, Tally> tallies_;
 };
 
 }  // namespace xpu2::interactive::rhizome
