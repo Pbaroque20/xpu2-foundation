@@ -3,6 +3,22 @@
 #pragma once
 #include <optix.h>
 #include <optix_device.h>
+// The volume bounds' candidates along a ray, kept by the any-hit program (GpuBackend::volumeCrossings).
+struct VolumeCandidate {
+    float t;
+    unsigned instance, primitive;
+};
+struct VolumeCandidates {
+    enum : unsigned { Max = 16 };
+    unsigned count;
+    VolumeCandidate at[Max];
+};
+// The volumes' maps on the card (volume_core.h's deviceVolumeMaps, defined below).
+#if XPU2_VOLUME_MAPS_MODULE
+// The mapped volume module (async_volumes.cu built a second time): the volumes' maps run in the march. Only this one:
+// the call in the march, though it never ran, slowed every volume 45% (2026-11-07), so the plain module leaves it out.
+#define XPU2_DEVICE_VOLUME_MAPS 1
+#endif
 #include "async_gpu_abi.h"
 #include "points_core.h"
 using namespace xpu2::interactive;
@@ -55,6 +71,41 @@ struct DeviceTextures {
     }
 };
 
+// A mapped volume's maps on the card (volume_core.h's GpuVolumeMaps): the material pool, the textures (none are read:
+// a volume whose maps read them is the host's, mapsOnHost) with the launch thread's third run of map registers (a
+// surface's two stay as they are), and the render space.
+struct DeviceVolumeMaps {
+    const float* pool;
+    DeviceTextures textures;
+    const float* worldToRender;
+};
+namespace xpu2::interactive::volume {
+// The map program on a State with P alone, as the host's (cpu_scene.h's volumeMapped): MoonRay's isect.init and setP.
+// Never inlined (2026-11-07): the map callable called from inside every volume march, inlined, took the volume module's
+// OptiX compile from 12 minutes and 4.6 GB to past 45 minutes and 44 GB; one copy here, called, keeps it to the first.
+static __device__ __noinline__ void deviceVolumeMaps(const void* context, const Shader& s, V3 p, Mapped& m) {
+    if (!s.mapped || s.program == shade::NoMapProgram) return;
+    const DeviceVolumeMaps& d = *static_cast<const DeviceVolumeMaps*>(context);
+    shade::State st;
+    st.P = p;
+    st.Ng = st.N = st.dPds = st.dPdt = st.wo = V3{0, 0, 0};
+    st.worldToRender = d.worldToRender;
+    st.worldToObject = s.worldToGrid;
+    shade::Color* regs = d.textures.registers;
+#if XPU2_MATERIAL_MODULE && XPU2_VOLUME_MAPS_CALLABLE
+    // The map module's callable (async_maps.cu), as the materials call it. Off (2026-11-07): called from the volume
+    // march it set OptiX's compile of the volume module running past 44 GB, in every form tried.
+    const U32 status = optixDirectCall<U32, const float*, U32, const shade::State*, const DeviceTextures*, shade::Color*>(
+        shade::MapsCallable, d.pool, s.program, &st, &d.textures, regs);
+#else
+    // The interpreter built into the volume module, here once (deviceVolumeMaps is never inlined).
+    const U32 status = shade::runMapProgram(d.pool, s.program, st, d.textures, regs);
+#endif
+    if (status != tex::Ready) return;
+    applyMaps(s, regs, m);
+}
+}  // namespace xpu2::interactive::volume
+
 // The material callables' places in the binding table (async_material.cu, async_gpu.h Program::create).
 enum MaterialCall : unsigned {
     CallShade = 0,
@@ -70,6 +121,7 @@ enum MaterialCall : unsigned {
     CallVolumeRadiance = 9,
     CallSubsurfaceRadiance = 10,
     CallVolumeTransmittance = 11,
+    CallEmissiveVolumeIntegral = 18,  // (after the extras module's: the binding table's last)
     // The DwaBase module's (async_dwa.cu), called by the material module.
     CallDwaResolve = shade::DwaResolveCallable,
     CallDwaLobes = shade::DwaLobesCallable,
@@ -503,19 +555,63 @@ struct GpuBackend {
     // The volumes, and a ray's crossings of their meshes past tnear, nearest first (the instances of visibility 2),
     // each entering or leaving by the triangle's geometric normal; repeats at one distance dropped.
     __device__ const volume::Shader* volumes() const { return params.volumes; }
-    // The dense grids (a mapped BaseVolume's baked extinction); VDB volumes are the CPU's.
-    __device__ volume::Grids volumeGrids() const { return volume::Grids{params.volumeGrids, params.volumeGridCount, nullptr, time}; }
-    __device__ volume::Regions emissiveRegions() const { return volume::Regions{}; }  // so are emissive volumes
+    // The VDB volumes' NanoVDB grids and the dense ones (a mapped BaseVolume's baked extinction), and the glowing ones' regions.
+    // With the mapped volumes' maps (volume_core.h's GpuVolumeMaps), the thread's third run of map registers theirs.
+    DeviceVolumeMaps volumeMaps_{};
+    __device__ volume::Grids volumeGrids() {
+        volumeMaps_ = DeviceVolumeMaps{params.materialPool,
+                                       DeviceTextures{params.textures, params.textureCount, threadRegisters() + 2 * params.mapRegisters,
+                                                      params.mapRegisters, nullptr},
+                                       params.config->worldToRender};
+        return volume::Grids{params.volumeGrids, params.volumeGridCount, &volumeMaps_, time};
+    }
+    __device__ volume::Regions emissiveRegions() const { return volume::Regions{params.emissiveRegions, params.emissiveRegionCount, params.emissionPool}; }
     __device__ const float* walkSequences() const { return params.walkSequences; }
     __device__ U32 volumeCrossings(surface::V3 o, surface::V3 d, float tnear, volume::Crossing* x, U32 max, U32 mask) {
         if (!params.volumeTraversable) return 0;
         const long long from = tick();
+        // One traversal, every candidate kept (async_gpu.cu's __anyhit__volumeCrossing; hit groups 2 and 3); then the
+        // loop below takes them as it took one trace's closest hit each: the nearest past t, none: done. Where the trace
+        // could have taken another (two triangles at the nearest distance, one exactly at t: the hardware's choice),
+        // and where there were more than it keeps, the ray's crossings a trace each, as before.
+        VolumeCandidates kept;
+        kept.count = 0;
+        if (volume::gpuOneTraversal()) {
+            const U64 at = reinterpret_cast<U64>(&kept);
+            unsigned p0 = U32(at), p1 = U32(at >> 32);
+            optixTrace(params.volumeTraversable, f3(o), f3(d), tnear, __int_as_float(0x7f800000), time, mask & 0xffu,
+                       OPTIX_RAY_FLAG_ENFORCE_ANYHIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT, 2, 1, 0, p0, p1);
+        }
+        bool fromKept = volume::gpuOneTraversal() && kept.count <= VolumeCandidates::Max;
         U32 n = 0;
         float t = tnear;
         for (U32 k = 0; k < 4 * max && n < max; ++k) {
             unsigned instance = ~0u, primitive = 0;
-            optixTrace(params.volumeTraversable, f3(o), f3(d), t, __int_as_float(0x7f800000), time, mask & 0xffu, OPTIX_RAY_FLAG_DISABLE_ANYHIT, 0, 1, 0,
-                       instance, primitive);
+            if (fromKept) {
+                float nearest = __int_as_float(0x7f800000);
+                bool unsure = false, tied = false;
+                for (U32 j = 0; j < kept.count; ++j) {
+                    const VolumeCandidate& c = kept.at[j];
+                    if (c.t == t) unsure = true;
+                    if (!(c.t > t)) continue;
+                    if (c.t < nearest) {
+                        nearest = c.t, instance = c.instance, primitive = c.primitive;
+                        tied = false;
+                    } else if (c.t == nearest && (c.instance != instance || c.primitive != primitive)) {
+                        tied = true;
+                    }
+                }
+                if (unsure || tied) {  // the hardware's choice: this ray as before, from its start
+                    fromKept = false;
+                    n = 0;
+                    t = tnear;
+                    k = ~0u;  // (0 after the loop's ++k)
+                    continue;
+                }
+            } else {
+                optixTrace(params.volumeTraversable, f3(o), f3(d), t, __int_as_float(0x7f800000), time, mask & 0xffu, OPTIX_RAY_FLAG_DISABLE_ANYHIT, 0, 1,
+                           0, instance, primitive);
+            }
             if (instance == ~0u || instance >= params.config->meshes) break;
             const auto m = params.geometry[instance];
             if (primitive >= m.triangleCount) break;
@@ -528,7 +624,7 @@ struct GpuBackend {
             if (!resume::geometryHit(h, ray, a, b, c)) break;
             const surface::V3 ng = surface::cross(surface::add(b, surface::mul(a, -1.0f)), surface::add(c, surface::mul(a, -1.0f)));
             const U32 v = U32(params.meshVolumes[instance]);
-            // A volume the GPU does not render (VDB, mapped colour or emission, emissive): the CPU lane renders the sample.
+            // A volume the GPU does not render (mapped colour, emission or anisotropy; grids not on the card): the CPU lane renders the sample.
             if (!volume::gpuRenders(params.volumes[v], volumeGrids())) deferFlag = true;
             const U32 flags = surface::dot(d, ng) < 0.0f ? volume::Entry : volume::Exit;
             if (!(n > 0 && x[n - 1].t == h.t && x[n - 1].volume == v && x[n - 1].flags == flags)) x[n++] = volume::Crossing{h.t, v, flags};
@@ -568,6 +664,13 @@ __device__ inline surface::V3 subsurfaceRadianceCall(const mixed::Config& c, con
                           const resume::Hit*, surface::V3, const shade::Bsdf*, bool, paths::Pending*, U32*, SampleStatus*, const SubsurfaceLpe*,
                           shade::Color*, surface::V3*>(CallSubsurfaceRadiance, &c, &root, &backend, lightSet, &pv, subsurfaceDepth, &st, &hit, rayDir,
                                                        &bsdf, doIndirect, stack, &top, &status, lpe, ssAov, &out);
+    return out;
+}
+__device__ inline surface::V3 emissiveVolumeIntegralCall(const mixed::Config& c, GpuBackend& backend, paths::Stream& s, surface::V3 org,
+                                                         surface::V3 dir, float tnear, float tEnd, U32 volume, int depth) {
+    surface::V3 out{0, 0, 0};
+    optixContinuationCall<void, const mixed::Config*, GpuBackend*, paths::Stream*, surface::V3, surface::V3, float, float, U32, int, surface::V3*>(
+        CallEmissiveVolumeIntegral, &c, &backend, &s, org, dir, tnear, tEnd, volume, depth, &out);
     return out;
 }
 __device__ inline surface::V3 volumeTransmittanceCall(const mixed::Config& c, GpuBackend& backend, paths::Stream& s, surface::V3 org,

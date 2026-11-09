@@ -979,11 +979,14 @@ inline MotionParams motionParams(const rdl::SceneVariables& sv,const rdl::SceneO
 // Whether a mesh has motion data or a moving transform (meshMotionSteps then places its vertices).
 inline bool meshHasMotion(const rdl::SceneObject& o){
  namespace sm=scene_rdl2::math;
- return !sm::isEqual(sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN)),sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END)))||
-        // A second step the same as the first is no motion: a host may write one for meshes that do not deform.
-        (!o.get<rdl::Vec3fVector>("vertex_list_1").empty()&&o.get<rdl::Vec3fVector>("vertex_list_1")!=o.get<rdl::Vec3fVector>("vertex_list_0"))||
-        !o.get<rdl::Vec3fVector>("velocity_list_0").empty()||
-        !o.get<rdl::Vec3fVector>("velocity_list_1").empty()||!o.get<rdl::Vec3fVector>("accleration_list").empty();}
+ if(!sm::isEqual(sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN)),sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END))))return true;
+ // Asked of any geometry: a VdbGeometry has none of these lists, and asking one it does not have throws.
+ // A second step the same as the first is no motion: a host may write one for meshes that do not deform.
+ for(const char* name:{"vertex_list_1","velocity_list_0","velocity_list_1","accleration_list"})
+  for(auto i=o.getSceneClass().beginAttributes();i!=o.getSceneClass().endAttributes();++i)
+   if((*i)->getName()==name&&!o.get<rdl::Vec3fVector>(name).empty()&&
+      (std::string(name)!="vertex_list_1"||o.get<rdl::Vec3fVector>(name)!=o.get<rdl::Vec3fVector>("vertex_list_0")))return true;
+ return false;}
 inline std::vector<std::vector<V3>> meshMotionSteps(const rdl::SceneObject& o,const MotionParams& mp,const rdl::Mat4d& xform0,const rdl::Mat4d& xform1,
                                                     bool staticTakesSecond=true,std::vector<float>* radiusScales=nullptr,
                                                     const std::vector<float>* w0=nullptr,const std::vector<float>* w1=nullptr,
@@ -1774,6 +1777,10 @@ inline std::vector<std::shared_ptr<const ix::Buffer>> deepSignature(const rdl::S
 #include "mesh_displacement.h"
 #include "coarse_geometry.h"
 namespace xpu2::interactive::cpu {
+// Whether a mapped volume's maps run on the host alone (volume_core.h's mapsOnHost): they read image textures, or
+// XPU2_GPU_VOLUME_MAPS_OFF (the card leaves every mapped volume to the CPU lane, as before, to compare).
+inline unsigned volumeMapsOnHost(const MapProgramBuilder& program){
+ static const bool off=std::getenv("XPU2_GPU_VOLUME_MAPS_OFF")!=nullptr;return off||program.readsTextures?1u:0u;}
 // A BaseVolume with bound attributes (KindBaseMapped): its attenuation colour, intensity and factor, diffuse colour,
 // emission colour and intensity and anisotropy, each bound one a register of one map program, the rest as admitVolume
 // reads them. Its extinction is baked or evaluated at the render origin once the textures are read (bakeVolume).
@@ -1788,7 +1795,7 @@ inline volume::Shader admitMappedVolume(const rdl::SceneObject& o,unsigned light
   const rdl::SceneObject* bound=a?o.getBinding(*a):nullptr;
   if(bound){s.regs[k]=program.reg(*bound);s.mapped|=1u<<k;}}
  need(!program.polyVertices,o.getName()+": a polygon map in a volume is not rendered");
- s.program=program.finish();
+ s.program=program.finish();s.mapsOnHost=volumeMapsOnHost(program);
  s.originAttenuation=(s.flags&volume::MatchAlbedo)?s.albedoColor:s.attenuationColor;s.originIntensity=s.intensity;s.originFactor=s.factor;
  return s;}
 // A mapped volume's bound values at p (world): its map program on a State with P alone (MoonRay's isect.init and
@@ -1798,11 +1805,7 @@ template<class Tex> inline void volumeMapped(const volume::Shader& s,const float
  shade::State st;st.P=p;st.Ng=st.N=st.dPds=st.dPdt=st.wo=V3{0,0,0};st.worldToRender=worldToRender;st.worldToObject=s.worldToGrid;
  shade::Color regs[shade::MapMaxRegisters];
  if(shade::runMapProgram(pool,s.program,st,textures,regs)!=tex::Ready)return;
- auto color=[&](unsigned k,V3& v){if(!(s.mapped>>k&1)||(v.x==0.0f&&v.y==0.0f&&v.z==0.0f))return;const shade::Color c=regs[s.regs[k]];v=V3{v.x*c.x,v.y*c.y,v.z*c.z};};
- auto scalar=[&](unsigned k,float& f){if(!(s.mapped>>k&1)||shade::isZero(f))return;const shade::Color c=regs[s.regs[k]];f*=(c.x+c.y+c.z)/3.0f;};
- color(volume::MapAttenuationColor,m.attenuationColor);scalar(volume::MapAttenuationIntensity,m.attenuationIntensity);
- scalar(volume::MapAttenuationFactor,m.attenuationFactor);color(volume::MapAlbedo,m.albedoColor);color(volume::MapEmissionColor,m.emissionColor);
- scalar(volume::MapEmissionIntensity,m.emissionIntensity);scalar(volume::MapAnisotropy,m.anisotropy);}
+ volume::applyMaps(s,regs,m);}  // as the card applies them (deviceVolumeMaps)
 // A VdbVolume's bound attributes (VdbVolume.cc): opacity_gain_mult, color_mult, incandescence_gain_mult and
 // anisotropy, a register each of one map program.
 inline void admitVdbMaps(volume::Shader& s,const rdl::SceneObject& o,Plan& plan,TextureContext& textureContext){
@@ -1813,7 +1816,7 @@ inline void admitVdbMaps(volume::Shader& s,const rdl::SceneObject& o,Plan& plan,
   for(auto i=o.getSceneClass().beginAttributes();i!=o.getSceneClass().endAttributes();++i)if((*i)->getName()==name)a=*i;
   const rdl::SceneObject* bound=a?o.getBinding(*a):nullptr;if(bound){s.regs[k]=program.reg(*bound);s.mapped|=1u<<k;}}
  need(!program.polyVertices,o.getName()+": a polygon map in a volume is not rendered");
- s.program=program.finish();}
+ s.program=program.finish();s.mapsOnHost=volumeMapsOnHost(program);}
 inline void runVolumeMaps(const void* context,const volume::Shader& s,V3 p,volume::Mapped& m){
  const Plan& plan=*static_cast<const Plan*>(context);
  const displace::Textures textures{plan.textureImages.data(),unsigned(plan.textureImages.size())};

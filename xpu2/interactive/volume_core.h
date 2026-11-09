@@ -33,6 +33,10 @@ constexpr U32 MaxSteps = MarchLimit;
 // the host samples them (volume_grid.h), marched with no table of steps (async_integrator.h's ReplaySteps). Off: their
 // samples go to the CPU lane, as before.
 constexpr bool GpuVdb = true;
+// GPU_EMISSION: glowing volumes (BaseVolume emission, a VDB's emission grid) on the CUDA lane: their emissive regions
+// uploaded with the grids (async_gpu.h's uploadRegions) and sampled as the host samples them (volume_emission.h). Off:
+// a scene with one renders on the CPU lane alone, as before.
+constexpr bool GpuEmission = true;
 constexpr float Epsilon = 1.1920928955078125e-07f;  // scene_rdl2 sEpsilon
 constexpr float HitEpsilonStart = 1e-5f;            // pbr sHitEpsilonStart
 constexpr float FarLimit = 0.999f * lights::DistantDistance;  // sHitEpsilonEnd * sDistantLightDistance
@@ -88,13 +92,53 @@ struct Shader {
     float tShutterOpen, tShutterRange;
     float worldToGrid1[12], gridToWorld[12], gridToWorld1[12];
     float surfaceOpacityThreshold;  // VolumeShader's surface_opacity_threshold (the state AOVs' volume surface)
+    // Its maps run on the host alone (gpuRenders): they read image textures (a tile not on the card cannot be waited
+    // for in the middle of a march), or XPU2_GPU_VOLUME_MAPS_OFF. Otherwise the card runs them too (GpuVolumeMaps).
+    U32 mapsOnHost;
 };
-// A mapped volume's bound values at a point (the unbound ones its constants): the host's map programs (cpu_scene.h's
-// volumeMapped), through Grids::maps.
+// GPU_VOLUME_MAPS: mapped volumes on the CUDA lane: their map programs (procedural maps, constants, ramps; no image
+// textures) run at each sample point by the map interpreter built into the volume module (async_gpu_device.h's deviceVolumeMaps), as the host
+// runs them, so a glowing volume whose maps give its emission no longer leaves the whole scene to the CPU. Off: their
+// samples go to the CPU lane, and a glowing one sends the scene there, as before.
+constexpr bool GpuVolumeMaps = true;
+// GPU_MARCH_CHECKPOINTS: the card's step lookups (async_integrator.h's ReplaySteps) resume the march from the first
+// march's checkpoints instead of marching again from the ray's start: the same steps bit for bit, fewer of them.
+X2_HD constexpr bool gpuMarchCheckpoints() { return true; }  // (a function: no module keeps it as a global)
+// GPU_ONE_TRAVERSAL: a ray's volume crossings from one traversal of the volume bounds (every candidate kept), not a trace
+// a crossing: the same crossings, bit for bit.
+X2_HD constexpr bool gpuOneTraversal() { return true; }
+// A mapped volume's bound values at a point (the unbound ones its constants): the map programs (cpu_scene.h's
+// volumeMapped on the host, deviceVolumeMaps on the card), through Grids::maps.
 struct Mapped {
     V3 attenuationColor, albedoColor, emissionColor;
     float attenuationIntensity, attenuationFactor, emissionIntensity, anisotropy;
 };
+// A map program's registers into a mapped volume's values (both lanes): each bound value times its map's colour
+// (evalColor) or the colour's average (evalFloat), unless zero.
+X2_HD inline void applyMaps(const Shader& s, const surface::V3* regs, Mapped& m) {
+    auto color = [&](unsigned k, V3& v) {
+        if (!(s.mapped >> k & 1) || (v.x == 0.0f && v.y == 0.0f && v.z == 0.0f)) return;
+        const V3 c = regs[s.regs[k]];
+        v = V3{v.x * c.x, v.y * c.y, v.z * c.z};
+    };
+    auto scalar = [&](unsigned k, float& f) {
+        if (!(s.mapped >> k & 1) || fabsf(f) <= 1e-6f) return;  // shade::isZero
+        const V3 c = regs[s.regs[k]];
+        f *= (c.x + c.y + c.z) / 3.0f;
+    };
+    color(MapAttenuationColor, m.attenuationColor);
+    scalar(MapAttenuationIntensity, m.attenuationIntensity);
+    scalar(MapAttenuationFactor, m.attenuationFactor);
+    color(MapAlbedo, m.albedoColor);
+    color(MapEmissionColor, m.emissionColor);
+    scalar(MapEmissionIntensity, m.emissionIntensity);
+    scalar(MapAnisotropy, m.anisotropy);
+}
+#if defined(__CUDACC__) && defined(XPU2_DEVICE_VOLUME_MAPS)
+// The card's run of a mapped volume's maps at p (world), context its DeviceVolumeMaps (async_gpu_device.h, which sets
+// XPU2_DEVICE_VOLUME_MAPS; a CUDA file without it, the adaptive kernels, has no volumes).
+static __device__ __noinline__ void deviceVolumeMaps(const void* context, const Shader& s, V3 p, Mapped& m);
+#endif
 struct MapEval {
     void (*run)(const void* context, const Shader& s, V3 p, Mapped& values);
     const void* context;
@@ -116,26 +160,37 @@ struct Step {
     float surfaceThreshold;    // its surface opacity threshold (1 with no volume)
 };
 X2_HD inline bool homogeneous(const Shader& s) { return s.kind == KindBase; }
-// Whether the GPU's programs render a volume (async_gpu.h, async_gpu_device.h): a homogeneous BaseVolume, or a mapped
-// one whose maps give its attenuation alone (baked into a dense grid the GPU holds, or taken at the render origin
-// unbaked), neither emitting. VDB volumes, and mapped ones whose maps give their colour, emission or anisotropy (the
-// host's map programs at each point), are the CPU lane's: their samples are deferred to it.
+// Whether the GPU's programs render a volume (async_gpu.h, async_gpu_device.h): a homogeneous BaseVolume, a VDB volume
+// whose grids are on the card, or a mapped one whose maps give its attenuation alone (baked into a dense grid the GPU
+// holds, or taken at the render origin unbaked); glowing or not (GpuEmission: their emissive regions are on the card
+// too). Mapped ones whose maps give their colour, emission or anisotropy run those maps on the card too (GpuVolumeMaps)
+// unless the maps read image textures: those are the CPU lane's, their samples deferred to it.
+// The maps the card would run at each point: those that give more than the attenuation (baked into a grid, or taken
+// at the render origin, on the host).
+X2_HD inline bool pointMaps(const Shader& s) {
+    const U32 attenuation = (1u << MapAttenuationColor) | (1u << MapAttenuationIntensity) | (1u << MapAttenuationFactor);
+    return (s.mapped & ~attenuation) != 0;
+}
 X2_HD inline bool gpuRenders(const Shader& s, const Grids& grids) {
-    if (s.emission.x != 0.0f || s.emission.y != 0.0f || s.emission.z != 0.0f) return false;
+    if (!GpuEmission && (s.emission.x != 0.0f || s.emission.y != 0.0f || s.emission.z != 0.0f)) return false;
     if (s.kind == KindBase) return true;
+    // Point maps the card runs (GpuVolumeMaps), unless they read textures (mapsOnHost).
+    const bool mapsHere = !pointMaps(s) || (GpuVolumeMaps && !s.mapsOnHost);
     if (s.kind == KindVdb) {
-        // A VDB volume the GPU samples from its NanoVDB grids (volume_grid.h): one that does not glow (an emissive volume
-        // lights every surface, left to the CPU lane with all its samples) and is not mapped (the maps run on the host),
-        // its grids on the card (null where uploadGrids has not sent them: then deferred, as before).
+        // A VDB volume the GPU samples from its NanoVDB grids (volume_grid.h): one that is not mapped (the maps run on
+        // the host), its grids on the card (null where uploadGrids has not sent them: then deferred, as before), its
+        // emission grid too where it glows.
         if (!GpuVdb) return false;
         auto there = [&](U32 g) { return g == NoGrid || (g < grids.count && (grids.grids[g].data || grids.grids[g].dense)); };
-        return !s.mapped && s.emissionGrid == NoGrid && s.densityGrid != NoGrid && there(s.densityGrid) && there(s.bakedGrid) &&
-               (!s.hasVelocity || there(s.velocityGrid));
+        const bool maps = !s.mapped || (GpuVolumeMaps && mapsHere);
+        return maps && (GpuEmission ? there(s.emissionGrid) : s.emissionGrid == NoGrid) && s.densityGrid != NoGrid &&
+               there(s.densityGrid) && there(s.bakedGrid) && (!s.hasVelocity || there(s.velocityGrid));
     }
     if (s.kind != KindBaseMapped) return false;
-    const U32 attenuation = (1u << MapAttenuationColor) | (1u << MapAttenuationIntensity) | (1u << MapAttenuationFactor);
-    if (s.mapped & ~attenuation) return false;
-    if (s.emissionIntensity != 0.0f && (s.emissionColor.x != 0.0f || s.emissionColor.y != 0.0f || s.emissionColor.z != 0.0f)) return false;
+    // Maps that give its colour, emission or anisotropy: the card runs them (GpuVolumeMaps) unless they read textures.
+    if (!mapsHere) return false;
+    if (!GpuEmission && s.emissionIntensity != 0.0f && (s.emissionColor.x != 0.0f || s.emissionColor.y != 0.0f || s.emissionColor.z != 0.0f))
+        return false;
     return s.densityGrid == NoGrid || (s.densityGrid < grids.count && grids.grids[s.densityGrid].dense);
 }
 // A point in the volume's grid world (its geometry's own space).
@@ -230,9 +285,11 @@ X2_HD inline Local localAt(const Shader& s, const Grids& grids, V3 p, float dept
         const float density = sampleFloat(grids, s.densityGrid, gp, interpolation);
         const V3 temperature = s.emissionGrid != NoGrid ? sampleVec3(grids, s.emissionGrid, gp, InterpolationPoint) : V3{0, 0, 0};
         Mapped m{s.gain, s.colorMult, s.incandescence, 1.0f, 1.0f, 1.0f, s.g};
-#if !defined(__CUDACC__)
+        // The maps at the sample's render position (transformVolumeSamplePosition of the advected point).
+#if defined(__CUDACC__) && defined(XPU2_DEVICE_VOLUME_MAPS)
+        if (pointMaps(s) && grids.maps) deviceVolumeMaps(grids.maps, s, worldPointAt(s, gp, grids.time), m);
+#elif !defined(__CUDACC__)
         if (s.mapped && grids.maps) {
-            // The maps at the sample's render position (transformVolumeSamplePosition of the advected point).
             const MapEval* e = static_cast<const MapEval*>(grids.maps);
             e->run(e->context, s, worldPointAt(s, gp, grids.time), m);
         }
@@ -244,7 +301,9 @@ X2_HD inline Local localAt(const Shader& s, const Grids& grids, V3 p, float dept
     if (s.kind == KindBaseMapped) {
         if (s.flags & DepthFixed) depth = -1.0f;
         Mapped m{s.attenuationColor, s.albedoColor, s.emissionColor, s.intensity, s.factor, s.emissionIntensity, s.g};
-#if !defined(__CUDACC__)
+#if defined(__CUDACC__) && defined(XPU2_DEVICE_VOLUME_MAPS)
+        if (pointMaps(s) && grids.maps) deviceVolumeMaps(grids.maps, s, p, m);
+#elif !defined(__CUDACC__)
         if (s.mapped && grids.maps) {
             const MapEval* e = static_cast<const MapEval*>(grids.maps);
             e->run(e->context, s, p, m);

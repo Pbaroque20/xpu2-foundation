@@ -5,7 +5,9 @@
 How XPU2 works, part by part, with the files behind each part. Written 2026-10-25; updated 2026-10-26 for the
 tessellation handler and the second round of scene preparation (`INDEXER.md` sections 16 and 17); corrected 2026-10-30
 against `MoonLightIPR` at 422a003, the 0.5 release, where XPU2 is part of the kit; updated 2026-11-04 for release 0.5.3
-and what came after it (card memory, subdivision under motion). The design notes it points to go
+and what came after it (card memory, subdivision under motion); updated 2026-11-08 for volumes on the card (VDB,
+mapped and glowing ones), march checkpoints, volume crossings in one traversal, the shader compile's memory guard and
+emission grids of single values. The design notes it points to go
 deeper. Where this manual and the code disagree, the code wins: fix the manual.
 
 All paths are relative to `xpu2/interactive/` unless they start with `xpu2/` or another top-level folder.
@@ -225,11 +227,34 @@ Design: `ASYNC.md` ("How a frame runs"), `INDEXER.md` section 7.
   OptiX denoiser works, else to Open Image Denoise on the CPU (`DenoiseEngine`). `--list-devices` lists the cards and
   processor groups; `XPU2_CARD_LIST` and `XPU2_GROUP_LIST` choose among them; `--compile-shaders` compiles for every card.
 - **The program in modules.** OptiX compiles each module separately and in parallel, but a module's call graph
-  compiles as a whole, so the program is split until no module is large. Today it has nine modules (section 12 lists
-  them). Direct callables can't trace rays in OptiX 7.6, so anything that traces is a continuation callable or stays
-  in ray generation. Callable modules are compiled relocatable (`-rdc`), or NVRTC drops their entry points. Big
-  helpers are kept out of line (`X2_CALL`, beside `X2_HD` in `sample_stream.h`). An OptiX call inside a callable can
-  take a module's compile from seconds to tens of minutes.
+  compiles as a whole, so the program is split until no module is large. Today it has nine modules, the volume module
+  built twice (section 12 lists them). Direct callables can't trace rays in OptiX 7.6, so anything that traces is a
+  continuation callable or stays in ray generation. Callable modules are compiled relocatable (`-rdc`), or NVRTC drops
+  their entry points. Big helpers are kept out of line (`X2_CALL`, beside `X2_HD` in `sample_stream.h`). An OptiX call
+  inside a callable can take a module's compile from seconds to tens of minutes, and its memory past what the machine
+  has: a direct callable for the map program inside the volume march took the compile past 44 GB (2026-11-07). The map
+  interpreter is built into the volume module instead. A constant the device code reads is an enum or a `constexpr`
+  function, never a namespace-scope variable: PTX keeps that as a global in every module, so changing it would
+  compile them all again.
+- **Volumes on the card** (since 2026-11-07). The GPU marches homogeneous, heterogeneous and VDB volumes (VDB from
+  their NanoVDB grids, `volume_grid.h`), glowing ones included (their emissive regions uploaded, `uploadRegions`).
+  A volume whose maps the card can run (procedural maps, constants, ramps) runs its map program at each sample point.
+  The volume module is built twice for this: plain, and with the map interpreter in its march
+  (`XPU2_VOLUME_MAPS_MODULE`, the runtime's `volumemaps/` folder). The second is bound only for a scene with such
+  volumes, since the interpreter slowed every volume by 45% even where it was never called. Volumes whose maps read
+  image textures stay on the CPU lane (`mapsOnHost`): a tile not on the card can't be waited for in the middle of a
+  march. Two changes keep the march fast and every step bit for bit the same:
+  - **March checkpoints** (`MarchRecord`, `MarchCheckpoint` in `async_integrator.h`). The card keeps no table of a
+    march's steps (a VDB cloud's thousands don't fit a thread), so it finds a step again by marching again. The first
+    march now keeps eight checkpoints, every so many steps, the stride doubled when they are all taken. A later
+    lookup resumes from the nearest one, with the same random stream and running sums, instead of from the ray's start.
+  - **Crossings in one traversal** (`volumeCrossings` in `async_gpu_device.h`, `__anyhit__volumeCrossing`). One trace
+    of the volume bounds collects every candidate, and the closest-first loop takes them as it took one trace's
+    closest hit each. Where the trace could have chosen differently (two hits at the same distance, one exactly at the
+    current distance), or there were more candidates than it keeps, the ray goes back to a trace a crossing.
+  On an RTX 3090, timed interleaved because the card's clocks drift between sessions: a VDB cloud 86–90 s to 57 s, a
+  glowing mapped volume 36–37 s to 27.5 s, a scene without volumes unchanged, every picture bit-identical. Before
+  them, volume crossings took 56% of the GPU's time and shadow rays 20%.
 - **Profile.** `XPU2_PROFILE` times each stage on the GPU (rays, shadow rays, material callables, presence, volume
   crossings) and counts rays per sample.
 
@@ -238,8 +263,7 @@ Design: `ASYNC.md` ("How a frame runs"), `INDEXER.md` section 7.
 `async_cpu.h`. Persistent, pinned workers claim their own chunks by the cellular rules. Embree, in robust mode,
 traverses triangles, and user geometry handles curves and points. The CPU lane:
 
-- renders every feature XPU2 has, including those the GPU defers (today: VDB volumes, and heterogeneous and emissive
-  volumes);
+- renders every feature XPU2 has, including those the GPU defers (today: volumes whose maps read image textures);
 - works through the retry queue: deferred GPU samples, each re-rendered whole from its identity;
 - re-renders provisional samples in full: every texture level is in RAM, so the CPU never misses;
 - keeps its own film, merged with the GPU's when the frame ends;
@@ -247,7 +271,8 @@ traverses triangles, and user geometry handles curves and points. The CPU lane:
   knowing its node (`multi::places`, `multi::currentNode`).
 
 Some features keep a whole scene on the CPU lane because the GPU programs lack them and they affect every sample
-(`GpuLane::cpuOnly`): today, light filters, shadow linking, lobe light sets and emissive volumes.
+(`GpuLane::cpuOnly`): today, light filters, shadow linking, lobe light sets, and glowing volumes whose maps read image
+textures (a GPU sample that doesn't cross one would still miss its light).
 
 ## 8. The shared integrator
 
@@ -371,7 +396,7 @@ against MoonRay renders (section 15). MoonRay XPU is also the fallback for scene
 | `map_admission.h` | Material bindings into `MapBinding`s and each material's map program, in dependency order |
 | `mesh_displacement.h` | MoonRay's PolyMesh tessellation and displacement for triangle meshes |
 | `light_tree_build.h`, `light_image_build.h`, `light_mesh_build.h` | Light tree, light textures and mesh lights, built on the host |
-| `xpu2_geom.cc`, `xpu2_geom.h` (`xpu2_geom.dll`) | MoonRay's own OpenSubdiv tessellation, displacement callbacks and OpenVDB reading, built separately with MoonRay's flags so XPU2's build never sees MoonRay's internal headers |
+| `xpu2_geom.cc`, `xpu2_geom.h` (`xpu2_geom.dll`) | MoonRay's own OpenSubdiv tessellation, displacement callbacks and OpenVDB reading, built separately with MoonRay's flags so XPU2's build never sees MoonRay's internal headers. An emission grid of single values (temperature or flames, as EmberGen, Houdini and Blender write fire) is read as grey RGB where `MOONRAY_MODO_SCALAR_EMISSION=1` (`emissionAsRgb`), as the kit's patched MoonRay reads it; otherwise it is refused as MoonRay refuses it |
 | `xpu2/indexed_scene.h`, `xpu2/rdl_scene_index.h`, `xpu2/rdl_replica.h`, `canonical_session.h` | The RDL capture under the indexer (section 4) |
 
 **Outputs**
@@ -395,7 +420,7 @@ against MoonRay renders (section 15). MoonRay XPU is also the fallback for scene
 | `async_maps.cu` | The map interpreter |
 | `async_lights.cu` | Light shapes: sampled, intersected, evaluated |
 | `async_lobes.cu` | Lobes: evaluated, sampled, their albedo |
-| `async_volumes.cu` | Volume radiance, subsurface, shadow transmittance (continuation callables) |
+| `async_volumes.cu` | Volume radiance, subsurface, shadow transmittance (continuation callables). Built twice: plain, and with the map interpreter in the march (`XPU2_VOLUME_MAPS_MODULE`, `volumemaps/`) for scenes whose volumes the card maps |
 | `async_dwa.cu` | DwaBase resolve: a tree's layers blended |
 | `async_dwalobes.cu` | A resolved DwaBase material's lobes, glitter |
 | `async_extras.cu` | The camera, AOVs |
@@ -450,10 +475,18 @@ Modo ── MoonRay for Modo kit ───────────────�
 
 What the session does besides rendering:
 
-- **Shader cache.** `--compile-shaders` compiles the GPU programs into OptiX's disk cache (about an hour the first
-  time) and leaves a mark for this driver and these programs. `--shaders-compiled` exits 0 when the mark is there and
-  3 when it isn't. If the cache is gone (a driver update, the cache's size limit), the session hands the scene to
-  MoonRay after a minute rather than compile for an hour.
+- **Shader cache.** `--compile-shaders` compiles the GPU programs into OptiX's disk cache and leaves a mark for this
+  driver and these programs. With the map interpreter in the volume module the whole compile took 8 minutes and
+  4.2 GB of RAM at its peak (RTX 3090, 2026-11-07); it once took about an hour.
+- **The compile's memory guard** (`CompileGuard`, `xpu2_session.cc`). Before it begins, the compile wants 8 GB of RAM
+  free (`CompileNeedGB`, twice the measured peak; `XPU2_COMPILE_NEED_GB` another, `XPU2_COMPILE_ANYWAY=1` skips the
+  check), else it says so and exits 3. While it runs, free RAM is looked at each second. Under a floor (a twentieth of
+  the machine's, at least 2 GB) it stops itself with exit 4 before Windows runs out. OptiX's cache keeps the modules
+  it finished, so compiling again goes on from there. Its tasks also wait while RAM is short
+  (`GpuLane::compileMemoryRoom`).
+- **Shaders compiled or not.** `--shaders-compiled` exits 0 when the mark is there and 3 when it isn't. If the cache
+  is gone (a driver update, the cache's size limit), the session hands the scene to MoonRay after a minute rather than
+  wait for the compile.
 - **Outlines** for the kit: `@@MODO_TILES` (cells being rendered), `@@MODO_WORKERS` (each CPU worker's tile) and
   `@@MODO_GPU_WORKERS` (cells the GPU's queued launches hold, drawn in their own colour).
 - **Checkpoints** (class `Checkpoints`): the frame so far, saved every `checkpoint_interval` minutes, with MoonRay's
@@ -497,7 +530,7 @@ python xpu2/interactive/build_async.py --source $toolchainRoot --runtime $refere
 #    of build N, and the pinned runtime's libraries
 python xpu2/interactive/build_session.py --source $toolchainRoot --runtime $referenceRoot --build test-results/async-build-N --output test-results/xpu2-session-N
 
-# 3. Compile the GPU programs into OptiX's cache (about an hour the first time; cached after)
+# 3. Compile the GPU programs into OptiX's cache (8 minutes and 4.2 GB at its peak on an RTX 3090; cached after)
 test-results/xpu2-session-N/runtime-xpu2/moonray_xpu2.exe --compile-shaders
 
 # 4. A release: XPU2 is part of the standard kit (kit/MoonRayForModo); the package adds the session's folder as runtime-xpu2
@@ -591,6 +624,10 @@ Environment variables read by the session or the renderer. The defaults are the 
 | `XPU2_SESSION_MEMORY_MB` | The session's memory ceiling (added 2026-10-26) |
 | `XPU2_ASYNC_STACKS=1` | Logs the GPU program's stacks and each thread's scratch (added 2026-11-02) |
 | `XPU2_GPU_MOTION_OFF=1` | Points, and geometry and lights in motion, left to the CPU lane as before the GPU rendered them, to compare |
+| `XPU2_GPU_VOLUME_MAPS_OFF=1` | Mapped volumes' samples to the CPU lane, and a glowing mapped one sends the scene there, as before the card ran their maps (added 2026-11-07) |
+| `XPU2_COMPILE_NEED_GB`, `XPU2_COMPILE_ANYWAY=1` | The free RAM the shader compile wants before it begins (default 8), or no check (added 2026-11-07) |
+| `XPU2_COMPILE_RESERVE_GB`, `XPU2_COMPILE_THREADS` | The RAM a compile task leaves free before another starts (default an eighth of the machine's, at least 4); the tasks at once (default up to 16) |
+| `MOONRAY_MODO_SCALAR_EMISSION` | `1`: an emission grid of single values read as grey (`xpu2_geom.dll`; the kit sets it from its preference, on by default); unset or `0`, refused as MoonRay itself refuses it |
 | `XPU2_SESSION_FAIL_TILE=N` | The Nth texture tile read fails, to test what follows one |
 | `XPU2_SESSION_RT_SPARSE=1` | Realtime's sparse first passes (a quarter of the pixels, then the rest) back |
 | `XPU2_SESSION_RT_UPSCALE=0` | Realtime denoises at full size while moving (the kit's Lower Resolution While Moving off) |
@@ -713,7 +750,7 @@ From the design notes. Each has more detail where it's listed.
 
 **MoonRay port**
 
-- On the GPU: VDB, heterogeneous and emissive volumes (deferred to the CPU today); light filters, shadow linking and lobe light sets (they keep a scene on the CPU today).
+- On the GPU: volumes whose maps read image textures (deferred to the CPU today; VDB, heterogeneous, mapped and glowing volumes render on the card since 2026-11-07); light filters, shadow linking and lobe light sets (they keep a scene on the CPU today).
 - An instanced displaced polygon mesh that deforms (it goes to MoonRay XPU today; subdivision ones render since 2026-11-02).
 - Deforming subdivision surfaces and their instances are checked by eye on one test scene, not yet against MoonRay.
 - Resuming from a checkpoint, and deep output (`FEATURE_PROGRESS.md`).

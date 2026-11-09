@@ -2,8 +2,8 @@
 // DenseEmissionDistribution, a 3D histogram of the volume's emission luminance laid on a box of voxels). A region is
 // sampled by a voxel picked through the histogram's marginals (Distribution3D, its 1D distributions as PBRT's), a
 // direction toward a place in it, and that direction's pdf by a DDA along the ray through the box (Simon's line
-// integral of the 3D pdf, EGSR 2017). Shared by the lanes (the CUDA lane leaves emissive volumes to the CPU,
-// async_gpu.h). Derived from MoonRay Apache-2.0, Copyright 2023-2024 DreamWorks Animation LLC (MOONRAY_LICENSE.txt).
+// integral of the 3D pdf, EGSR 2017). Shared by the lanes (the CUDA lane's regions uploaded by async_gpu.h's
+// uploadRegions). Derived from MoonRay Apache-2.0, Copyright 2023-2024 DreamWorks Animation LLC (MOONRAY_LICENSE.txt).
 #pragma once
 #include "surface_core.h"
 

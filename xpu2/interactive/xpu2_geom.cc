@@ -50,6 +50,7 @@
 #include <string>
 #include <vector>
 
+#include <cstdlib>
 #include <openvdb/openvdb.h>
 #include <openvdb/io/File.h>
 #include <openvdb/io/GridDescriptor.h>
@@ -533,6 +534,38 @@ void leafBlocks(const openvdb::FloatTree& tree, X2VdbGrid* out) {
     std::copy(cells.begin(), cells.end(), out->blocks);
 }
 
+// MOONRAY_MODO_SCALAR_EMISSION (MoonRay's patched VdbVolume, tools/port_scalar_emission.py): a float emission grid glows grey.
+bool modoScalarEmission() {
+    static const bool on = [] {
+        const char* value = std::getenv("MOONRAY_MODO_SCALAR_EMISSION");
+        return value && value[0] == '1';
+    }();
+    return on;
+}
+// The float grid as an RGB grid of the same shape, each value v as (v, v, v): VdbVolume.cc's modoGreyGrid, step for step.
+openvdb::VectorGrid::Ptr modoGreyGrid(const openvdb::FloatGrid& scalar) {
+    const float background = scalar.background();
+    openvdb::VectorGrid::Ptr grey = openvdb::VectorGrid::create(openvdb::Vec3f(background, background, background));
+    grey->setTransform(scalar.transform().copy());
+    grey->setName(scalar.getName());
+    grey->tree().topologyUnion(scalar.tree());
+    const openvdb::FloatGrid::ConstAccessor values = scalar.getConstAccessor();
+    for (auto it = grey->beginValueAll(); it; ++it) {
+        const float v = values.getValue(it.getCoord());
+        it.setValue(openvdb::Vec3f(v, v, v));
+    }
+    return grey;
+}
+// An emission grid as RGB: an RGB grid as it is, a float one grey where the switch is on; none for another.
+openvdb::VectorGrid::Ptr emissionAsRgb(openvdb::io::File& file, const openvdb::GridBase::Ptr& meta, const std::string& gridName) {
+    if (!meta) return nullptr;
+    if (meta->isType<openvdb::VectorGrid>()) return openvdb::gridPtrCast<openvdb::VectorGrid>(file.readGrid(gridName));
+    if (meta->isType<openvdb::FloatGrid>() && modoScalarEmission()) {
+        const auto scalar = openvdb::gridPtrCast<openvdb::FloatGrid>(file.readGrid(gridName));
+        return scalar ? modoGreyGrid(*scalar) : nullptr;
+    }
+    return nullptr;
+}
 // VdbVolume.cc's findNthGridByName: the nth grid of a name ("name[n]" in OpenVDB's unique-name form), the first
 // without a suffix.
 openvdb::GridBase::Ptr findNthGrid(const openvdb::GridPtrVec& grids, const std::string& name) {
@@ -572,11 +605,12 @@ extern "C" __declspec(dllexport) int x2VdbRead(const char* path, const char* gri
             fail(error, errorSize, std::string("the grid \"") + gridName + "\" is not in " + path);
             return 0;
         }
-        if (vec3 ? !meta->isType<openvdb::VectorGrid>() : !meta->isType<openvdb::FloatGrid>()) {
+        const bool grey = vec3 && meta->isType<openvdb::FloatGrid>() && modoScalarEmission();
+        if (vec3 ? !meta->isType<openvdb::VectorGrid>() && !grey : !meta->isType<openvdb::FloatGrid>()) {
             fail(error, errorSize, std::string("the grid \"") + gridName + (vec3 ? "\" is not an RGB grid" : "\" is not a float grid"));
             return 0;
         }
-        const openvdb::GridBase::Ptr grid = file.readGrid(gridName);
+        const openvdb::GridBase::Ptr grid = grey ? openvdb::GridBase::Ptr(emissionAsRgb(file, meta, gridName)) : file.readGrid(gridName);
         if (!grid || grid->empty()) {
             fail(error, errorSize, std::string("the grid \"") + gridName + "\" is empty");
             return 0;
@@ -622,11 +656,11 @@ extern "C" __declspec(dllexport) int x2VdbHistogram(const char* path, const char
         file.open();
         const openvdb::GridPtrVecPtr grids = file.readAllGridMetadata();
         const openvdb::GridBase::Ptr meta = grids ? findNthGrid(*grids, gridName) : openvdb::GridBase::Ptr();
-        if (!meta || !meta->isType<openvdb::VectorGrid>()) {
+        const auto grid = emissionAsRgb(file, meta, gridName);
+        if (!grid) {
             fail(error, errorSize, std::string("the emission grid \"") + gridName + "\" is not an RGB grid of " + path);
             return 0;
         }
-        const auto grid = openvdb::gridPtrCast<openvdb::VectorGrid>(file.readGrid(gridName));
         // getGridLuminance: each active value's luminance, in the value iterator's order.
         std::vector<float> lum;
         for (auto it = grid->cbeginValueOn(); it; ++it) {
@@ -694,11 +728,11 @@ extern "C" __declspec(dllexport) int x2VdbHistogramMapped(const char* path, cons
         file.open();
         const openvdb::GridPtrVecPtr grids = file.readAllGridMetadata();
         const openvdb::GridBase::Ptr meta = grids ? findNthGrid(*grids, gridName) : openvdb::GridBase::Ptr();
-        if (!meta || !meta->isType<openvdb::VectorGrid>()) {
+        const auto grid = emissionAsRgb(file, meta, gridName);
+        if (!grid) {
             fail(error, errorSize, std::string("the emission grid \"") + gridName + "\" is not an RGB grid of " + path);
             return 0;
         }
-        const auto grid = openvdb::gridPtrCast<openvdb::VectorGrid>(file.readGrid(gridName));
         std::vector<float> lum;
         for (auto it = grid->cbeginValueOn(); it; ++it) {
             const openvdb::Vec3s v = *it;

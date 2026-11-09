@@ -228,14 +228,15 @@ std::string oneLine(std::string text) {
 // The renderer's files beside the executable (build_session.py lays them out): the program for every frame, its
 // material module and the adaptive pass chain.
 struct Programs {
-    std::string uniform, material, chain, maps, lights, lobes, volumes, dwa, dwaLobes, extras;
+    std::string uniform, material, chain, maps, lights, lobes, volumes, dwa, dwaLobes, extras, volumeMaps;
 };
 Programs programs(const fs::path& folder) {
     return {fileText(folder / "async_gpu.ptx"), fileText(folder / "material" / "async_material.ptx"),
             fileText(folder / "adaptive" / "async_adaptive.ptx"), fileText(folder / "maps" / "async_maps.ptx"),
             fileText(folder / "lights" / "async_lights.ptx"), fileText(folder / "lobes" / "async_lobes.ptx"),
             fileText(folder / "volumes" / "async_volumes.ptx"), fileText(folder / "dwa" / "async_dwa.ptx"),
-            fileText(folder / "dwalobes" / "async_dwalobes.ptx"), fileText(folder / "extras" / "async_extras.ptx")};
+            fileText(folder / "dwalobes" / "async_dwalobes.ptx"), fileText(folder / "extras" / "async_extras.ptx"),
+            fileText(folder / "volumemaps" / "async_volumes.ptx")};
 }
 
 // card: the graphics card, CUDA's numbering (multi_device.h).
@@ -255,6 +256,7 @@ std::unique_ptr<async::GpuLane> gpuLane(const Programs& p, std::function<void(un
     options.lightsPtx = p.lights;
     options.lobesPtx = p.lobes;
     options.volumesPtx = p.volumes;
+    options.volumeMapsPtx = p.volumeMaps;
     options.dwaPtx = p.dwa;
     options.dwaLobesPtx = p.dwaLobes;
     options.extrasPtx = p.extras;
@@ -276,10 +278,14 @@ ShaderStamp shaderStamp(const Programs& p) {
     auto mix = [&](const void* data, size_t n) {
         for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
     };
-    for (const std::string* s : {&p.uniform, &p.material, &p.chain, &p.maps, &p.lights, &p.lobes, &p.volumes, &p.dwa, &p.dwaLobes, &p.extras}) mix(s->data(), s->size());
+    for (const std::string* s : {&p.uniform, &p.material, &p.chain, &p.maps, &p.lights, &p.lobes, &p.volumes, &p.dwa, &p.dwaLobes, &p.extras, &p.volumeMaps}) mix(s->data(), s->size());
     // A test build's lower OptiX optimization (XPU2_OPTIX_LEVEL, async_gpu.h) is another program in OptiX's cache.
     if (const char* level = std::getenv("XPU2_OPTIX_LEVEL")) {
         const std::string l = level;
+        mix(l.data(), l.size());
+    }
+    if (const char* levels = std::getenv("XPU2_OPTIX_LEVELS")) {
+        const std::string l = std::string("levels ") + levels;
         mix(l.data(), l.size());
     }
     // So is a diagnostic build's with OptiX's exceptions (XPU2_OPTIX_EXCEPTIONS).
@@ -348,6 +354,74 @@ std::vector<std::pair<int, std::string>> uncompiledCards(const fs::path& mark, b
 }
 
 // --compile-shaders: the GPU programs into OptiX's disk cache, with progress as it goes.
+// The shader compile's memory (asked 2026-11-07: "i dont want my computer to crash"). A map callable called from inside
+// the volume march took OptiX's compile past 44 GB; with the map program built into the volume module instead, the whole
+// compile peaked at 4.2 GB and took 8 minutes (RTX 3090, 2026-11-07). Before it begins: free RAM at least what it needs
+// (CompileNeedGB, XPU2_COMPILE_NEED_GB another; XPU2_COMPILE_ANYWAY=1 skips the check), else a message and exit 3. While
+// it runs: free RAM looked at each second, and under the floor (a twentieth of the machine's, at least 2 GB) the compile
+// stops itself (exit 4) before Windows runs out; OptiX's cache keeps the modules it finished, so compiling again goes on
+// from there. (Its tasks also wait while RAM is short: GpuLane::compileMemoryRoom.)
+// Twice the measured peak, for drivers and cards that compile larger.
+constexpr double CompileNeedGB = 8.0;
+class CompileGuard {
+public:
+    CompileGuard() = default;
+    ~CompileGuard() {
+        stop_ = true;
+        if (watch_.joinable()) watch_.join();
+    }
+    // Whether there is room to begin; the watch started if so.
+    bool room() {
+        MEMORYSTATUSEX m = status();
+        const double freeGB = gb(m.ullAvailPhys), totalGB = gb(m.ullTotalPhys);
+        double need = CompileNeedGB;
+        if (const char* n = std::getenv("XPU2_COMPILE_NEED_GB")) need = std::max(1.0, std::atof(n));
+        const bool anyway = std::getenv("XPU2_COMPILE_ANYWAY") && std::getenv("XPU2_COMPILE_ANYWAY")[0] == '1';
+        floor_ = std::max(2.0, totalGB / 20.0);
+        least_ = freeGB;
+        if (freeGB < need && !anyway) {
+            std::printf("MoonRay XPU2 shaders: not compiled: not enough free memory (%.1f GB free of %.1f GB; the compile needs about %.0f GB). "
+                        "Close other programs and compile again.\n",
+                        freeGB, totalGB, need);
+            std::fflush(stdout);
+            return false;
+        }
+        watch_ = std::thread([this] {
+            while (!stop_) {
+                const double f = gb(status().ullAvailPhys);
+                if (f < least_) least_ = f;
+                if (f < floor_) {
+                    std::printf("MoonRay XPU2 shaders: stopped: memory ran low (%.1f GB free); the modules compiled so far are kept, "
+                                "compile again with more memory free\n",
+                                f);
+                    std::fflush(stdout);
+                    std::_Exit(4);
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        });
+        return true;
+    }
+    double peakGB() const {
+        PROCESS_MEMORY_COUNTERS c{};
+        c.cb = sizeof c;
+        return K32GetProcessMemoryInfo(GetCurrentProcess(), &c, sizeof c) ? gb(c.PeakPagefileUsage) : 0.0;
+    }
+    double leastFreeGB() const { return least_; }
+private:
+    static MEMORYSTATUSEX status() {
+        MEMORYSTATUSEX m{};
+        m.dwLength = sizeof m;
+        GlobalMemoryStatusEx(&m);
+        return m;
+    }
+    static double gb(unsigned long long b) { return double(b) / double(1ull << 30); }
+    std::thread watch_;
+    std::atomic<bool> stop_{false};
+    std::atomic<double> least_{0.0};
+    double floor_ = 2.0;
+};
+
 int compileShaders(const fs::path& folder) {
     const auto began = Clock::now();
     auto seconds = [&] { return std::chrono::duration<double>(Clock::now() - began).count(); };
@@ -359,7 +433,13 @@ int compileShaders(const fs::path& folder) {
         auto progress = [&](unsigned done, unsigned waiting) {
             if (seconds() - last < 10) return;
             last = seconds();
-            std::printf("MoonRay XPU2 shaders: %u compile tasks done, %u waiting, %.0f s\n", done, waiting, last);
+            // The compile's memory too (its committed RAM now and at most), after the time: the kit reads the counts and
+            // the seconds by their places (moonray_xpu2.py's _counts).
+            PROCESS_MEMORY_COUNTERS m{};
+            m.cb = sizeof m;
+            const bool known = K32GetProcessMemoryInfo(GetCurrentProcess(), &m, sizeof m);
+            std::printf("MoonRay XPU2 shaders: %u compile tasks done, %u waiting, %.0f s, memory %.1f GB (at most %.1f GB)\n", done, waiting, last,
+                        known ? double(m.PagefileUsage) / double(1ull << 30) : 0.0, known ? double(m.PeakPagefileUsage) / double(1ull << 30) : 0.0);
             std::fflush(stdout);
         };
         // Every kind of graphics card in the machine, switched on or not (multi_device.h), that the mark does not hold
@@ -372,6 +452,9 @@ int compileShaders(const fs::path& folder) {
             std::printf("MoonRay XPU2 shaders: up to date for every graphics card\n");
             return 0;
         }
+        // Memory (CompileGuard): not begun without the RAM it needs, stopped before the machine runs short.
+        CompileGuard guard;
+        if (!guard.room()) return 3;
         if (missing.empty()) {
             gpuLane(p, progress, 0);
             kinds.insert(cardKind(0));
@@ -384,7 +467,8 @@ int compileShaders(const fs::path& folder) {
             markCompiled(p, kinds);
         }
         markCompiled(p, kinds);
-        std::printf("MoonRay XPU2 shaders: compiled in %.0f s\n", seconds());
+        std::printf("MoonRay XPU2 shaders: compiled in %.0f s (memory at most %.1f GB, the machine's least free %.1f GB)\n", seconds(),
+                    guard.peakGB(), guard.leastFreeGB());
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "MoonRay XPU2 shaders: " << e.what() << std::endl;

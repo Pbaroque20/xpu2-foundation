@@ -31,6 +31,11 @@ The mantra for XPU2 is: "Use your silicon!"
   those samples to the CPU finished 2.6 to 8.5 times sooner; a scene with nothing moving costs the GPU about 2 to 3%.
   A deforming subdivision surface is tessellated once over its time steps, so adaptive tessellation and instanced
   deforming prototypes render too.
+- **Volumes on both devices.** VDB clouds and fire, and mapped and glowing volumes, are marched on the GPU as on the
+  CPU, the volumes' map programs run at each sample point. A march resumes from checkpoints instead of starting
+  again, and a ray finds every volume it crosses in one traversal. On an RTX 3090 a VDB cloud went from 88 to 57
+  seconds and a glowing mapped volume from 37 to 27.5, every picture bit-identical. Fire written as a single-value
+  temperature or flames grid glows too.
 - **Lean card memory.** The GPU's stack is sized from the program's real call chains and from what the scene contains,
   and each thread's scratch from what the scene uses. A launch is as wide as the card's cores can hold at once, and
   narrower only when the card is short of memory. On an RTX 3090 a simple scene went from 10.9 GB of the card to 4.5 GB

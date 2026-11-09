@@ -538,7 +538,11 @@ inline shade::DwaRecord admitDwa(const rdl::SceneObject& o, const DwaClass& c, M
         need(model != 2 || (shade::isZero(F(KCreaseAttenuation, 0)) && !bound(KCreaseAttenuation)),
              o.getName() + ": random-walk crease attenuation is not shaded yet");
         need(!obj(KSubsurfaceTraceSet), o.getName() + ": subsurface trace sets are not shaded yet");
-        need(!B(KEnableSubsurfaceInputNormal, false), o.getName() + ": a subsurface input normal is not shaded yet");
+        // MoonRay's subsurface takes the material's Input Normal at its entry and exit points when this is on
+        // (PathIntegratorSubsurface: evalNormalFunc, DwaBase::resolveSubsurfaceNormal); with no normal map there that
+        // is the shading normal it takes with it off, so only a mapped input normal is beyond XPU2 yet.
+        need(!B(KEnableSubsurfaceInputNormal, false) || !obj(KInputNormal),
+             o.getName() + ": a subsurface input normal from a normal map is not shaded yet");
     }
     hint(shade::HintDiffuseTransmission, has[KShowDiffuse] && B(KShowDiffuse, false) && !transmissionIsOne && !metallicIsOne &&
                                              has[KDiffuseTransmissionColor] && !shade::isBlack(C(KDiffuseTransmissionColor, 0)) &&

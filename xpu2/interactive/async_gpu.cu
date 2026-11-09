@@ -20,6 +20,14 @@ extern "C" __global__ void __closesthit__triangle() {
     optixSetPayload_0(optixGetInstanceId());
     optixSetPayload_1(optixGetPrimitiveIndex());
 }
+// The volume bounds' traversal (GpuBackend::volumeCrossings): every candidate kept, the traversal let go on.
+extern "C" __global__ void __anyhit__volumeCrossing() {
+    auto* kept = reinterpret_cast<VolumeCandidates*>(U64(optixGetPayload_0()) | U64(optixGetPayload_1()) << 32);
+    if (kept->count < VolumeCandidates::Max)
+        kept->at[kept->count] = VolumeCandidate{optixGetRayTmax(), optixGetInstanceId(), optixGetPrimitiveIndex()};
+    ++kept->count;
+    optixIgnoreIntersection();
+}
 // A curve span (MoonRay XPU's curve programs, curve_core.h) or a point (points_core.h): only the distance is reported;
 // the hit is worked out again afterwards, as on the CPU.
 extern "C" __global__ void __intersection__curve() {
