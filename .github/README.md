@@ -9,7 +9,7 @@ claims its own work, neither waits for the other, and any sample can be rendered
 result.
 
 XPU2 is designed by Raphael Tobar, implemented with AI-assistance. Not affiliated with or endorsed by DreamWorks
-Animation; MoonRay and OpenMoonRay are DreamWorks Animation's.
+Animation; MoonRay and OpenMoonRay are DreamWorks Animation's. XPU2 is released under the [MIT license](/LICENSE).
 
 The mantra for XPU2 is: "Use your silicon!"
 
@@ -58,6 +58,11 @@ The mantra for XPU2 is: "Use your silicon!"
   node nearest it, and decoded tiles live in their node's memory. A node short of memory moves its oldest tiles to
   another node before letting any go: a hop across the sockets instead of a decode from disk. A simulation app tests
   cards, groups, nodes and denoiser hand-offs on one card.
+- **Across machines: Rhizome.** P2P, decentralized network rendering: a swarm of peers, each a whole XPU2, with no
+  render server. One peer takes the master integrator role for a job (any peer can, and the next takes over if it
+  fails), work moves between neighbours by the same cellular rules, and every machine's RAM and card memory form one
+  pool. Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
+  branch, also MIT.
 
 ## Reference renderer: MoonRay
 
@@ -109,5 +114,7 @@ The core and the MoonRay port currently share a folder. The manual's file map as
 
 - `MoonLightIPR`, in MoonRay for Modo: where XPU2 is developed, with its host.
 - `xpu2-async` (this branch): XPU2's core and its documents, brought up to date from `MoonLightIPR`. Its kit stops at the 0.5 release.
+- [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network): Rhizome, XPU2 across machines
+  (P2P, decentralized network rendering), on top of this core.
 - `xpu-plus`: XPU+, the earlier synchronous approach (19–20 October 2026). It speeds up MoonRay XPU's own pipeline with
   exact savings that keep images identical, rather than replacing it. Kept for its measurements and techniques.
