@@ -149,6 +149,9 @@ picture.
 
 ## 6. Where it stands
 
+"Hydra" below is a test scene, a Modo scene exported to MoonRay (`Hydra_uniform.rdla`); it has nothing to do with
+USD's Hydra render delegates.
+
 | Part | State |
 |---|---|
 | Node hash, key pair kept in the node's folder, signed messages, rhizome key handshake (`rhizome_identity.h`, `rhizome_wire.h`) | built, tested |
