@@ -59,8 +59,8 @@ urgent its share. Every node is a whole XPU2 with its own work grid.
 
 Parts 1 to 15 of the plan are built and tested on one machine, with a master and several nodes as separate
 processes. Our test scenes render as one machine renders them (block error 0), stills and animated jobs alike, even
-with the master killed part way or every machine stopped and started again. They include Hydra, a Modo scene
-exported to MoonRay (a test scene: nothing to do with USD's Hydra render delegates), and a VDB cloud.
+with the master killed part way or every machine stopped and started again. They include a Modo scene exported to
+MoonRay and a VDB cloud.
 
 Still to do: texture tiles fetched from the pool while rendering instead of a whole copy of the scene on each node;
 cells given to the nodes that hold their pieces; routed networks and VPNs; and a test on two real machines. The full
