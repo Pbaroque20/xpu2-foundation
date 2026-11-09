@@ -274,6 +274,56 @@ static void plans() {
         for (U32 k = 0; k < s.chunksPerCell(); ++k) l.arrived(Chunk{c, k});
     check(l.complete(), "the ledger completes");
 
+    // Plan 17: the next frame's cells back to the nodes that rendered them, though the rates moved.
+    std::vector<Hash> before(s.cells());
+    for (U32 c = 0; c < s.cells(); ++c) before[c] = p.nodes[size_t(p.owner[c])].hash;
+    std::vector<Node> moved = {{fakeHash(0), 1.1e7, 0.001}, {fakeHash(1), 8e6, 0.001}, {fakeHash(2), 2.4e6, 0.002}, {fakeHash(3), 0.8e6, 0.05}};
+    const Plan plain = Plan::make(s, moved, imp), kept = Plan::make(s, moved, imp, 0.5, 0.25, &before);
+    auto same = [&](const Plan& q) {
+        U32 n = 0;
+        for (U32 c = 0; c < s.cells(); ++c) n += q.nodes[size_t(q.owner[c])].hash == before[c] ? 1 : 0;
+        return n;
+    };
+    check(same(kept) > same(plain) && same(kept) >= s.cells() * 8 / 10 && kept.kept == same(kept),
+          "the rates moved: " + std::to_string(same(kept)) + " of " + std::to_string(s.cells()) + " cells with the node of the frame before (" +
+              std::to_string(same(plain)) + " without)");
+    bool nearAll = true, nearImpFast = true;
+    std::vector<double> share(4, 0), wanted(4, 0);
+    double rates = 0;
+    for (const auto& n : kept.nodes) rates += n.rate;
+    for (U32 c = 0; c < s.cells(); ++c) {
+        nearAll = nearAll && kept.owner[c] >= 0;
+        if (kept.owner[c] < 0) continue;
+        nearImpFast = nearImpFast && (!kept.important[c] || kept.nodes[size_t(kept.owner[c])].fast);
+        share[size_t(kept.owner[c])] += s.pixels(c);
+    }
+    double worstShare = 0;
+    for (size_t i = 0; i < 4; ++i)
+        worstShare = std::max(worstShare, std::fabs(share[i] / (double(s.width) * s.height) - kept.nodes[i].rate / rates));
+    check(nearAll && nearImpFast && worstShare < 0.05, "with affinity every cell is given, important ones to the fast tier, shares by rate (worst " +
+                                                          std::to_string(worstShare * 100) + "% off)");
+    // A node gone: its cells to the others, the rest kept.
+    std::vector<Node> three(moved.begin(), moved.begin() + 3);
+    const Plan less = Plan::make(s, three, imp, 0.5, 0.25, &before);
+    bool lessAll = true;
+    U32 keptOthers = 0, othersBefore = 0;
+    for (U32 c = 0; c < s.cells(); ++c) {
+        lessAll = lessAll && less.owner[c] >= 0 && less.owner[c] < 3;
+        if (before[c] != fakeHash(3)) othersBefore++, keptOthers += less.nodes[size_t(less.owner[c])].hash == before[c] ? 1 : 0;
+    }
+    const U32 lessPlain = same(Plan::make(s, three, imp));
+    check(lessAll && keptOthers >= othersBefore * 8 / 10 && keptOthers >= lessPlain,
+          "a node gone: its cells given out, " + std::to_string(keptOthers) + " of the others' " + std::to_string(othersBefore) + " kept (" +
+              std::to_string(lessPlain) + " without)");
+    // A node joining: it takes its share, the others keep most of theirs.
+    std::vector<Node> five = moved;
+    five.push_back(Node{fakeHash(4), 9e6, 0.001});
+    const Plan more = Plan::make(s, five, imp, 0.5, 0.25, &before);
+    const U32 moreKept = same(more), morePlain = same(Plan::make(s, five, imp));
+    double newShare = 0;
+    for (U32 c = 0; c < s.cells(); ++c) newShare += more.owner[c] == 4 ? s.pixels(c) : 0;
+    check(moreKept > morePlain && newShare > 0, "a node joining: " + std::to_string(moreKept) + " cells kept (" + std::to_string(morePlain) +
+                                                    " without), the new node given " + std::to_string(int(newShare * 100 / (double(s.width) * s.height))) + "%");
 }
 
 static void memory() {

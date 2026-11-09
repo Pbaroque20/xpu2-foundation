@@ -91,6 +91,7 @@ struct Plan {
     // Chunks already in the picture (a frame taken up again from its checkpoint, plan 14), as cell * chunksPerCell +
     // index: no one is given them, the ledger has them back.
     std::vector<U32> done;
+    U32 kept = 0;  // cells given back to the node that rendered them in the frame before (make's affinity; not sent)
     bool isDone(U32 cell, U32 index) const {
         const U32 id = cell * shape.chunksPerCell() + index;
         return std::binary_search(done.begin(), done.end(), id);
@@ -100,8 +101,12 @@ struct Plan {
     // (importance above the mean of the cells') go to the fast tier and the rest to the slow tier, each node's run of
     // cells along the Morton curve sized by its rate, so a node's cells are together (its caches warm) and the
     // expected times even.
+    // affinity (plan 17): each cell's node in the frame before (the one that rendered most of it; a zero hash: none).
+    // A cell goes back to it first, while that node is in the plan, of the tier the cell asks for and short of its
+    // share: the texture tiles the cell reads are there already (fetched from the swarm's memory as it rendered), its
+    // caches warm. The cells left are dealt as above.
     static Plan make(const FrameShape& shape, std::vector<Node> nodes, const std::vector<float>& importance, double fastShare = 0.5,
-                     double targetSeconds = 0.25) {
+                     double targetSeconds = 0.25, const std::vector<Hash>* affinity = nullptr) {
         Plan p;
         p.shape = shape;
         const U32 cells = shape.cells();
@@ -137,15 +142,28 @@ struct Plan {
         std::sort(order.begin(), order.end(), [&](U32 a, U32 b) {
             return morton(a % shape.cellsX(), a / shape.cellsX()) < morton(b % shape.cellsX(), b / shape.cellsX());
         });
-        std::vector<U32> imp, rest;
-        for (U32 c : order) (p.important[c] ? imp : rest).push_back(c);
-
         // A node's share of the frame's pixels by its rate.
         double totalRate = 0, totalPixels = 0;
         for (const auto& n : p.nodes) totalRate += n.rate;
         for (U32 c = 0; c < cells; ++c) totalPixels += shape.pixels(c);
         std::vector<double> target(p.nodes.size()), given(p.nodes.size(), 0);
         for (size_t i = 0; i < p.nodes.size(); ++i) target[i] = totalPixels * p.nodes[i].rate / totalRate;
+
+        // Each cell back to its node of the frame before (affinity), along the curve, while the node is short of its share.
+        if (affinity && affinity->size() == cells) {
+            for (U32 c : order) {
+                const Hash& h = (*affinity)[c];
+                if (h == Hash{}) continue;
+                const int i = p.nodeIndex(h);
+                if (i < 0 || (p.important[c] && !p.nodes[size_t(i)].fast) || given[size_t(i)] + shape.pixels(c) > target[size_t(i)]) continue;
+                p.owner[c] = i;
+                given[size_t(i)] += shape.pixels(c);
+                ++p.kept;
+            }
+        }
+        std::vector<U32> imp, rest;
+        for (U32 c : order)
+            if (p.owner[c] < 0) (p.important[c] ? imp : rest).push_back(c);
 
         std::vector<size_t> fast, slow;
         for (size_t i = 0; i < p.nodes.size(); ++i) (p.nodes[i].fast ? fast : slow).push_back(i);

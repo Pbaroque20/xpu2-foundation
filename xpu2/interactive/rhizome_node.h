@@ -288,7 +288,23 @@ public:
         for (const Member* mm : members_.working())
             if ((o_.readyAtJoin || isReady(mm->hash)) && !paused_nodes_.count(mm->hash))
                 nodes.push_back(Node{mm->hash, mm->caps.rate, std::max(0.0, mm->rtt), false});
-        plan_ = std::make_unique<Plan>(Plan::make(shape, nodes, importance));
+        // Plan 17: each cell's node in the frame before, a frame of the same cells (the one whose films of it were most).
+        std::vector<Hash> affinity;
+        if (plan_ && plan_->shape.width == shape.width && plan_->shape.height == shape.height && plan_->shape.cellSize == shape.cellSize &&
+            cellBy_.size() == size_t(plan_->shape.cells()) * plan_->nodes.size() && !plan_->nodes.empty()) {
+            const size_t n = plan_->nodes.size();
+            affinity.assign(shape.cells(), Hash{});
+            for (U32 c = 0; c < shape.cells(); ++c) {
+                const uint32_t* by = cellBy_.data() + size_t(c) * n;
+                const size_t best = size_t(std::max_element(by, by + n) - by);
+                if (by[best] > 0) affinity[c] = plan_->nodes[best].hash;
+            }
+        }
+        plan_ = std::make_unique<Plan>(Plan::make(shape, nodes, importance, 0.5, 0.25, affinity.empty() ? nullptr : &affinity));
+        cellBy_.assign(size_t(shape.cells()) * plan_->nodes.size(), 0);
+        if (!affinity.empty())
+            log("the plan: " + std::to_string(plan_->kept) + " of " + std::to_string(shape.cells()) +
+                " cells with the machine that rendered them in the frame before");
         film_.assign(size_t(shape.width) * shape.height * 4, 0.0);
         odd_.assign(shape.adaptive() ? size_t(shape.width) * shape.height * 4 : 0, 0.0);
         counts_.assign(size_t(shape.width) * shape.height, 0);
@@ -1795,6 +1811,7 @@ private:
         const int who = plan_->nodeIndex(from);
         if (who >= 0) {
             ++byNode_[size_t(who)];
+            if (const size_t at = size_t(c.cell) * plan_->nodes.size() + size_t(who); at < cellBy_.size()) ++cellBy_[at];
             if (plan_->important[c.cell]) (plan_->nodes[size_t(who)].fast ? importantByFast_ : importantBySlow_)++;
         }
         addFilm(film_, counts_, f, &odd_);
@@ -2219,6 +2236,7 @@ private:
     size_t convergedCells_ = 0;
     std::vector<uint32_t> counts_;
     std::vector<uint64_t> byNode_;
+    std::vector<uint32_t> cellBy_;  // master: each cell's films by node (cell * nodes + node), for the next frame's plan (17)
     uint64_t importantByFast_ = 0, importantBySlow_ = 0, auditsDone_ = 0;
     Auditor auditor_;
     std::deque<Audit> auditQueue_;
