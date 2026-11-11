@@ -36,15 +36,18 @@ urgent its share. Every node is a whole XPU2 with its own work grid.
   the nodes into tiers by rate and gives the important cells to the fast tier and the rest to the slow tier.
 - **Cells, ownership and stealing.** The picture is cut into cells, each with one owner at a time, so no sample is
   rendered twice. A node finishes its cell, then its own cells, then asks a neighbour for half of its remaining work.
-  Near nodes take small chunks, far ones larger ones.
+  Near nodes take small chunks, far ones larger ones. From one frame to the next, a cell goes back to the machine
+  that rendered most of it, where the scene data its pixels read is already fetched and its caches are warm.
 - **The audit.** Every XPU2 sample is defined by its identity, so any machine renders it to the same value. The master
   renders again a few samples of each contribution, chosen by a seed the nodes do not know. A contribution that does
   not match is thrown away, and its node is refused for the rest of the session.
 - **One film.** Each node sends back its sums, odd sums and sample counts. The master adds them as a graphics card's
   film is added into the first card's, merges AOVs and Cryptomatte, pools the error for adaptive sampling across
   machines and writes the scene's outputs once.
-- **Memory pool.** Every machine's RAM and graphics card memory form one pool. The scene's files, meshes and texture
-  tiles are pieces named by their SHA-256, each kept on two machines and copied again when one fails.
+- **Memory pool.** Every machine's RAM and graphics card memory form one pool. The scene's files, meshes and textures
+  are pieces named by their SHA-256, each kept on two machines and copied again when one fails. A node does not copy
+  the scene's textures whole: it fetches each piece from the pool the first time its render reads it, so texture data
+  a machine's cells never see never crosses the network.
 - **Master failover.** The master signs a succession list, the fastest nodes first. The first successor, the deputy,
   keeps a copy of the picture and its ledger. If the master falls silent, the deputy takes over and finishes the frame.
 - **Trust and the wire.** A swarm key admits members. Approvals are signed endorsements every machine can check, and
@@ -57,14 +60,15 @@ urgent its share. Every node is a whole XPU2 with its own work grid.
 
 ## Where it stands
 
-Parts 1 to 15 of the plan are built and tested on one machine, with a master and several nodes as separate
+Parts 1 to 17 of the plan are built and tested on one machine, with a master and several nodes as separate
 processes. Our test scenes render as one machine renders them (block error 0), stills and animated jobs alike, even
 with the master killed part way or every machine stopped and started again. They include a Modo scene exported to
-MoonRay and a VDB cloud.
+MoonRay and a VDB cloud. A node renders a scene's textures (121 MB in the test) straight from the swarm's memory
+with the same picture, and with the camera moving, 35 of a frame's 49 cells stay with the machine that rendered them
+the frame before.
 
-Still to do: texture tiles fetched from the pool while rendering instead of a whole copy of the scene on each node;
-cells given to the nodes that hold their pieces; routed networks and VPNs; and a test on two real machines. The full
-design and the plan, part by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
+Still to do: routed networks and VPNs beyond the local network, and a test on two real machines. The full design
+and the plan, part by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
 
 ## Running it
 
