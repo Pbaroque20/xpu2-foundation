@@ -472,6 +472,13 @@ Modo ── MoonRay for Modo kit ───────────────�
   (`persistent._Rewrite`).
 - **Without `MOONRAY_MODO_SESSION`**, `moonray_xpu2.exe` passes its arguments to the kit's own `moonray.exe`
   (`MOONRAY_XPU2_MOONRAY` names it).
+- **`moonray_xpu2 render -in <scene> [-in <more>] [-out <beauty>] [-threads <n>] [--mode 0|1|2]`** renders a scene on
+  its own, with no host (`standaloneRender`): the session's code for one frame, in a temporary folder of its own, with
+  no coarse first pass and no pictures published, ended when the frame is (`Standalone`). The scene's render outputs
+  are written as at a frame's end, and `-out` writes the beauty with its alpha (`writeBeauty`, rows from the top). What
+  the kit sets when it starts XPU2 is set where the shell has not (`RDL2_DSO_PATH`, `REZ_MOONRAY_ROOT`, MoonRay from
+  `runtime` beside `runtime-xpu2`). A fallback hands the same arguments to MoonRay, with MoonRay's own library paths
+  back. Exit code 0 when the picture is written, 1 otherwise.
 
 What the session does besides rendering:
 

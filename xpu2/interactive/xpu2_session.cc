@@ -567,6 +567,7 @@ int passThrough(int argc, char** argv) {
 struct Args {
     std::vector<std::string> scenes;
     unsigned threads = 0;
+    std::string out;
 };
 Args parse(int argc, char** argv) {
     Args a;
@@ -574,7 +575,8 @@ Args parse(int argc, char** argv) {
         const std::string k = argv[i];
         if (k == "-in" && i + 1 < argc) a.scenes.push_back(argv[++i]);
         else if (k == "-threads" && i + 1 < argc) a.threads = unsigned(std::stoul(argv[++i]));
-        else if ((k == "-out" || k == "-exec_mode") && i + 1 < argc) ++i;
+        else if (k == "-out" && i + 1 < argc) a.out = argv[++i];
+        else if (k == "-exec_mode" && i + 1 < argc) ++i;
     }
     return a;
 }
@@ -1359,7 +1361,36 @@ private:
     std::thread thread_;
 };
 
+// moonray_xpu2 render (standaloneRender): one frame of a scene rendered to its files and the session ended, without Modo;
+// what XPU2 gives up is then MoonRay's, as a preview's is.
+struct Standalone {
+    bool on = false;
+    bool fellBack = false;
+    std::string beauty;  // -out: the frame's beauty, as an image of its own beside the scene's outputs
+};
+Standalone& standalone() {
+    static Standalone s;
+    return s;
+}
+
+// -out of moonray_xpu2 render: the frame's beauty and alpha as one image (OpenEXR, or what the name's extension says),
+// its rows from the top as images keep them (the film runs from the bottom).
+void writeBeauty(const std::string& path, const async::RenderResult& result, unsigned width, unsigned height) {
+    std::vector<float> pixels(size_t(width) * height * 4);
+    for (unsigned y = 0; y < height; ++y)
+        std::copy_n(result.rgba.data() + size_t(height - 1 - y) * width * 4, size_t(width) * 4, pixels.data() + size_t(y) * width * 4);
+    auto out = OIIO::ImageOutput::create(path);
+    if (!out) throw std::runtime_error("cannot write " + path + ": " + OIIO::geterror());
+    const OIIO::ImageSpec spec(int(width), int(height), 4, OIIO::TypeDesc::FLOAT);
+    if (!out->open(path, spec) || !out->write_image(OIIO::TypeDesc::FLOAT, pixels.data()))
+        throw std::runtime_error("cannot write " + path + ": " + out->geterror());
+    out->close();
+    std::printf("Wrote: %s\n", path.c_str());
+    std::fflush(stdout);
+}
+
 void fallback(const std::string& reason) {
+    standalone().fellBack = true;
     std::cerr << "MoonRay XPU2: " << reason << std::endl;
     modoProtocolLine("@@MODO_XPU2 FALLBACK " + oneLine(reason));
 }
@@ -1750,7 +1781,8 @@ int session(const Args& args, const fs::path& directory) {
               << ", adaptive passes " << (deviceChain ? "on the GPU" : "on the host") << std::endl;
 
     Scene scene;
-    scene.coarseFirst = envOn("XPU2_SESSION_COARSE_FIRST", true);
+    // A render on its own (moonray_xpu2 render) has no one to show a coarse first pass to.
+    scene.coarseFirst = envOn("XPU2_SESSION_COARSE_FIRST", true) && !standalone().on;
     scene.dso = folder;
     scene.staging = directory / "xpu2";
     std::error_code ignored;
@@ -2475,6 +2507,7 @@ int session(const Args& args, const fs::path& directory) {
                             for (const auto& w : warnings) std::puts(("MoonRay XPU2: " + w).c_str());
                             cpu::need(error.empty(), error);
                         }
+                        if (standalone().on && !standalone().beauty.empty()) writeBeauty(standalone().beauty, result, width, height);
                         complete = true;
                         std::printf("MoonRay XPU2: %s in %.2f s (CPU %llu samples, GPU %llu)\n", result.drained ? "drained" : "finished",
                                     result.seconds, (unsigned long long)result.cpuSamples, (unsigned long long)result.gpuSamples);
@@ -2510,6 +2543,8 @@ int session(const Args& args, const fs::path& directory) {
             }
         }
         event(complete ? "DONE" : "CANCELED", id);
+        // A render on its own ends with its frame.
+        if (standalone().on) return complete ? 0 : 1;
         while (!waiting()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         std::string mode_, delta, full;
         {
@@ -2555,10 +2590,80 @@ int session(const Args& args, const fs::path& directory) {
     }
 }
 
+// moonray_xpu2 render -in <scene> [-in <more>] [-out <beauty>] [-threads <n>] [--mode 0|1|2]: the scene rendered by XPU2
+// on this machine without Modo, as one frame of a preview session started with Render (its full samples, no coarse first
+// pass), its render outputs written as the scene names them, and the beauty to -out where given. What XPU2 gives up is
+// rendered by MoonRay from the same files, as a preview's is (MOONRAY_XPU2_MOONRAY, else runtime\moonray.exe beside
+// runtime-xpu2). Exit code 0 when the picture is written, 1 otherwise.
+int standaloneRender(int argc, char** argv, const fs::path& folder) {
+    std::vector<char*> rest{argv[0]};
+    std::string mode;
+    for (int i = 2; i < argc; ++i) {
+        const std::string k = argv[i];
+        if (k == "--help" || k == "-h") {
+            std::puts("moonray_xpu2 render -in <scene.rdla|.rdlb> [-in <more>] [-out <beauty.exr>] [-threads <n>] [--mode 0|1|2]\n"
+                      "  Renders the scene with XPU2 on this machine, without Modo, and writes its render outputs as the scene\n"
+                      "  names them; -out writes the beauty (with alpha) too. --mode: 0 the processor alone, 1 the graphics\n"
+                      "  cards alone, 2 both (the default). A scene XPU2 cannot render is rendered by MoonRay instead.");
+            return 0;
+        }
+        if (k == "--mode" && i + 1 < argc) {
+            mode = argv[++i];
+            continue;
+        }
+        rest.push_back(argv[i]);
+    }
+    Args args = parse(int(rest.size()), rest.data());
+    if (args.scenes.empty()) {
+        std::fprintf(stderr, "MoonRay XPU2 render: give the scene with -in (moonray_xpu2 render --help)\n");
+        return 1;
+    }
+    // What the kit gives XPU2 when it starts it, where the shell has not: its own libraries and scene classes.
+    auto setDefault = [](const char* name, const std::string& value) {
+        if (!std::getenv(name)) _putenv_s(name, value.c_str());
+    };
+    const char* dso = std::getenv("RDL2_DSO_PATH");
+    const char* root = std::getenv("REZ_MOONRAY_ROOT");
+    const std::string heldDso = dso ? dso : "", heldRoot = root ? root : "";
+    setDefault("RDL2_DSO_PATH", folder.u8string());
+    setDefault("REZ_MOONRAY_ROOT", folder.u8string());
+    const fs::path moonray = folder.parent_path() / "runtime" / "moonray.exe";
+    if (fs::exists(moonray)) setDefault("MOONRAY_XPU2_MOONRAY", moonray.u8string());
+    if (!mode.empty()) _putenv_s("XPU2_SESSION_MODE", mode.c_str());
+    standalone().on = true;
+    standalone().beauty = args.out;
+    // A folder of its own for what the session stages, gone when it ends.
+    const fs::path work = fs::temp_directory_path() / ("moonray_xpu2_render_" + std::to_string(GetCurrentProcessId()));
+    std::error_code ignored;
+    fs::remove_all(work, ignored);
+    fs::create_directories(work);
+    setDefault("TMPDIR", work.u8string());
+    memoryCeiling();
+    if (ceilingBytes) texture::textureBudget().store(std::max<uint64_t>(4ull << 30, uint64_t(ceilingBytes) / 2));
+    texture::watchPressure(ceilingBytes);
+    int code = 1;
+    try {
+        code = session(args, work);
+        cpu::finishGeometryCache();
+    } catch (const std::bad_alloc&) {
+        fallback("MoonRay XPU2 ran out of the memory it may use (" + memoryText() + ")");
+    } catch (const std::exception& e) {
+        fallback(e.what());
+    }
+    fs::remove_all(work, ignored);
+    if (!standalone().fellBack) return code;
+    // MoonRay finds its own libraries beside it unless these name others: back as the shell had them.
+    _putenv_s("RDL2_DSO_PATH", heldDso.c_str());
+    _putenv_s("REZ_MOONRAY_ROOT", heldRoot.c_str());
+    std::fprintf(stderr, "MoonRay XPU2 render: MoonRay renders the scene instead\n");
+    return passThrough(int(rest.size()), rest.data());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const fs::path folder = executableFolder();
+    if (argc >= 2 && std::string(argv[1]) == "render") return standaloneRender(argc, argv, folder);
     if (argc == 2 && std::string(argv[1]) == "--compile-shaders") return compileShaders(folder);
     if (argc == 2 && std::string(argv[1]) == "--shaders-compiled") return shadersCompiled(folder);
     if (argc == 2 && std::string(argv[1]) == "--list-devices") return listDevices();
