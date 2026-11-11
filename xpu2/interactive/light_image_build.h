@@ -8,6 +8,7 @@
 #pragma once
 #include "light_image.h"
 #include "shade_colorcorrect.h"
+#include "remote_files.h"
 #include <OpenImageIO/imageio.h>
 #include <algorithm>
 #include <cmath>
@@ -98,7 +99,9 @@ inline float luminance(V3 c) { return 0.299f * c.x + 0.587f * c.y + 0.114f * c.z
 // Reads and tabulates a light's texture (ImageDistribution::init). Throws when the file cannot be read (MoonRay then
 // lights with the fatal colour) and returns null when it holds no usable level (the light is off).
 inline std::shared_ptr<ImageData> buildImage(const ImageSettings& s) {
-    auto in = OIIO::ImageInput::open(s.file);
+    // From its source when it has one (remote_files.h: a Rhizome node's texture from the swarm's memory), else the disk.
+    std::unique_ptr<xpu2::remote::Proxy> proxy;
+    auto in = xpu2::remote::open(s.file, proxy);
     if (!in) throw std::runtime_error("Image file \"" + s.file + "\" does not exist.");
     OIIO::ImageSpec spec = in->spec();
     auto out = std::make_shared<ImageData>();
