@@ -71,7 +71,7 @@ struct RhizomeArgs {
     int port = -1;  // -1: the verb's own (NodePort, MasterPort)
     int mode = 2;
     double wait = 30;
-    bool approve = false, trustFirst = false, approver = false, watch = false, discovery = true;
+    bool approve = false, trustFirst = false, approver = false, watch = false, discovery = true, json = false;
 };
 
 inline const char* usage(Verb v) {
@@ -131,7 +131,10 @@ inline const char* usage(Verb v) {
     case Verb::Revoke:
         return "moonray_xpu2 rhizome revoke <hash> [--folder f]\n"
                "  An approver: revoke a machine, signed, passed through the swarm. Another machine: block it here only.";
-    case Verb::Status: return "moonray_xpu2 rhizome status [--folder f] [--watch]\n  The swarm as this machine sees it (a running node or master's status.json).";
+    case Verb::Status:
+        return "moonray_xpu2 rhizome status [--folder f] [--watch] [--json]\n"
+               "  The swarm as this machine sees it: the table a running node or master writes each second. --json: its\n"
+               "  status.json (RHIZOME_API.md) instead. Exit 0 while one runs from the folder, 3 when none does.";
     case Verb::Firewall:
         return "moonray_xpu2 rhizome firewall [--check] [--print] [--remove] [--public]\n"
                "  Lets other machines reach this one's node or master through Windows Firewall: one inbound rule for this\n"
@@ -193,6 +196,7 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--trust-first") a.trustFirst = true;
         else if (k == "--approver") a.approver = true;
         else if (k == "--watch") a.watch = true;
+        else if (k == "--json") a.json = true;
         else if (k == "--no-discovery") a.discovery = false;
         else if (k == "--frames") a.frames = next();
         else if (k == "--delta") a.deltas.push_back(next());
@@ -1107,6 +1111,32 @@ inline int identityVerb(const RhizomeArgs& a) {
     const fs::path folder = roleFolder(a);
     if (a.verb == Verb::Status) {
         const fs::path text = folder / "status.txt", json = folder / "status.json";
+        // Running: its status written within the last 5 s (it writes each second).
+        auto running = [&] {
+            std::error_code e;
+            if (!fs::exists(json, e)) return false;
+            return std::chrono::duration<double>(fs::file_time_type::clock::now() - fs::last_write_time(json, e)).count() <= 5.0;
+        };
+        if (a.json) {
+            int code = 0;
+            for (bool first = true; first || a.watch; first = false) {
+                code = running() ? 0 : 3;
+                std::string s;
+                if (code == 0) {
+                    std::ifstream in(json, std::ios::binary);
+                    s.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                } else {
+                    // Nothing running: this folder's hash, when it has one.
+                    std::string hash;
+                    if (fs::exists(folder / "node.key")) hash = rz::hex(rz::Identity::load(folder)->hash());
+                    s = "{\n  \"rhizome\": 1,\n  \"running\": false,\n  \"hash\": \"" + hash + "\"\n}\n";
+                }
+                std::fwrite(s.data(), 1, s.size(), stdout);
+                std::fflush(stdout);
+                if (a.watch) std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            return code;
+        }
         for (bool first = true; first || a.watch; first = false) {
             if (a.watch) std::printf("\x1b[2J\x1b[H");
             std::error_code e;
@@ -1129,9 +1159,8 @@ inline int identityVerb(const RhizomeArgs& a) {
             }
             std::fflush(stdout);
             if (a.watch) std::this_thread::sleep_for(std::chrono::seconds(1));
-            (void)json;
         }
-        return 0;
+        return running() ? 0 : 3;
     }
     const bool made = !fs::exists(folder / "node.key");
     auto id = rz::Identity::load(folder);

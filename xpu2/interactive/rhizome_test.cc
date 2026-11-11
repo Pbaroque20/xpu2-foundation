@@ -688,6 +688,12 @@ static void shaderStates() {
     check(j.find("\"gpuPrograms\": \"compiling: 3 of 9 tasks, 40 s\"") != std::string::npos && j.find("\"gpuPrograms\": \"no graphics card\"") != std::string::npos,
           "status.json shows each machine's GPU programs");
     check(text.find("GPU programs: compiled") != std::string::npos, "status.txt shows them");
+    // Its format (RHIZOME_API.md): version 1, written at a Unix time, this machine's row marked self with a plain role.
+    const size_t self = j.find("\"self\": true");
+    check(j.find("\"rhizome\": 1,") != std::string::npos && j.find("\"written\": ") != std::string::npos && self != std::string::npos &&
+              j.find("\"role\": \"master\"", self) != std::string::npos && j.find("\"self\": true", self + 1) == std::string::npos &&
+              j.find("this machine") == std::string::npos,
+          "status.json is format 1: its version, the time written, one row marked self");
     std::error_code e;
     std::filesystem::remove(status, e);
     std::filesystem::remove(txt, e);

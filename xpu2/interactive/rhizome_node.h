@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -133,8 +134,9 @@ public:
         std::lock_guard<std::mutex> g(m_);
         return ledger_ ? ledger_->cancelled() : 0;
     }
-    // This machine's GPU programs, said in its heartbeats and shown in every machine's status: "no graphics card",
-    // "compiled", "missing: <cards>", "compiling: ...", "not compiled (declined)" (rhizome_session.inc, plan 15).
+    // This machine's GPU programs, said in its heartbeats and shown in every machine's status (plan 15): any text; the
+    // session sends "no graphics card", "not used (the processor alone)", "compiled", "missing: <cards>",
+    // "missing: <cards> (declined here)", "compiling" or "compiling: <done> of <all> tasks, <seconds> s".
     void setShaders(const std::string& s) {
         std::lock_guard<std::mutex> g(m_);
         shaders_ = s;
@@ -150,7 +152,7 @@ public:
     uint64_t plainFramesIn() const { return plainIn_; }
     uint64_t sealedFramesIn() const { return sealedIn_; }
 
-    // Listens on 127.0.0.1 (a port the system picks) and, as a worker, joins the master.
+    // Listens (NodeOptions bind and port) and starts the swarm's threads; a node given a master's address reaches it.
     void start() {
         listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         sockaddr_in a{};
@@ -470,28 +472,6 @@ public:
         w.bytes(manifest_);
         broadcast(Type(TypeManifest), w.b);
     }
-    // A node: the pieces the pool placed here not landed yet, asked again every two seconds, of the next holder in turn
-    // (the one first asked may not have it yet itself), the master's source once each holder has been asked twice.
-    void askPlaced(double now) {
-        for (auto it = placed_.begin(); it != placed_.end();) {
-            if (store_.count(it->first)) {
-                it = placed_.erase(it);
-                continue;
-            }
-            auto& [when, tries] = it->second;
-            if (now - when >= 2.0) {
-                std::vector<Hash> from;
-                for (const Hash& h : holders_[it->first])
-                    if (h != hash() && h != masterHash_ && !members_.quarantined(h)) from.push_back(h);
-                const Hash to = !from.empty() && tries < 2 * from.size() ? from[tries % from.size()] : masterHash_;
-                Writer w;
-                w.hash(it->first);
-                sendTo(to, uint16_t(TypePieceAsk), w.b);
-                when = now, ++tries;
-            }
-            ++it;
-        }
-    }
     // Master: the nodes that have said they are ready (their scene made).
     size_t ready() {
         std::lock_guard<std::mutex> g(m_);
@@ -555,6 +535,28 @@ public:
     }
 
 private:
+    // A node: the pieces the pool placed here not landed yet, asked again every two seconds (the heartbeat loop, under the node's lock), of the next holder in turn
+    // (the one first asked may not have it yet itself), the master's source once each holder has been asked twice.
+    void askPlaced(double now) {
+        for (auto it = placed_.begin(); it != placed_.end();) {
+            if (store_.count(it->first)) {
+                it = placed_.erase(it);
+                continue;
+            }
+            auto& [when, tries] = it->second;
+            if (now - when >= 2.0) {
+                std::vector<Hash> from;
+                for (const Hash& h : holders_[it->first])
+                    if (h != hash() && h != masterHash_ && !members_.quarantined(h)) from.push_back(h);
+                const Hash to = !from.empty() && tries < 2 * from.size() ? from[tries % from.size()] : masterHash_;
+                Writer w;
+                w.hash(it->first);
+                sendTo(to, uint16_t(TypePieceAsk), w.b);
+                when = now, ++tries;
+            }
+            ++it;
+        }
+    }
     struct Conn {
         SOCKET s = INVALID_SOCKET;
         Hash peer{};
@@ -1386,14 +1388,17 @@ private:
             std::snprintf(t, sizeof t, "%.6g", std::isfinite(v) ? v : 0.0);
             return std::string(t);
         };
+        // status.json, format 1 (RHIZOME_API.md): this machine, the frame, the pool, then a row a member (this machine
+        // the first, "self" true).
         std::string j = "{\n";
+        j += "  \"rhizome\": 1,\n";
+        j += "  \"written\": " + std::to_string((long long)std::time(nullptr)) + ",\n";
         j += "  \"hash\": " + jsonText(hex(hash())) + ",\n";
         j += "  \"role\": " + jsonText(o_.master ? "master" : "node") + ",\n";
         j += "  \"address\": " + jsonText(address_) + ",\n";
         j += "  \"approver\": " + std::string(o_.trust && o_.trust->approver() ? "true" : "false") + ",\n";
         j += "  \"master\": " + jsonText(o_.master ? hex(hash()) : masterHash_ == Hash{} ? "" : hex(masterHash_)) + ",\n";
         j += "  \"job\": " + jsonText(o_.job) + ",\n";
-        j += "  \"time\": " + num(now) + ",\n";
         // The frame: chunks in all and back (the master's ledger), the chunks this machine holds still.
         size_t total = 0, back = 0;
         if (plan_) total = size_t(plan_->shape.cells()) * plan_->shape.chunksPerCell();
@@ -1414,11 +1419,14 @@ private:
             const Member* mm = members_.find(h);
             return mm ? mm->shaders : std::string();
         };
+        // role: master, node, quarantined, revoked, blocked (on this machine only) or waiting (for approval); state:
+        // alive, suspect, gone, stepped back, refused or held.
         auto row = [&](const Hash& h, const std::string& addr, const std::string& role, const std::string& state, double rate, double rtt) {
             const int i = plan_ ? plan_->nodeIndex(h) : -1;
             std::string tier = i < 0 ? "" : plan_->nodes[size_t(i)].fast ? "fast" : "slow";
             const uint64_t done = i >= 0 && size_t(i) < byNode_.size() ? byNode_[size_t(i)] : 0;
-            return "    {\"hash\": " + jsonText(hex(h)) + ", \"address\": " + jsonText(addr) + ", \"role\": " + jsonText(role) +
+            return "    {\"hash\": " + jsonText(hex(h)) + ", \"self\": " + std::string(h == hash() ? "true" : "false") +
+                   ", \"address\": " + jsonText(addr) + ", \"role\": " + jsonText(role) +
                    ", \"state\": " + jsonText(state) + ", \"tier\": " + jsonText(tier) + ", \"rate\": " + num(rate) + ", \"rtt\": " + num(rtt) +
                    ", \"chunks\": " + std::to_string(done) + ", \"ram\": " + std::to_string(pool_.used(h, Tier::Ram)) +
                    ", \"vram\": " + std::to_string(pool_.used(h, Tier::Vram)) + ", \"ramGiven\": " + std::to_string(pool_.capacity(h, Tier::Ram)) +
@@ -1447,18 +1455,18 @@ private:
                           mb(pool_.capacity(h, Tier::Ram) + pool_.capacity(h, Tier::Vram)).c_str(), sh.empty() ? "-" : sh.c_str());
             text += line;
         };
-        rows.push_back(row(hash(), address_, o_.master ? "master" : "node (this machine)", paused_ ? "stepped back" : "alive", o_.caps.rate, 0));
+        rows.push_back(row(hash(), address_, o_.master ? "master" : "node", paused_ ? "stepped back" : "alive", o_.caps.rate, 0));
         textRow(hash(), address_, o_.master ? "master (this machine)" : "node (this machine)", paused_ ? "stepped back" : "alive", o_.caps.rate, -1);
         for (const Member* mm : members_.all()) {
             const char* st = mm->quarantined ? "refused" : paused_nodes_.count(mm->hash) && mm->state != State::Gone ? "stepped back"
                              : mm->state == State::Alive ? "alive" : mm->state == State::Suspect ? "suspect" : "gone";
             std::string role = mm->quarantined ? (revoked(mm->hash) ? "revoked" : "quarantined") : mm->master || mm->hash == masterHash_ ? "master" : "node";
-            if (o_.trust && o_.trust->blocked(mm->hash)) role = "blocked (here)";
-            rows.push_back(row(mm->hash, mm->caps.address, role, st, mm->caps.rate, mm->rtt));
-            textRow(mm->hash, mm->caps.address, role, st, mm->caps.rate, mm->rtt);
+            const bool blocked = o_.trust && o_.trust->blocked(mm->hash);
+            rows.push_back(row(mm->hash, mm->caps.address, blocked ? "blocked" : role, st, mm->caps.rate, mm->rtt));
+            textRow(mm->hash, mm->caps.address, blocked ? "blocked (here)" : role, st, mm->caps.rate, mm->rtt);
         }
         for (const auto& [h, w] : waiting_) {
-            rows.push_back(row(h, w.info.caps.address, "waiting for approval", "held", w.info.caps.rate, -1));
+            rows.push_back(row(h, w.info.caps.address, "waiting", "held", w.info.caps.rate, -1));
             textRow(h, w.info.caps.address, "waiting for approval", "held", w.info.caps.rate, -1);
         }
         for (size_t i = 0; i < rows.size(); ++i) j += rows[i] + (i + 1 < rows.size() ? ",\n" : "\n");

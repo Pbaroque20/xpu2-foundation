@@ -10,7 +10,9 @@ frame between processor groups, NUMA nodes and graphics cards. Rhizome adds mach
 the swarm as a NUMA node is a node of the machine: the work it is given is near it, and the farther it is, the larger
 and less urgent its share.
 
-This note is the design and where it stands. The code is `rhizome_*.h`; `rhizome_test.cc` checks it:
+This note is the design and where it stands. How to drive Rhizome (the command line, a machine's folder and its
+`status.json`, the job queue, the C++ class) is in [RHIZOME_API.md](RHIZOME_API.md). The code is `rhizome_*.h`;
+`rhizome_test.cc` checks it:
 
 ```
 g++ -std=c++20 -O2 -o rhizome_test.exe xpu2/interactive/rhizome_test.cc -lbcrypt -lws2_32 -liphlpapi
