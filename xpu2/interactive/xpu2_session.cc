@@ -2565,6 +2565,8 @@ int main(int argc, char** argv) {
     const char* directory = std::getenv("MOONRAY_MODO_SESSION");
     if (!directory) return passThrough(argc, argv);
     memoryCeiling();
+    // Textures as decoded may take half of it (texture::textureBudget), 4 GB at least.
+    if (ceilingBytes) texture::textureBudget().store(std::max<uint64_t>(4ull << 30, uint64_t(ceilingBytes) / 2));
     texture::watchPressure(ceilingBytes);
     try {
         const int code = session(parse(argc, argv), fs::u8path(directory));

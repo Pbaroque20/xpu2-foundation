@@ -4045,8 +4045,8 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
  tessellations.clear();
  prepLaps().lap("render items (meshes, tessellation, materials)");
  if(gpuTextures(domain)){uint64_t total=0;std::set<texture::File*> files;
-  for(auto* set:{&plan->diffuseMaps,&plan->emissionMaps})for(auto& pair:*set){auto& file=*pair.second.file;if(!files.insert(&file).second)continue;total+=file.decodedBytes;need(total<=(4ull<<30),"Aggregate host texture budget");if(!file.pyramid)file.pyramid=std::make_shared<texture::Pyramid>(file.name.string());}
-  for(auto& f:plan->textures){auto& file=*f;if(files.insert(&file).second){total+=file.decodedBytes;need(total<=(4ull<<30),"Aggregate host texture budget");}if(!file.pyramid)file.pyramid=std::make_shared<texture::Pyramid>(file.name.string(),file.alpha);plan->textureImages.push_back(&file.pyramid->image);}
+  for(auto* set:{&plan->diffuseMaps,&plan->emissionMaps})for(auto& pair:*set){auto& file=*pair.second.file;if(!files.insert(&file).second)continue;total+=file.decodedBytes;need(total<=texture::sceneTextureBudget(),"Aggregate host texture budget");if(!file.pyramid)file.pyramid=std::make_shared<texture::Pyramid>(file.name.string());}
+  for(auto& f:plan->textures){auto& file=*f;if(files.insert(&file).second){total+=file.decodedBytes;need(total<=texture::sceneTextureBudget(),"Aggregate host texture budget");}if(!file.pyramid)file.pyramid=std::make_shared<texture::Pyramid>(file.name.string(),file.alpha);plan->textureImages.push_back(&file.pyramid->image);}
  }
  prepLaps().lap("texture pyramids");
  if(plan->paths&&plan->randomWalk)plan->walkSequences=walkSequences();

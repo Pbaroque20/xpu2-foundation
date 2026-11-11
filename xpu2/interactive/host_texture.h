@@ -89,6 +89,14 @@ inline bool lazyTextures(){static const bool on=[]{const char* v=std::getenv("XP
 // out of memory on the machine or the card: finer levels are neither decoded nor sent. The session halves it until the
 // scene loads (nextOverflowSide) and says so in the preview.
 inline std::atomic<unsigned>& overflowSide(){static std::atomic<unsigned> side{0};return side;}
+// The most decoded texture a scene may ask for, one texture's levels and all its textures together: half the session's memory
+// ceiling, 4 GB at least (the session sets it, xpu2_session.cc), or 2 GB and 4 GB where no ceiling was set. It was 2 and 4 GB
+// on every machine: a tester's 16K float diffuse map (3.2 GB as decoded) on a card of 32 GB and 85 GB of RAM free went to
+// texture overflow at 8K and to MoonRay XPU at 16K. Tiles are decoded as they are read and let go under memory pressure;
+// what does not fit on the card steps into texture overflow mode there (async_gpu.h).
+inline std::atomic<uint64_t>& textureBudget(){static std::atomic<uint64_t> bytes{0};return bytes;}
+inline uint64_t fileTextureBudget(){const uint64_t b=textureBudget().load();return b?b:(2ull<<30);}
+inline uint64_t sceneTextureBudget(){const uint64_t b=textureBudget().load();return b?b:(4ull<<30);}
 inline std::atomic<unsigned>& largestTexture(){static std::atomic<unsigned> side{0};return side;}
 constexpr unsigned SmallestOverflowSide=256;
 // Its first step, where the encoder is there: every texture as BC6H, a byte a texel, at the size it has: lossy, but the detail stays.
@@ -390,7 +398,9 @@ struct File {
   // Retain a read lease: no writer or delete can change the file under OIIO's cache.
   lock=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
   need(lock!=INVALID_HANDLE_VALUE,"Cannot lease immutable texture");
-  try{LARGE_INTEGER bytes{};need(GetFileSizeEx(lock,&bytes)&&bytes.QuadPart>0&&bytes.QuadPart<=(1ll<<30),"Texture file budget");
+  // Any size of file: it is read a tile at a time as the render reads it (a file of more than 1 GB was refused, and the
+  // whole scene went to MoonRay XPU: a 16K float .tx is 2.2 GB).
+  try{LARGE_INTEGER bytes{};need(GetFileSizeEx(lock,&bytes)&&bytes.QuadPart>0,"Texture file unreadable");
    auto in=OIIO::ImageInput::open(path.string());need(bool(in),"TX open failed");
    int w=0,h=0;for(int level=0;level<32;++level){if(!in->seek_subimage(0,level))break;const auto& spec=in->spec();
     need(spec.depth==1&&spec.x==0&&spec.y==0&&spec.z==0&&spec.full_x==0&&spec.full_y==0&&spec.full_width==spec.width&&spec.full_height==spec.height&&spec.width>0&&spec.height>0&&spec.tile_width>0&&spec.tile_height>0&&spec.nchannels>=1&&spec.nchannels<=4&&spec.channelformats.empty()&&!spec.deep,"Unsupported TX layout");
@@ -398,7 +408,7 @@ struct File {
     else need(spec.width==std::max(1,w/2)&&spec.height==std::max(1,h/2),"Invalid stored mip pyramid");
     w=spec.width;h=spec.height;if(level==0){unsigned seen=largestTexture().load();while(unsigned(std::max(w,h))>seen&&!largestTexture().compare_exchange_weak(seen,unsigned(std::max(w,h)))){}}
     if(const unsigned side=overflowSide().load();!side||unsigned(std::max(w,h))<=side)decodedBytes+=overflowCompress().load()?uint64_t(w)*h:uint64_t(w)*h*spec.nchannels*4;
-    need(decodedBytes<=(2ull<<30),"Decoded texture budget");++levels;
+    need(decodedBytes<=fileTextureBudget(),"Decoded texture budget");++levels;
    }need(levels>0&&w==1&&h==1,"Complete stored mip pyramid required");need(!in->seek_subimage(1,0),"Multipart texture unsupported");
    OIIO::ImageSpec spec;need(system->get_imagespec(name,spec),"OIIO texture admission failed");
   }catch(...){CloseHandle(lock);lock=INVALID_HANDLE_VALUE;throw;}
