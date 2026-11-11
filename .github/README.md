@@ -28,9 +28,11 @@ urgent its share. Every node is a whole XPU2 with its own work grid.
 - **Nodes and their hashes.** Each node makes a key pair the first time it runs. Its hash, the SHA-256 of its public
   key, is its identity in the swarm. Every message is signed, so every sample in the picture is known by the node
   that made it.
-- **The swarm.** A node needs the address of one member, or finds the swarm by discovery on the local network. Members
-  are kept by heartbeats, and the distance between two nodes is their round-trip time. Nodes join and leave at any
-  time; a node that leaves has its unreturned work given out again.
+- **The swarm.** A node needs the address of one member, or finds the swarm by discovery on the local network. Where
+  a broadcast does not reach, behind a router or over a VPN, the master probes address ranges one address at a time
+  and remembers every machine it has reached, so a node found once is found again. One command adds the firewall
+  rule a machine needs. Members are kept by heartbeats, and the distance between two nodes is their round-trip time.
+  Nodes join and leave at any time; a node that leaves has its unreturned work given out again.
 - **The master integrator.** The only node that reads the scene. Before a frame its indexer probes the picture and
   scores each cell's importance: edges, many materials or lights, detailed maps, volumes, hair, subsurface. It sorts
   the nodes into tiers by rate and gives the important cells to the fast tier and the rest to the slow tier.
@@ -60,15 +62,16 @@ urgent its share. Every node is a whole XPU2 with its own work grid.
 
 ## Where it stands
 
-Parts 1 to 17 of the plan are built and tested on one machine, with a master and several nodes as separate
+Parts 1 to 18 of the plan are built and tested on one Windows machine, with a master and several nodes as separate
 processes. Our test scenes render as one machine renders them (block error 0), stills and animated jobs alike, even
 with the master killed part way or every machine stopped and started again. They include a Modo scene exported to
 MoonRay and a VDB cloud. A node renders a scene's textures (121 MB in the test) straight from the swarm's memory
 with the same picture, and with the camera moving, 35 of a frame's 49 cells stay with the machine that rendered them
-the frame before.
+the frame before. With broadcast switched off, a master found two nodes by sweeping their addresses, then by the
+remembered addresses alone.
 
-Still to do: routed networks and VPNs beyond the local network, and a test on two real machines. The full design
-and the plan, part by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
+Still to do: a test on two real machines, and macOS, with the platform roadmap. The full design and the plan, part
+by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
 
 ## Running it
 
@@ -78,6 +81,7 @@ moonray_xpu2 rhizome node --key <swarm key>                   a node: waits for 
 moonray_xpu2 rhizome master -in scene.rdla -out beauty.pfm --key <swarm key>
 moonray_xpu2 rhizome submit --queue jobs -in shot.####.rdla -out beauty.####.pfm --frames 1-24
 moonray_xpu2 rhizome status --watch                           every machine's role, progress and pool share
+moonray_xpu2 rhizome firewall                                 the firewall rule a machine needs, added once
 ```
 
 Each verb has `--help`. Building XPU2 is in the [engineer manual](/xpu2/manual/README.md#14-building-and-running).
