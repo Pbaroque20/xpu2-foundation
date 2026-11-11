@@ -62,7 +62,8 @@ The mantra for XPU2 is: "Use your silicon!"
   render server. One peer takes the master integrator role for a job (any peer can, and the next takes over if it
   fails), work moves between neighbours by the same cellular rules, and every machine's RAM and card memory form one
   pool. A node fetches texture data from the pool only as its render reads it, and a cell goes back to the machine
-  that rendered it the frame before, where that data already is. Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
+  that rendered it the frame before, where that data already is. Peers find each other on a local network, and
+  behind routers and VPNs by probing addresses. Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
   branch, also MIT.
 
 ## Reference renderer: MoonRay
