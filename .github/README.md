@@ -61,7 +61,8 @@ The mantra for XPU2 is: "Use your silicon!"
 - **Across machines: Rhizome.** P2P, decentralized network rendering: a swarm of peers, each a whole XPU2, with no
   render server. One peer takes the master integrator role for a job (any peer can, and the next takes over if it
   fails), work moves between neighbours by the same cellular rules, and every machine's RAM and card memory form one
-  pool. Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
+  pool. A node fetches texture data from the pool only as its render reads it, and a cell goes back to the machine
+  that rendered it the frame before, where that data already is. Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
   branch, also MIT.
 
 ## Reference renderer: MoonRay
