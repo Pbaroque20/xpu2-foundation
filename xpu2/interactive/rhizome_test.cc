@@ -946,11 +946,53 @@ static void discovery() {
         std::lock_guard<std::mutex> g(m);
         return found.count(a->hash()) != 0;
     });
-    std::lock_guard<std::mutex> g(m);
-    check(got, "a master finds a node of its rhizome by discovery");
-    check(got && found[a->hash()].size() > 6 && found[a->hash()].substr(found[a->hash()].size() - 6) == ":47123", "at its address and TCP port (" +
-          (got ? found[a->hash()] : std::string("none")) + ")");
-    check(!found.count(b->hash()), "a node of another rhizome is not found");
+    {
+        std::lock_guard<std::mutex> g(m);
+        check(got, "a master finds a node of its rhizome by discovery");
+        check(got && found[a->hash()].size() > 6 && found[a->hash()].substr(found[a->hash()].size() - 6) == ":47123", "at its address and TCP port (" +
+              (got ? found[a->hash()] : std::string("none")) + ")");
+        check(!found.count(b->hash()), "a node of another rhizome is not found");
+    }
+
+    // Plan 18: beyond broadcast. Ranges read; a machine probed by its address alone, and one found by a sweep (no
+    // broadcasts: loopback's other addresses stand for a VPN's).
+    Range r;
+    const bool ranges = parseRange("10.8.0.0/24", r) && r.count == 254 && r.first == 0x0A080001u && parseRange("10.8.0.7", r) && r.count == 1 &&
+                        r.first == 0x0A080007u && parseRange("10.8.4.9/22", r) && r.first == 0x0A080401u && r.count == 1022 &&
+                        !parseRange("10.0.0.0/8", r) && !parseRange("10.8.0/24", r) && !parseRange("host/24", r);
+    check(ranges, "address ranges read (a /24's 254 hosts, one address, at most /16, nonsense refused)");
+    std::map<Hash, std::string> direct, swept;
+    ProbeOptions one;
+    one.broadcast = false;
+    one.hosts = {0x7F000005u};  // 127.0.0.5
+    Prober byAddress("studio rhizome key", [&](const Hash& h, const std::string& at) {
+        std::lock_guard<std::mutex> g2(m);
+        direct[h] = at;
+    }, port, 0.2, one);
+    ProbeOptions sweep;
+    sweep.broadcast = false;
+    parseRange("127.0.3.0/24", r);
+    sweep.ranges = {r};
+    sweep.perSecond = 400;
+    Prober bySweep("studio rhizome key", [&](const Hash& h, const std::string& at) {
+        std::lock_guard<std::mutex> g2(m);
+        swept[h] = at;
+    }, port, 0.2, sweep);
+    const bool gotDirect = until([&] {
+        std::lock_guard<std::mutex> g2(m);
+        return direct.count(a->hash()) != 0;
+    });
+    const bool gotSwept = until([&] {
+        std::lock_guard<std::mutex> g2(m);
+        return swept.count(a->hash()) != 0;
+    });
+    std::lock_guard<std::mutex> g3(m);
+    // (Windows answers from 127.0.0.1 whichever loopback address was probed: the address found is that one.)
+    check(gotDirect && !direct.count(b->hash()) && byAddress.unicastProbes() > 0,
+          "a machine reached by its address alone, broadcast off (" + (gotDirect ? direct[a->hash()] : std::string("none")) + ")");
+    check(gotSwept && bySweep.unicastProbes() > 0,
+          "a machine found by a sweep of a range (" + (gotSwept ? swept[a->hash()] : std::string("none")) + ", " +
+              std::to_string(bySweep.unicastProbes()) + " addresses probed)");
 }
 
 // Master failover: the master names its successors (the fastest first) and sends the deputy each film it takes in;

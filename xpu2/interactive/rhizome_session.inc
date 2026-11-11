@@ -10,13 +10,14 @@
 //                                [--wait s] [--approve] [--trust-first] [--trust <hash> ...] [--cell px] [--chunk n]
 //                                [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]
 //                                [--frames 1-24] [--delta <frame.####.rdla> ...] [--queue folder [--queue-watch]]
-//                                [--checkpoint s] [--fresh] [--shaders ask|compile|skip]
+//                                [--checkpoint s] [--fresh] [--shaders ask|compile|skip] [--scan [ranges]] [--no-broadcast]
 //   moonray_xpu2 rhizome submit  --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24] [--delta ...] [--name n]
 //   moonray_xpu2 rhizome id      [--folder f]
 //   moonray_xpu2 rhizome trust   <approver hash> [--folder f]
 //   moonray_xpu2 rhizome approve <hash> [--approver] [--folder f]
 //   moonray_xpu2 rhizome revoke  <hash> [--folder f]
 //   moonray_xpu2 rhizome status  [--folder f] [--watch]
+//   moonray_xpu2 rhizome firewall [--check] [--print] [--remove] [--public]
 //   moonray_xpu2 rhizome <verb> --help
 // (--rhizome-node and --rhizome-master: node and master.)
 //
@@ -31,6 +32,7 @@
 #include "rhizome_importance.h"
 #include "rhizome_jobs.h"
 #include <future>
+#include <shellapi.h>
 
 namespace {
 namespace rhizomesession {
@@ -38,7 +40,7 @@ namespace rz = xpu2::interactive::rhizome;
 
 constexpr uint16_t NodePort = 47100, MasterPort = 47110;
 
-enum class Verb { Node, Master, Submit, Id, Trust, Approve, Revoke, Status, Help };
+enum class Verb { Node, Master, Submit, Id, Trust, Approve, Revoke, Status, Firewall, Help };
 struct RhizomeArgs {
     Verb verb = Verb::Help;
     bool master = false, help = false;
@@ -55,6 +57,11 @@ struct RhizomeArgs {
     bool wholeTextures = false;
     // GPU programs not compiled here (plan 15): ask (on first start, the answer kept), compile, skip.
     std::string shaders = "ask";
+    // Discovery beyond broadcast (plan 18): sweeps of ranges or of each adapter's subnet, broadcast left out.
+    std::vector<std::string> scan;
+    bool scanAdapters = false, broadcast = true;
+    // The firewall verb: look only, print the commands, take the rule away, public networks too; (the elevated copy).
+    bool firewallCheck = false, firewallPrint = false, firewallRemove = false, firewallPublic = false, firewallElevated = false;
     unsigned nodes = 0, threads = 0, cell = 256, chunk = 16;
     // A workstation: renders only once no one has used it for whenIdle seconds (0: always), within hours [from, to) of
     // the day (to below from: across midnight; -1: any hour); in use, busyThreads threads instead of stepping back.
@@ -89,7 +96,7 @@ inline const char* usage(Verb v) {
         return "moonray_xpu2 rhizome master -in <scene> [-in ...] -out <image.pfm> --key <rhizome key> [--nodes N]\n"
                "    [--node host:port ...] [--wait s] [--approve] [--trust-first] [--trust <approver hash> ...] [--cell px]\n"
                "    [--chunk samples] [--mode 0|1|2] [-threads n] [--folder f] [--bind host] [--port p] [--no-discovery]\n"
-               "    [--shaders ask|compile|skip]\n"
+               "    [--shaders ask|compile|skip] [--scan [ranges]] [--no-broadcast]\n"
                "  Finds the nodes on its networks (and those given with --node), waits for N of them ready (or --wait seconds),\n"
                "  renders the frame with them, and writes the picture and the scene's outputs. --approve: only approved\n"
                "  machines join (the others wait, their hash printed with the command to approve them); --trust-first:\n"
@@ -104,7 +111,12 @@ inline const char* usage(Verb v) {
                "  (--checkpoint s; 0: never) and after each frame; started again on the same job (every machine stopped,\n"
                "  the queue's too), the master takes it up where it was, and skips a job it finished; a job whose scene or\n"
                "  delta files were written again since begins anew. --fresh: begin it anew anyway.\n"
-               "  --shaders: as a node's (rhizome node --help).";
+               "  --shaders: as a node's (rhizome node --help).\n"
+               "  Beyond broadcast (a VPN, a routed network): the machines reached before are remembered (known.txt in the\n"
+               "  folder) and probed one by one at each start; --scan 10.8.0.0/24,10.9.0.0/24 probes those ranges address by\n"
+               "  address (at most /16 each), --scan alone each adapter's subnet; --no-broadcast: no broadcasts. A machine\n"
+               "  probes cannot reach: --node host:port. Other machines reach this one through the firewall's rule\n"
+               "  (moonray_xpu2 rhizome firewall).";
     case Verb::Submit:
         return "moonray_xpu2 rhizome submit --queue folder -in <scene> [-in ...] -out <image> [--frames 1-24]\n"
                "    [--delta <frame.####.rdla> ...] [--name n]\n"
@@ -120,8 +132,14 @@ inline const char* usage(Verb v) {
         return "moonray_xpu2 rhizome revoke <hash> [--folder f]\n"
                "  An approver: revoke a machine, signed, passed through the swarm. Another machine: block it here only.";
     case Verb::Status: return "moonray_xpu2 rhizome status [--folder f] [--watch]\n  The swarm as this machine sees it (a running node or master's status.json).";
+    case Verb::Firewall:
+        return "moonray_xpu2 rhizome firewall [--check] [--print] [--remove] [--public]\n"
+               "  Lets other machines reach this one's node or master through Windows Firewall: one inbound rule for this\n"
+               "  moonray_xpu2.exe on private and domain networks (--public: public ones too), added once. Adding or removing it\n"
+               "  asks for an administrator (Windows' own prompt). --check: whether it is there, nothing changed; --print: the\n"
+               "  commands to run by hand; --remove: the rule taken away.";
     default:
-        return "moonray_xpu2 rhizome node | master | submit | id | trust | approve | revoke | status   (each with --help)";
+        return "moonray_xpu2 rhizome node | master | submit | id | trust | approve | revoke | status | firewall   (each with --help)";
     }
 }
 
@@ -134,7 +152,8 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
     else if (first == "rhizome") {
         const std::string v = argc > 2 ? argv[2] : "help";
         a.verb = v == "node" ? Verb::Node : v == "master" ? Verb::Master : v == "submit" ? Verb::Submit : v == "id" ? Verb::Id : v == "trust" ? Verb::Trust
-                 : v == "approve" ? Verb::Approve : v == "revoke" ? Verb::Revoke : v == "status" ? Verb::Status : Verb::Help;
+                 : v == "approve" ? Verb::Approve : v == "revoke" ? Verb::Revoke : v == "status" ? Verb::Status
+                 : v == "firewall" ? Verb::Firewall : Verb::Help;
         if (a.verb == Verb::Help && v != "help" && v != "--help") throw std::runtime_error("unknown verb " + v + "\n" + usage(Verb::Help));
         i = 3;
     }
@@ -183,6 +202,28 @@ inline RhizomeArgs parseRhizome(int argc, char** argv) {
         else if (k == "--checkpoint") a.checkpointSeconds = std::stod(next());
         else if (k == "--fresh") a.fresh = true;
         else if (k == "--whole-textures") a.wholeTextures = true;
+        else if (k == "--scan") {
+            // --scan alone: each adapter's subnet; --scan 10.8.0.0/24,192.168.5.0/24: those.
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string list = next();
+                for (size_t at = 0; at <= list.size();) {
+                    const size_t comma = std::min(list.find(',', at), list.size());
+                    if (comma > at) a.scan.push_back(list.substr(at, comma - at));
+                    at = comma + 1;
+                }
+                for (const auto& s : a.scan) {
+                    rz::Range r;
+                    if (!rz::parseRange(s, r)) throw std::runtime_error("--scan takes IPv4 ranges like 10.8.0.0/24 (at most /16): " + s);
+                }
+            } else {
+                a.scanAdapters = true;
+            }
+        } else if (k == "--no-broadcast") a.broadcast = false;
+        else if (k == "--check") a.firewallCheck = true;
+        else if (k == "--print") a.firewallPrint = true;
+        else if (k == "--remove") a.firewallRemove = true;
+        else if (k == "--public") a.firewallPublic = true;
+        else if (k == "--elevated") a.firewallElevated = true;
         else if (k == "--shaders") {
             a.shaders = next();
             if (a.shaders != "ask" && a.shaders != "compile" && a.shaders != "skip")
@@ -1349,6 +1390,168 @@ private:
     bool compiling_ = false, stopping_ = false;
 };
 
+// Plan 18: the firewall rule its user adds once. Windows Firewall lets another machine reach this one's node or master
+// only through an inbound rule; a node runs headless, where Windows' own question when a program first listens is not
+// seen. One rule, named for Rhizome, lets moonray_xpu2.exe (this one, by its path) take connections on private and
+// domain networks (--public: public ones too). Adding it needs an administrator: asked for (Windows' own prompt) when
+// this is not one. --check: whether it is there (read from the firewall's own list, nothing changed); --print: the
+// commands, run by hand; --remove: the rule taken away.
+constexpr const wchar_t* FirewallRuleName = L"MoonRay XPU2 Rhizome";
+// The programs the inbound allowing rules of that name are for (the firewall's list in the registry, read only).
+inline std::vector<std::wstring> firewallRulePrograms() {
+    std::vector<std::wstring> out;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules", 0,
+                      KEY_READ, &key) != ERROR_SUCCESS)
+        return out;
+    const std::wstring name = std::wstring(L"|Name=") + FirewallRuleName + L"|";
+    for (DWORD i = 0;; ++i) {
+        wchar_t value[512];
+        DWORD valueLen = 512, type = 0, bytes = 0;
+        LONG got = RegEnumValueW(key, i, value, &valueLen, nullptr, &type, nullptr, &bytes);
+        if (got == ERROR_NO_MORE_ITEMS) break;
+        if (got != ERROR_SUCCESS || type != REG_SZ || bytes == 0) continue;
+        std::wstring data(bytes / sizeof(wchar_t) + 1, L'\0');
+        valueLen = 512;
+        DWORD size = DWORD(data.size() * sizeof(wchar_t));
+        if (RegEnumValueW(key, i, value, &valueLen, nullptr, &type, reinterpret_cast<BYTE*>(data.data()), &size) != ERROR_SUCCESS) continue;
+        data.resize(wcslen(data.c_str()));
+        if (data.find(name) == std::wstring::npos || data.find(L"|Dir=In|") == std::wstring::npos ||
+            data.find(L"|Action=Allow|") == std::wstring::npos || data.find(L"|Active=TRUE|") == std::wstring::npos)
+            continue;
+        const size_t app = data.find(L"|App=");
+        if (app == std::wstring::npos) continue;
+        const size_t end = data.find(L'|', app + 5);
+        out.push_back(data.substr(app + 5, end == std::wstring::npos ? std::wstring::npos : end - app - 5));
+    }
+    RegCloseKey(key);
+    return out;
+}
+inline fs::path selfExecutable() {
+    wchar_t self[32768];
+    const DWORD n = GetModuleFileNameW(nullptr, self, 32768);
+    return fs::path(std::wstring(self, n));
+}
+// Whether the firewall lets this executable take connections from other machines (a rule of Rhizome's for its path).
+inline bool firewallAllowsThis() {
+    const std::wstring self = selfExecutable().wstring();
+    for (const auto& p : firewallRulePrograms())
+        if (_wcsicmp(p.c_str(), self.c_str()) == 0) return true;
+    return false;
+}
+inline bool runningElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION e{};
+    DWORD got = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof e, &got) && e.TokenIsElevated;
+    CloseHandle(token);
+    return ok;
+}
+// A command run without a window; its exit code (-1: it did not start).
+inline int runQuietly(std::wstring command) {
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return -1;
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    return int(code);
+}
+inline std::string narrow(const std::wstring& w) { return fs::path(w).u8string(); }
+inline int firewallVerb(const RhizomeArgs& a) {
+    const std::wstring exe = selfExecutable().wstring();
+    const std::wstring remove = std::wstring(L"netsh advfirewall firewall delete rule name=\"") + FirewallRuleName + L"\"";
+    const std::wstring add = std::wstring(L"netsh advfirewall firewall add rule name=\"") + FirewallRuleName +
+                             L"\" dir=in action=allow enable=yes profile=private,domain" + (a.firewallPublic ? L",public" : L"") + L" program=\"" + exe + L"\"";
+    auto state = [&] {
+        if (firewallAllowsThis()) {
+            std::printf("MoonRay XPU2 Rhizome: the firewall lets other machines reach this one (%s)\n", narrow(exe).c_str());
+            return 0;
+        }
+        const auto others = firewallRulePrograms();
+        if (others.empty()) std::printf("MoonRay XPU2 Rhizome: no firewall rule for Rhizome here: other machines may not reach this one\n");
+        else std::printf("MoonRay XPU2 Rhizome: the firewall's Rhizome rule is for another copy (%s), not this one\n", narrow(others.front()).c_str());
+        std::printf("  moonray_xpu2 rhizome firewall adds it (asking for an administrator)\n");
+        return 3;
+    };
+    if (a.firewallCheck) return state();
+    if (a.firewallPrint) {
+        std::printf("Run these in a command prompt opened as an administrator:\n  %s\n", narrow(remove).c_str());
+        if (!a.firewallRemove) std::printf("  %s\n", narrow(add).c_str());
+        return 0;
+    }
+    if (!runningElevated()) {
+        if (a.firewallElevated) {
+            std::printf("MoonRay XPU2 Rhizome: not an administrator: the rule is not changed\n");
+            return 5;
+        }
+        // Windows' own prompt for an administrator; this same command again behind it.
+        std::wstring params = L"rhizome firewall --elevated";
+        if (a.firewallRemove) params += L" --remove";
+        if (a.firewallPublic) params += L" --public";
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof sei;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE;
+        sei.lpVerb = L"runas";
+        sei.lpFile = exe.c_str();
+        sei.lpParameters = params.c_str();
+        sei.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&sei) || !sei.hProcess) {
+            std::printf("MoonRay XPU2 Rhizome: %s: the rule is not changed\n",
+                        GetLastError() == ERROR_CANCELLED ? "the administrator prompt was declined" : "the administrator prompt did not open");
+            return 4;
+        }
+        WaitForSingleObject(sei.hProcess, INFINITE);
+        CloseHandle(sei.hProcess);
+    } else {
+        runQuietly(remove);  // the rule of an earlier copy (another path) too
+        if (!a.firewallRemove && runQuietly(add) != 0) {
+            std::printf("MoonRay XPU2 Rhizome: netsh did not add the rule\n");
+            return 1;
+        }
+        if (a.firewallElevated) return 0;
+    }
+    if (a.firewallRemove) {
+        const bool gone = firewallRulePrograms().empty();
+        std::printf("MoonRay XPU2 Rhizome: %s\n", gone ? "the firewall rule is removed" : "the firewall rule is still there");
+        return gone ? 0 : 1;
+    }
+    return state();
+}
+
+// Plan 18: the machines a master reached before, remembered in its folder (known.txt, an IPv4 address a line, the
+// newest first, 256 at most) and probed one by one at its next start, where broadcast does not reach (a VPN, a routed
+// network): found once by address or a sweep, found again by itself.
+inline std::vector<std::string> readKnown(const fs::path& folder) {
+    std::vector<std::string> out;
+    std::ifstream in(folder / "known.txt");
+    for (std::string line; std::getline(in, line);) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        in_addr x{};
+        if (!line.empty() && inet_pton(AF_INET, line.c_str(), &x) == 1 && std::find(out.begin(), out.end(), line) == out.end()) out.push_back(line);
+    }
+    return out;
+}
+inline void remember(const fs::path& folder, const std::string& host) {
+    in_addr x{};
+    if (inet_pton(AF_INET, host.c_str(), &x) != 1) return;
+    std::vector<std::string> known = readKnown(folder);
+    known.erase(std::remove(known.begin(), known.end(), host), known.end());
+    known.insert(known.begin(), host);
+    if (known.size() > 256) known.resize(256);
+    std::error_code e;
+    const fs::path temp = folder / "known.txt.part";
+    {
+        std::ofstream out(temp, std::ios::trunc);
+        for (const auto& k : known) out << k << "\n";
+    }
+    fs::rename(temp, folder / "known.txt", e);
+}
+
 inline int run(int argc, char** argv) {
     RhizomeArgs a = parseRhizome(argc, argv);
     wholeTextures() = a.wholeTextures;
@@ -1370,6 +1573,7 @@ inline int run(int argc, char** argv) {
         std::printf("MoonRay XPU2 Rhizome: job %s queued: %s\n", j.name.c_str(), at.u8string().c_str());
         return 0;
     }
+    if (a.verb == Verb::Firewall) return firewallVerb(a);
     if (a.verb != Verb::Node && a.verb != Verb::Master) return identityVerb(a);
     rz::Winsock winsock;
     const fs::path folder = roleFolder(a);
@@ -1586,22 +1790,50 @@ inline int run(int argc, char** argv) {
     std::unique_ptr<rz::Responder> responder;
     std::unique_ptr<rz::Prober> prober;
     const uint16_t tcpPort = uint16_t(std::stoi(node.address().substr(node.address().rfind(':') + 1)));
+    // Another machine reaches this one only through the firewall's rule: said once at the start when it is not there
+    // (a test's machines on 127.0.0.1 need none).
+    if (a.bind != "127.0.0.1" && !firewallAllowsThis())
+        std::printf("MoonRay XPU2 Rhizome: the firewall has no rule for this program: other machines may not reach it "
+                    "(moonray_xpu2 rhizome firewall adds one, once)\n");
     if (a.discovery) {
         try {
-            if (a.master)
-                prober = std::make_unique<rz::Prober>(a.key, [&](const rz::Hash& h, const std::string& at) {
+            if (a.master) {
+                // Beyond broadcast (plan 18): the machines reached before, one by one, and the sweeps asked for.
+                rz::ProbeOptions po;
+                po.broadcast = a.broadcast;
+                po.adapters = a.scanAdapters;
+                for (const auto& s : a.scan) {
+                    rz::Range r;
+                    if (rz::parseRange(s, r)) po.ranges.push_back(r);
+                }
+                const std::vector<std::string> known = readKnown(folder);
+                for (const auto& k : known) {
+                    in_addr x{};
+                    if (inet_pton(AF_INET, k.c_str(), &x) == 1) po.hosts.push_back(ntohl(x.s_addr));
+                }
+                if (!known.empty() || !po.ranges.empty() || po.adapters)
+                    std::printf("MoonRay XPU2 Rhizome: probing %zu machines reached before%s%s\n", known.size(),
+                                po.ranges.empty() ? "" : (", " + std::to_string(po.ranges.size()) + " ranges swept").c_str(),
+                                po.adapters ? ", each adapter's subnet swept" : "");
+                prober = std::make_unique<rz::Prober>(a.key, [&, folder](const rz::Hash& h, const std::string& at) {
                     if (h == node.hash()) return;
                     std::printf("MoonRay XPU2 Rhizome: found %s at %s\n", rz::shortHex(h).c_str(), at.c_str());
                     std::fflush(stdout);
+                    remember(folder, at.substr(0, at.rfind(':')));
                     node.dial(at);
-                });
+                }, rz::DiscoveryPort, 1.0, po);
+            }
             else
                 responder = std::make_unique<rz::Responder>(a.key, node.hash(), tcpPort);
         } catch (const std::exception& e) {
             std::printf("MoonRay XPU2 Rhizome: discovery is off here: %s\n", e.what());
         }
     }
-    for (const auto& at : a.nodeAddresses) node.dial(at);
+    for (const auto& at : a.nodeAddresses) {
+        // A machine given by address is remembered too (its host): probed at the next start without being given.
+        if (a.master) remember(folder, at.substr(0, at.rfind(':')));
+        node.dial(at);
+    }
     if (!a.master) {
         // A node: each job's scene from the swarm's memory, made here, then ready for cells; then the next job.
         std::printf("MoonRay XPU2 Rhizome: node waiting for a master%s\n", a.masterAddress.empty() ? " to find it" : "");
