@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
         std::string materialPtx, chainPtx;
         if (std::ifstream a{fs::path(argv[3]).parent_path() / "material" / "async_material.ptx", std::ios::binary})
             materialPtx.assign(std::istreambuf_iterator<char>(a), {});
-        std::string mapsPtx, lightsPtx, lobesPtx, volumesPtx, dwaPtx, dwaLobesPtx, extrasPtx;
+        std::string mapsPtx, lightsPtx, lobesPtx, volumesPtx, volumeMapsPtx, dwaPtx, dwaLobesPtx, extrasPtx;
         if (std::ifstream a{fs::path(argv[3]).parent_path() / "maps" / "async_maps.ptx", std::ios::binary})
             mapsPtx.assign(std::istreambuf_iterator<char>(a), {});
         if (std::ifstream a{fs::path(argv[3]).parent_path() / "lights" / "async_lights.ptx", std::ios::binary})
@@ -53,6 +53,8 @@ int main(int argc, char** argv) {
             lobesPtx.assign(std::istreambuf_iterator<char>(a), {});
         if (std::ifstream a{fs::path(argv[3]).parent_path() / "volumes" / "async_volumes.ptx", std::ios::binary})
             volumesPtx.assign(std::istreambuf_iterator<char>(a), {});
+        if (std::ifstream a{fs::path(argv[3]).parent_path() / "volumemaps" / "async_volumes.ptx", std::ios::binary})
+            volumeMapsPtx.assign(std::istreambuf_iterator<char>(a), {});
         if (std::ifstream a{fs::path(argv[3]).parent_path() / "dwa" / "async_dwa.ptx", std::ios::binary})
             dwaPtx.assign(std::istreambuf_iterator<char>(a), {});
         if (std::ifstream a{fs::path(argv[3]).parent_path() / "dwalobes" / "async_dwalobes.ptx", std::ios::binary})
@@ -100,6 +102,7 @@ int main(int argc, char** argv) {
             gpuOptions.lightsPtx = lightsPtx;
             gpuOptions.lobesPtx = lobesPtx;
             gpuOptions.volumesPtx = volumesPtx;
+            gpuOptions.volumeMapsPtx = volumeMapsPtx;
             gpuOptions.dwaPtx = dwaPtx;
             gpuOptions.dwaLobesPtx = dwaLobesPtx;
             gpuOptions.extrasPtx = extrasPtx;

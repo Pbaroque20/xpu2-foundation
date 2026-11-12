@@ -44,6 +44,9 @@ struct GpuOptions {
     // modules (async_lights.cu, async_lobes.cu) and volume module (async_volumes.cu), called by the path tracer: a
     // program built in modules has them all.
     std::string mapsPtx, lightsPtx, lobesPtx, volumesPtx;
+    // The volume module again with the volumes' map program in its march (XPU2_VOLUME_MAPS_MODULE): bound in place of
+    // the plain one only for a scene with volumes whose maps the card runs.
+    std::string volumeMapsPtx;
     // The DwaBase modules (async_dwa.cu, async_dwalobes.cu), called by the material module's callables.
     std::string dwaPtx, dwaLobesPtx;
     // The extras module (async_extras.cu): the camera's ray and the AOVs' accumulation, called by the path tracer.
@@ -76,8 +79,10 @@ class GpuLane {
 public:
     gpu::Driver driver;
     // The GPU program's modules: the path tracer's, then its callables' (material, maps, lights, lobes, volumes, DwaBase
-    // resolve, DwaBase lobes, extras).
-    static constexpr int ModuleCount = 9;
+    // resolve, DwaBase lobes, extras), and the mapped volume module (VolumeMapsModule, bound in place of the volume
+    // module where a scene needs it).
+    static constexpr int ModuleCount = 10;
+    static constexpr int VolumeModule = 5, VolumeMapsModule = 9;
 
     // ptx renders every frame (async_gpu.cu: one program for uniform and adaptive frames); materialPtx, its material
     // module (async_material.cu: the material callables; none: the program shades materials itself);
@@ -109,7 +114,8 @@ public:
             ox(optixDeviceContextCreate(driver.context, &context, &optix_));
             OptixModule modules[ModuleCount]{};
             const std::string* sources[ModuleCount] = {&ptx, &materialPtx, &options_.mapsPtx, &options_.lightsPtx, &options_.lobesPtx,
-                                                       &options_.volumesPtx, &options_.dwaPtx, &options_.dwaLobesPtx, &options_.extrasPtx};
+                                                       &options_.volumesPtx, &options_.dwaPtx, &options_.dwaLobesPtx, &options_.extrasPtx,
+                                                       &options_.volumeMapsPtx};
             compileModules(sources, modules);
             programs_[0].create(*this, modules);
             program_ = &programs_[0];
@@ -208,9 +214,16 @@ public:
         if (!plan->shadowLinks.empty()) return "shadow linking";
         if (!plan->lobeLightSetBits.empty()) return "lobe light sets";
         // Emissive volumes light every surface (their emissive regions are light sources, volume_emission.h): a GPU
-        // sample that does not cross one would still miss its light, so none may be the GPU's.
-        if (!plan->emissiveRegions.empty()) return "emissive volumes";
-        // VDB, heterogeneous and emissive volumes are stand-ins (standIn): their samples are deferred to the CPU lane.
+        // sample that does not cross one would still miss its light, so a glowing volume the GPU does not render (one
+        // whose maps read image textures: volume_core.h's mapsOnHost) leaves none to the GPU. The others' regions go
+        // to the card (uploadRegions), mapped ones' maps run there too (GpuVolumeMaps).
+        if (!plan->emissiveRegions.empty()) {
+            if (!volume::GpuEmission) return "emissive volumes";
+            const volume::Grids host{plan->volumeGridViews.data(), U32(plan->volumeGridViews.size()), nullptr, 0.0f};
+            for (const auto& r : plan->emissiveRegions)
+                if (r.volume >= plan->volumes.size() || !volume::gpuRenders(plan->volumes[r.volume], host)) return volume::GpuVolumeMaps ? "emissive volumes whose maps read image textures" : "emissive volumes with mapped emission";
+        }
+        // Volumes the GPU does not render are stand-ins (standIn): their samples are deferred to the CPU lane.
         return {};
     }
     // A launch thread's records of lights in motion at the sample's time (GpuBackend::movedLight): however many move, the
@@ -230,8 +243,8 @@ public:
         const bool moving = !m.steps.empty() || !m.curveSteps.empty();
         return mesh.cpuOnly || (m.points && mesh.instance) || ((moving || m.points) && !motionOnGpu());
     }
-    // Whether the GPU hands samples to the CPU lane: stand-in meshes, or volumes its programs do not render (VDB,
-    // heterogeneous, emissive: volumeCrossings defers them), which need the CPU lane and the deferred samples' ring.
+    // Whether the GPU hands samples to the CPU lane: stand-in meshes, or volumes its programs do not render (mapped
+    // colour, emission or anisotropy; grids not on the card: volumeCrossings defers them), which need the CPU lane and the deferred samples' ring.
     // Each follower in its context, then this lane's again. Between frames (the scene, its edits, a frame's begin) a
     // follower that fails is let go and the others go on (forwardOrDrop); within a frame its failure is the frame's
     // (forward), which goes to the fallback as any GPU failure does.
@@ -329,7 +342,10 @@ public:
         if (!followers_.empty()) forwardOrDrop([&](GpuLane& f) { f.updateCamera(plan); });
         plan_ = plan;
         // The volumes' records again: a mapped one's settings at the render origin, where the camera now is.
-        if (scene_.volumes && !plan->volumes.empty()) scene_.volumes = upload(plan->volumes.data(), plan->volumes.size() * sizeof(volume::Shader));
+        if (scene_.volumes && !plan->volumes.empty()) {
+            scene_.volumes = upload(plan->volumes.data(), plan->volumes.size() * sizeof(volume::Shader));
+            uploadRegions(*plan);
+        }
         uploadConfig(plan);
     }
     // A placement-only edit (the session's fast path, realtime): the plan is the one prepared with some meshes placed
@@ -410,6 +426,7 @@ public:
             bool regrid = plan->volumeGridViews.size() != gridsSent_.size();
             for (size_t k = 0; !regrid && k < gridsSent_.size(); ++k) regrid = gridHeld(plan->volumeGridViews[k]) != gridsSent_[k];
             if (regrid) uploadGrids(*plan);
+            uploadRegions(*plan);  // a moved glowing volume's regions where it is
         }
         uploadConfig(plan);
         placementsMoved_ = moved.size();
@@ -1153,6 +1170,7 @@ public:
             if (!plan->volumes.empty()) {
                 scene_.volumes = upload(plan->volumes.data(), plan->volumes.size() * sizeof(volume::Shader));
                 uploadGrids(*plan);
+                uploadRegions(*plan);
                 std::vector<int> meshVolumes;
                 for (const auto& mesh : plan->meshes) meshVolumes.push_back(mesh.volume);
                 scene_.meshVolumes = upload(meshVolumes.data(), meshVolumes.size() * sizeof(int));
@@ -1212,7 +1230,12 @@ public:
             movedLightSlots_ = U32(std::min(plan->lightMotion.size(), MovedLightSlots));
             movedLightsScratch_ = (movedLightSlots_ * sizeof(lights::Light) + (movedLightSlots_ + 1) * sizeof(U32) + 15) & ~size_t(15);
             if (!movedLightSlots_) movedLightsScratch_ = 0;
-            registersScratch_ = (size_t(2 * plan->mapRegisters) * sizeof(shade::Color) + 15) & ~size_t(15);
+            // Two runs of map registers (a surface's, and its bump's shifted states), a third where the card runs a
+            // mapped volume's maps (volume_core.h's GpuVolumeMaps: deviceVolumeMaps).
+            bool volumeMaps = false;
+            for (const auto& v : plan->volumes) volumeMaps = volumeMaps || (volume::GpuVolumeMaps && volume::pointMaps(v) && !v.mapsOnHost);
+            volumeMaps_ = volumeMaps;
+            registersScratch_ = (size_t((volumeMaps ? 3 : 2) * plan->mapRegisters) * sizeof(shade::Color) + 15) & ~size_t(15);
             const size_t threadScratch = scratchStride(plan->dwaSlots, plan->glitter) + aovScratch_ + cryptoScratch_ + movedLightsScratch_ + registersScratch_;
             // The launch the card has room for: the scratch at most a quarter of what is free, halved until it is.
             options_.launchThreads = cardThreads_;
@@ -1333,6 +1356,17 @@ public:
         cpu::need(plan_ && inFlight_.empty(), "GPU frame overlap");
         cpu::need(!adaptive || single_ || programs_[1].pipeline, "No adaptive GPU program");
         program_ = &programs_[adaptive && !single_ ? 1 : 0];
+        // A scene with volumes whose maps the card runs: the program with the mapped volume module, made the first time.
+        if (volumeMaps_ && program_ == &programs_[0] && programs_[0].modules[VolumeMapsModule]) {
+            if (!mapped_.pipeline) {
+                OptixModule modules[ModuleCount];
+                for (int i = 0; i < ModuleCount; ++i) modules[i] = programs_[0].modules[i];
+                modules[VolumeModule] = programs_[0].modules[VolumeMapsModule];
+                mapped_.create(*this, modules);
+                mapped_.ownsModules = false;  // programs_[0]'s
+            }
+            program_ = &mapped_;
+        }
         itemsPerChunk_ = samplesPerChunk * TilePixels;
         adaptive_ = adaptive;
         sizeParked(partial);
@@ -2108,6 +2142,17 @@ private:
         return po;
     }
     static bool exceptions() { return std::getenv("XPU2_OPTIX_EXCEPTIONS") != nullptr; }
+    // Whether the machine has room for another compile task: free RAM above a reserve, an eighth of the machine's and
+    // at least 4 GB (XPU2_COMPILE_RESERVE_GB: another). A task of the largest modules takes GBs of its own; several at
+    // once took a 64 GB machine past 25 GB.
+    static bool compileMemoryRoom() {
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof status;
+        if (!GlobalMemoryStatusEx(&status)) return true;
+        double reserve = std::max(4.0, double(status.ullTotalPhys) / double(1ull << 30) / 8.0);
+        if (const char* r = std::getenv("XPU2_COMPILE_RESERVE_GB")) reserve = std::max(1.0, std::atof(r));
+        return double(status.ullAvailPhys) / double(1ull << 30) > reserve;
+    }
     // The program modules (the adaptive one if any), compiled together on a pool of threads through OptiX's
     // compile tasks: one thread compiling the shading library took minutes. OptiX's disk cache still serves
     // a module it has compiled before: it hands out tasks all the same, which then finish at once.
@@ -2124,6 +2169,21 @@ private:
             if (l >= 0 && l <= 3) mo.optLevel = levels[l];
         }
         mo.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
+        // Each module's own options: XPU2_OPTIX_LEVELS ("module:level,...", e.g. "0:1,5:2") sets some modules' levels, to
+        // measure what a lighter level saves in compile memory and costs in speed.
+        OptixModuleCompileOptions moduleOptions[ModuleCount];
+        for (int i = 0; i < ModuleCount; ++i) moduleOptions[i] = mo;
+        if (const char* levels = std::getenv("XPU2_OPTIX_LEVELS")) {
+            static const OptixCompileOptimizationLevel named[4] = {OPTIX_COMPILE_OPTIMIZATION_LEVEL_0, OPTIX_COMPILE_OPTIMIZATION_LEVEL_1,
+                                                                  OPTIX_COMPILE_OPTIMIZATION_LEVEL_2, OPTIX_COMPILE_OPTIMIZATION_LEVEL_3};
+            for (const char* at = levels; *at;) {
+                int module = -1, level = -1, used = 0;
+                if (std::sscanf(at, "%d:%d%n", &module, &level, &used) != 2) break;
+                if (module >= 0 && module < ModuleCount && level >= 0 && level <= 3) moduleOptions[module].optLevel = named[level];
+                at += used;
+                if (*at == ',') ++at;
+            }
+        }
         const OptixPipelineCompileOptions po = pipelineOptions();
         std::mutex mutex;
         std::condition_variable wake;
@@ -2135,24 +2195,28 @@ private:
         for (int i = 0; i < ModuleCount; ++i) {
             if (sources[i]->empty()) continue;
             OptixTask first = nullptr;
-            if (optixModuleCreateFromPTXWithTasks(optix_, &mo, &po, sources[i]->data(), sources[i]->size(), logs[i], &lengths[i],
+            if (optixModuleCreateFromPTXWithTasks(optix_, &moduleOptions[i], &po, sources[i]->data(), sources[i]->size(), logs[i], &lengths[i],
                                                   &modules[i], &first) != OPTIX_SUCCESS)
                 throw std::runtime_error("OptiX module: " + std::string(logs[i], std::min(lengths[i], sizeof(logs[i]))));
             if (first) tasks.push_back(first);
         }
         unsigned finished = 0;
         unsigned active = 0;
-        bool done = tasks.empty();
+        bool done = tasks.empty(), heldNoted = false;
         OptixResult error = OPTIX_SUCCESS;
         // When each module completed (seconds from the start; negative: not yet).
         const auto began = std::chrono::steady_clock::now();
-        double completedAt[ModuleCount] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+        double completedAt[ModuleCount];
+        for (double& at : completedAt) at = -1;
         auto noteCompleted = [&] {
             for (int i = 0; i < ModuleCount; ++i) {
                 if (!modules[i] || completedAt[i] >= 0) continue;
                 OptixModuleCompileState state = OPTIX_MODULE_COMPILE_STATE_NOT_STARTED;
-                if (optixModuleGetCompilationState(modules[i], &state) == OPTIX_SUCCESS && state == OPTIX_MODULE_COMPILE_STATE_COMPLETED)
+                if (optixModuleGetCompilationState(modules[i], &state) == OPTIX_SUCCESS && state == OPTIX_MODULE_COMPILE_STATE_COMPLETED) {
                     completedAt[i] = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+                    std::fprintf(stderr, "OptiX module %d compiled at %.1f s\n", i, completedAt[i]);
+                    std::fflush(stderr);
+                }
             }
         };
         auto work = [&] {
@@ -2160,8 +2224,19 @@ private:
                 OptixTask task;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
-                    wake.wait(lock, [&] { return done || !tasks.empty(); });
-                    if (done) return;
+                    // A task more only while the machine has room for it (compileMemoryRoom): one task at least runs,
+                    // so the compile always moves; the others wait for memory as for work (each task can take GBs).
+                    for (;;) {
+                        wake.wait_for(lock, std::chrono::milliseconds(500), [&] { return done || !tasks.empty(); });
+                        if (done) return;
+                        if (tasks.empty()) continue;
+                        if (active == 0 || compileMemoryRoom()) break;
+                        if (!heldNoted) {
+                            heldNoted = true;
+                            std::printf("MoonRay XPU2 shaders: memory is short: compile tasks run fewer at a time\n");
+                            std::fflush(stdout);
+                        }
+                    }
                     task = tasks.front();
                     tasks.pop_front();
                     ++active;
@@ -2183,7 +2258,9 @@ private:
                 wake.notify_all();
             }
         };
-        const unsigned threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        unsigned threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        // XPU2_COMPILE_THREADS: that many tasks at once (1: one at a time, each task's memory its own, to measure).
+        if (const char* n = std::getenv("XPU2_COMPILE_THREADS")) threads = std::max(1, std::min(64, std::atoi(n)));
         std::vector<std::thread> workers;
         try {
             for (unsigned i = 1; i < threads; ++i) workers.emplace_back(work);
@@ -2214,13 +2291,16 @@ private:
             modules[i] = nullptr;
             char log[8192];
             size_t length = sizeof(log);
-            if (optixModuleCreateFromPTX(optix_, &mo, &po, sources[i]->data(), sources[i]->size(), log, &length, &modules[i]) !=
+            if (optixModuleCreateFromPTX(optix_, &moduleOptions[i], &po, sources[i]->data(), sources[i]->size(), log, &length, &modules[i]) !=
                 OPTIX_SUCCESS)
                 throw std::runtime_error("OptiX module: " + std::string(log, std::min(length, sizeof(log))));
         }
     }
     // One OptiX program: its modules, programs, pipeline and binding table.
     struct Program {
+        // The groups: raygen, two misses, four hit groups (triangles, curves; the volume bounds' collecting two), then
+        // the callables (async_gpu_device.h's MaterialCall order) and the exception program where it is on.
+        static constexpr unsigned CallablesFirst = 7;
         OptixModule modules[ModuleCount]{};
         OptixProgramGroup groups[32]{};  // five, and the callables (async_gpu_device.h's MaterialCall)
         OptixPipeline pipeline = nullptr;
@@ -2229,6 +2309,7 @@ private:
         // volume callables', its subsurface callable's; stackC as set (fitStack).
         unsigned stackA = 0, stackB = 0, stackC = 0, stackBase = 0, ccVolume = 0, ccSubsurface = 0;
         bool fitted = false;
+        bool ownsModules = true;  // the mapped program's are the first program's
         OptixShaderBindingTable sbt{};
 
         // Takes the compiled modules (compileModules) and makes their programs and pipeline.
@@ -2254,6 +2335,16 @@ private:
             desc[4].hitgroup.entryFunctionNameCH = "__closesthit__triangle";
             desc[4].hitgroup.moduleIS = module;
             desc[4].hitgroup.entryFunctionNameIS = "__intersection__curve";
+            // The volume bounds' traversal (GpuBackend::volumeCrossings): every candidate kept by its any-hit program
+            // (hit groups 2 and 3 of the table; the curves' never meet the bounds, but each type has its record).
+            desc[5].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+            desc[5].hitgroup.moduleAH = module;
+            desc[5].hitgroup.entryFunctionNameAH = "__anyhit__volumeCrossing";
+            desc[6].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+            desc[6].hitgroup.moduleAH = module;
+            desc[6].hitgroup.entryFunctionNameAH = "__anyhit__volumeCrossing";
+            desc[6].hitgroup.moduleIS = module;
+            desc[6].hitgroup.entryFunctionNameIS = "__intersection__curve";
             // The callables, in async_gpu_device.h's MaterialCall order: all of them in a program built in modules.
             static const struct { int module; const char* entry; bool continuation; } callables[] = {
                 {1, "__direct_callable__shade", false},       {1, "__direct_callable__presence", false},
@@ -2264,21 +2355,22 @@ private:
                 {5, "__continuation_callable__subsurfaceRadiance", true}, {5, "__continuation_callable__volumeTransmittance", true},
                 {6, "__direct_callable__dwaResolve", false}, {7, "__direct_callable__dwaLobes", false},
                 {8, "__direct_callable__camera", false},     {8, "__direct_callable__aovLight", false},
-                {8, "__direct_callable__aovVisibility", false}, {8, "__direct_callable__materialAovs", false}};
+                {8, "__direct_callable__aovVisibility", false}, {8, "__direct_callable__materialAovs", false},
+                {5, "__continuation_callable__emissiveVolumeIntegral", true}};
             const bool split = modules[1] != nullptr;
             for (int i = 2; i < ModuleCount; ++i)
-                cpu::need(!split || modules[i], "The GPU program's modules are incomplete: module " + std::to_string(i) + " is missing");
+                if (i != VolumeMapsModule) cpu::need(!split || modules[i], "The GPU program's modules are incomplete: module " + std::to_string(i) + " is missing");
             const unsigned callableCount = split ? unsigned(sizeof(callables) / sizeof(callables[0])) : 0u;
-            const unsigned count = 5u + callableCount + (exceptions() ? 1u : 0u);
-            static_assert(5 + sizeof(callables) / sizeof(callables[0]) <= sizeof(desc) / sizeof(desc[0]), "too many program groups");
+            const unsigned count = CallablesFirst + callableCount + (exceptions() ? 1u : 0u);
+            static_assert(CallablesFirst + sizeof(callables) / sizeof(callables[0]) <= sizeof(desc) / sizeof(desc[0]), "too many program groups");
             for (unsigned k = 0; k < callableCount; ++k) {
-                desc[5 + k].kind = OPTIX_PROGRAM_GROUP_KIND_CALLABLES;
+                desc[CallablesFirst + k].kind = OPTIX_PROGRAM_GROUP_KIND_CALLABLES;
                 if (callables[k].continuation) {
-                    desc[5 + k].callables.moduleCC = modules[callables[k].module];
-                    desc[5 + k].callables.entryFunctionNameCC = callables[k].entry;
+                    desc[CallablesFirst + k].callables.moduleCC = modules[callables[k].module];
+                    desc[CallablesFirst + k].callables.entryFunctionNameCC = callables[k].entry;
                 } else {
-                    desc[5 + k].callables.moduleDC = modules[callables[k].module];
-                    desc[5 + k].callables.entryFunctionNameDC = callables[k].entry;
+                    desc[CallablesFirst + k].callables.moduleDC = modules[callables[k].module];
+                    desc[CallablesFirst + k].callables.entryFunctionNameDC = callables[k].entry;
                 }
             }
             if (exceptions()) {  // the diagnostic's exception program, after the callables
@@ -2308,21 +2400,21 @@ private:
                 // (mapsAtLeast keeps more than twice that), so what it reports is not taken alone.
                 const auto own = [&](unsigned k) {
                     OptixStackSizes one{};
-                    ox(optixUtilAccumulateStackSizes(groups[5 + k], &one));
+                    ox(optixUtilAccumulateStackSizes(groups[CallablesFirst + k], &one));
                     return one.dssDC;
                 };
                 constexpr unsigned mapsAtLeast = 4096, traceAtLeast = 512;
                 const unsigned maps = std::max(own(2), mapsAtLeast);
                 const auto ownCC = [&](unsigned k) {
                     OptixStackSizes one{};
-                    ox(optixUtilAccumulateStackSizes(groups[5 + k], &one));
+                    ox(optixUtilAccumulateStackSizes(groups[CallablesFirst + k], &one));
                     return one.cssCC;
                 };
                 a = 0;
                 b = std::max({own(0) + std::max({maps, own(12), own(13)}), own(1) + maps, stacks.dssDC});
                 c = stacks.cssRG + stacks.cssCC + std::max({stacks.cssCH, stacks.cssMS, stacks.cssIS + stacks.cssAH, traceAtLeast});
                 stackBase = c - stacks.cssCC;
-                ccVolume = std::max(ownCC(9), ownCC(11));
+                ccVolume = std::max({ownCC(9), ownCC(11), ownCC(18)});
                 ccSubsurface = ownCC(10);
                 fitted = stacks.cssCC == std::max(ccVolume, ccSubsurface);
             }
@@ -2333,7 +2425,7 @@ private:
                 for (unsigned i = 0; i < count; ++i) {
                     OptixStackSizes one{};
                     ox(optixUtilAccumulateStackSizes(groups[i], &one));
-                    const char* name = i >= 5 && i - 5 < sizeof(callables) / sizeof(callables[0]) ? callables[i - 5].entry : "";
+                    const char* name = i >= CallablesFirst && i - CallablesFirst < sizeof(callables) / sizeof(callables[0]) ? callables[i - CallablesFirst].entry : "";
                     std::fprintf(stderr, "stack of %u %s: rg %u ms %u ch %u dc %u cc %u is %u ah %u\n", i, name, one.cssRG, one.cssMS, one.cssCH, one.dssDC, one.cssCC, one.cssIS, one.cssAH);
                 }
                 std::fprintf(stderr, "stacks asked: from traversal %u, from state %u, continuation %u\n", a, b, c);
@@ -2350,9 +2442,9 @@ private:
             sbt.missRecordCount = 2;
             sbt.hitgroupRecordBase = records->pointer + 3 * sizeof(Record);
             sbt.hitgroupRecordStrideInBytes = sizeof(Record);
-            sbt.hitgroupRecordCount = 2;
+            sbt.hitgroupRecordCount = 4;
             if (split) {
-                sbt.callablesRecordBase = records->pointer + 5 * sizeof(Record);
+                sbt.callablesRecordBase = records->pointer + CallablesFirst * sizeof(Record);
                 sbt.callablesRecordStrideInBytes = sizeof(Record);
                 sbt.callablesRecordCount = callableCount;
             }
@@ -2375,8 +2467,9 @@ private:
             if (pipeline) optixPipelineDestroy(pipeline);
             for (auto& g : groups)
                 if (g) optixProgramGroupDestroy(g);
-            for (auto& m : modules)
-                if (m) optixModuleDestroy(m);
+            if (ownsModules)
+                for (auto& m : modules)
+                    if (m) optixModuleDestroy(m);
             pipeline = nullptr;
             for (auto& m : modules) m = nullptr;
             for (auto& g : groups) g = nullptr;
@@ -2539,6 +2632,19 @@ private:
     std::vector<const void*> gridsSent_;
     // A grid's host data, dense or NanoVDB, by which a grid made again is told from the one sent.
     static const void* gridHeld(const volume::Grid& g) { return g.dense ? static_cast<const void*>(g.dense) : g.data; }
+    // The glowing volumes' emissive regions and their distributions' pool (volume_emission.h), for the path tracer's
+    // light samples toward them; none without (the integrator then finds no regions).
+    void uploadRegions(const cpu::Plan& plan) {
+        scene_.emissiveRegions = nullptr;
+        scene_.emissionPool = nullptr;
+        scene_.emissiveRegionCount = 0;
+        if (plan.emissiveRegions.empty() || !volume::GpuEmission) return;
+        gpu::Allocating what("the glowing volumes' regions");
+        scene_.emissiveRegions = upload(plan.emissiveRegions.data(), plan.emissiveRegions.size() * sizeof(volume::Region));
+        const std::vector<float> pool = plan.emissionPool.empty() ? std::vector<float>{0.0f} : plan.emissionPool;
+        scene_.emissionPool = upload(pool.data(), pool.size() * sizeof(float));
+        scene_.emissiveRegionCount = U32(plan.emissiveRegions.size());
+    }
     void uploadGrids(const cpu::Plan& plan) {
         scene_.gridData.clear();
         scene_.volumeGrids = nullptr;
@@ -2582,6 +2688,8 @@ private:
         B volumeGrids;               // the volumes' grids as the device reads them, and the dense grids' data
         std::vector<B> gridData;
         U32 volumeGridCount = 0;
+        B emissiveRegions, emissionPool;  // the glowing volumes' regions (uploadRegions)
+        U32 emissiveRegionCount = 0;
         B provSums, provCounts, hostProvSums, hostProvCounts;
         B geometry, materials, lights, meshLights, lightSetBits, lightTree, lightTreeRoots, lightMotion, lightMoved, volumes, meshVolumes, walkSequences, meshMaterials, meshAttributes, meshMotion, materialPool, scratch, config, maps, textures, sums, odd, counts,
             hostSums,
@@ -3033,6 +3141,9 @@ private:
         p.meshVolumes = scene_.meshVolumes ? reinterpret_cast<const int*>(scene_.meshVolumes->pointer) : nullptr;
         p.volumeGrids = scene_.volumeGrids ? reinterpret_cast<const volume::Grid*>(scene_.volumeGrids->pointer) : nullptr;
         p.volumeGridCount = scene_.volumeGrids ? scene_.volumeGridCount : 0u;
+        p.emissiveRegions = scene_.emissiveRegions ? reinterpret_cast<const volume::Region*>(scene_.emissiveRegions->pointer) : nullptr;
+        p.emissionPool = scene_.emissionPool ? reinterpret_cast<const float*>(scene_.emissionPool->pointer) : nullptr;
+        p.emissiveRegionCount = scene_.emissiveRegions ? scene_.emissiveRegionCount : 0u;
         p.walkSequences = scene_.walkSequences ? reinterpret_cast<const float*>(scene_.walkSequences->pointer) : nullptr;
         p.meshMaterials = scene_.meshMaterials ? reinterpret_cast<const shade::MaterialRecord*>(scene_.meshMaterials->pointer) : nullptr;
         p.meshAttributes = scene_.meshAttributes ? reinterpret_cast<const shade::MeshAttributes*>(scene_.meshAttributes->pointer) : nullptr;
@@ -3183,6 +3294,7 @@ private:
         stream_ = nullptr;
         if (chain_.module) driver.cuModuleUnload_p(chain_.module);
         chain_ = {};
+        mapped_.destroy();
         for (auto& p : programs_) p.destroy();
         if (optix_) optixDeviceContextDestroy(optix_);
         optix_ = nullptr;
@@ -3191,6 +3303,8 @@ private:
     GpuOptions options_;
     OptixDeviceContext optix_ = nullptr;
     Program programs_[2];  // uniform, adaptive
+    Program mapped_;       // programs_[0] with the mapped volume module (made by begin where a scene needs it)
+    bool volumeMaps_ = false;  // the scene has volumes whose maps the card runs
     Program* program_ = &programs_[0];
     bool single_ = false;  // one program for every frame
     Chain chain_;

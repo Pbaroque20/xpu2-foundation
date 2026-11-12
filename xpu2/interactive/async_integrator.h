@@ -148,6 +148,7 @@ X2_HD inline bool roulette(float lum, float threshold, float u, float& scale) {
 struct Stream {
     sample::Identity id;
     U32 dimension, group = ~0u, w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+    Stream() = default;  // a checkpoint's (MarchCheckpoint), set before it is read
     X2_HD Stream(const sample::Identity& i, U32 bounce, U32 offset)
         : id(i), dimension(sample::CameraDimensions + bounce * sample::DimensionsPerBounce + offset) {}
     X2_HD void skip(U32 n) { dimension += n; }
@@ -613,6 +614,35 @@ struct VolumeLpe {
 // to emit(step, index), which stops it by returning false. The CPU lane keeps the steps in a table; the CUDA lane keeps
 // none (a VDB cloud's hundreds or thousands do not fit a thread) and finds a step it needs by marching again, the
 // marching stream started the same, so the very same steps (ReplaySteps, GPU_VDB).
+// A march's whole state at the top of a heterogeneous step (VolumeMarch::stepping): from it the march goes on as it would
+// have. partial: the steps' weights summed before this one (the first march's running sum, the cdf's partial).
+struct MarchCheckpoint {
+    paths::Stream marching;
+    V3 vt, vth, vta, vtm;
+    float t, stepStart, stepSize, partial;
+    U32 interval, regions, count, visited;
+};
+// The first march's checkpoints: every stride steps, the stride doubled (every other kept) when they are all taken.
+struct MarchRecord {
+    enum : U32 { Slots = 8 };  // (an enum: a constant no module keeps as a global)
+    MarchCheckpoint at[Slots];
+    U32 used = 0, stride = 8, last = 0;
+    // Whether the march's step count is one to keep (asked before a checkpoint is made: most steps are not).
+    X2_HD bool wants(U32 count) const {
+        if (count == 0 || count == last || count % stride) return false;
+        return used < Slots || count % (2 * stride) == 0;
+    }
+    // Its slot: with all taken, every other let go and the stride doubled first.
+    X2_HD MarchCheckpoint& slot(U32 count) {
+        if (used == Slots) {
+            for (U32 i = 0; i < Slots / 2; ++i) at[i] = at[2 * i + 1];
+            used = Slots / 2;
+            stride *= 2;
+        }
+        last = count;
+        return at[used++];
+    }
+};
 template <class Backend>
 struct VolumeMarch {
     const mixed::Config& c;
@@ -633,14 +663,25 @@ struct VolumeMarch {
     U32 visited, count;
     bool reachedThreshold, stopped;
 
+    // Where the first march leaves its checkpoints (the card's lookups, ReplaySteps), and the weights' running sum it
+    // keeps (the first march's own, read at each checkpoint); none: no checkpoints.
+    MarchRecord* record = nullptr;
+    const float* weightsSoFar = nullptr;
+
+    // The march; from a checkpoint (from), the rest of it from there: the same steps, bit for bit, as the whole.
     template <class Emit>
-    X2_HD void run(Emit& emit) {
-        paths::Stream marching = start;
-        U32 regions = regionsAtStart;
-        vt = vth = vta = V3{1, 1, 1};
-        vtm = V3{0, 0, 0};
+    X2_HD void run(Emit& emit, const MarchCheckpoint* from = nullptr) {
+        paths::Stream marching = from ? from->marching : start;
+        U32 regions = from ? from->regions : regionsAtStart;
+        if (from) {
+            vt = from->vt, vth = from->vth, vta = from->vta, vtm = from->vtm;
+            visited = from->visited, count = from->count;
+        } else {
+            vt = vth = vta = V3{1, 1, 1};
+            vtm = V3{0, 0, 0};
+            visited = count = 0;
+        }
         for (U32 v = 0; v < volume::MaxVolumes; ++v) emitted[v] = V3{0, 0, 0};
-        visited = count = 0;
         reachedThreshold = stopped = false;
         auto update = [&](V3 tr, V3 trh) {
             vt = volume::times(vt, tr);
@@ -653,7 +694,49 @@ struct VolumeMarch {
             if (!emit(s, count)) stopped = true;
             ++count;
         };
-        auto march = [&](float t0, float t1) {
+        // A heterogeneous stretch's steps, from t (the next step's end) and stepStart (its start) on.
+        auto stepping = [&](float t1, float t, float stepStart, float stepSize, U32 interval) {
+            auto step = [&](float at) {
+                const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? marching.next() : 0.0f;
+                V3 emissions[volume::MaxVolumes];
+                U32 chosen = volume::MaxVolumes;
+                const volume::Coefficients k = volume::evalShadersAt(shaders, grids, regions, c.volumeOverlapMode, rnd, surface::add(org, surface::mul(dir, at)),
+                                                                     -1.0f, volume::NoGrid, sampleEmission ? emissions : nullptr, &chosen, cutouts);
+                const float delta = at - stepStart;
+                take(volume::Step{k.sigmaT, k.sigmaS, vt, k.g, stepStart, delta, k.lightSet, k.sigmaTh, k.sigmaSh, vth, chosen, k.surfaceThreshold});
+                const V3 te = volume::times(vt, vth);
+                if (sampleEmission) {
+                    if (c.volumeOverlapMode == volume::OverlapSum) {
+                        for (U32 v = 0; v < volume::MaxVolumes; ++v)
+                            if (regions >> v & 1) emitted[v] = volume::plus(emitted[v], volume::scaled(volume::times(te, emissions[v]), delta));
+                    } else if (chosen < volume::MaxVolumes) {
+                        emitted[chosen] = volume::plus(emitted[chosen], volume::scaled(volume::times(te, emissions[0]), delta));
+                    }
+                }
+                update(volume::expNeg(k.sigmaT, delta), volume::expNeg(k.sigmaTh, delta));
+            };
+            while (t < t1) {
+                // A checkpoint: the march's whole state as this step begins (the first march's only).
+                if (record && weightsSoFar && record->wants(count))
+                    record->slot(count) = MarchCheckpoint{marching, vt, vth, vta, vtm, t, stepStart, stepSize, *weightsSoFar, interval, regions,
+                                                          count, visited};
+                if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
+                    reachedThreshold = true;
+                    return;
+                }
+                step(t);
+                if (stopped) return;
+                stepStart = t;
+                t += stepSize;
+                if (count + 1 >= limit) return;
+            }
+            if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
+                reachedThreshold = true;
+                return;
+            }
+            if (t - t1 > volume::Epsilon) step(t1);
+        };
+        auto march = [&](float t0, float t1, U32 interval) {
             if (!regions || t1 >= volume::FarLimit || count + 1 >= limit || reachedThreshold || stopped) return;
             visited |= regions;
             float minFeatureSize;
@@ -686,53 +769,28 @@ struct VolumeMarch {
             // path), the first at a random place in the first step, each step's coefficients at its end.
             const float u = marching.next();
             const float stepSize = minFeatureSize * c.invVolumeQuality * fmaxf(float(int(depth) - 1), 1.0f);
-            float stepStart = t0, t = t0 + stepSize * u;
-            auto step = [&](float at) {
-                const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? marching.next() : 0.0f;
-                V3 emissions[volume::MaxVolumes];
-                U32 chosen = volume::MaxVolumes;
-                const volume::Coefficients k = volume::evalShadersAt(shaders, grids, regions, c.volumeOverlapMode, rnd, surface::add(org, surface::mul(dir, at)),
-                                                                     -1.0f, volume::NoGrid, sampleEmission ? emissions : nullptr, &chosen, cutouts);
-                const float delta = at - stepStart;
-                take(volume::Step{k.sigmaT, k.sigmaS, vt, k.g, stepStart, delta, k.lightSet, k.sigmaTh, k.sigmaSh, vth, chosen, k.surfaceThreshold});
-                const V3 te = volume::times(vt, vth);
-                if (sampleEmission) {
-                    if (c.volumeOverlapMode == volume::OverlapSum) {
-                        for (U32 v = 0; v < volume::MaxVolumes; ++v)
-                            if (regions >> v & 1) emitted[v] = volume::plus(emitted[v], volume::scaled(volume::times(te, emissions[v]), delta));
-                    } else if (chosen < volume::MaxVolumes) {
-                        emitted[chosen] = volume::plus(emitted[chosen], volume::scaled(volume::times(te, emissions[0]), delta));
-                    }
-                }
-                update(volume::expNeg(k.sigmaT, delta), volume::expNeg(k.sigmaTh, delta));
-            };
-            while (t < t1) {
-                if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
-                    reachedThreshold = true;
-                    return;
-                }
-                step(t);
-                if (stopped) return;
-                stepStart = t;
-                t += stepSize;
-                if (count + 1 >= limit) return;
-            }
-            if (volume::lum(vta) < c.volumeTransmittanceThreshold) {
-                reachedThreshold = true;
-                return;
-            }
-            if (t - t1 > volume::Epsilon) step(t1);
+            stepping(t1, t0 + stepSize * u, t0, stepSize, interval);
         };
         float tStart = tnear;
-        for (U32 i = 0; i < n; ++i) {
+        U32 first = 0;
+        if (from) {
+            // The checkpoint's stretch from its step on, then the crossings after it as the whole march takes them.
+            const U32 k = from->interval;
+            stepping(k < n ? x[k].t : tfar, from->t, from->stepStart, from->stepSize, k);
+            if (k >= n) return;
+            tStart = x[k].t;
+            volume::apply(regions, x[k]);
+            first = k + 1;
+        }
+        for (U32 i = first; i < n; ++i) {
             if (x[i].t > tfar || reachedThreshold || stopped) break;
             if (x[i].t - tStart > volume::Epsilon) {
-                march(tStart, x[i].t);
+                march(tStart, x[i].t, i);
                 tStart = x[i].t;
             }
             volume::apply(regions, x[i]);
         }
-        if (tfar - tStart > volume::Epsilon && !reachedThreshold && !stopped) march(tStart, tfar);
+        if (tfar - tStart > volume::Epsilon && !reachedThreshold && !stopped) march(tStart, tfar, n);
     }
 };
 // A step's weight for distance sampling: its scattering, through what lies before it.
@@ -756,12 +814,17 @@ struct TableSteps {
         return steps[k];
     }
 };
+// pick and at replay the march (each some 9,000 lines on the card): X2_CALL, one copy each, not one inside every part of
+// volumeRadiance (inlined there, they took the volume module's compile past 40 GB, 2026-11-07).
 template <class March>
 struct ReplaySteps {
     March& m;
     U32 count;
     float total;  // the weights' sum; one where none weighs
     bool weightless;
+    const MarchRecord* record = nullptr;  // the first march's checkpoints (none: march from the start)
+    // The cdf as a checkpoint's step begins: the cdf of the step before it, as cdf gave it there.
+    X2_HD float cdfBefore(const MarchCheckpoint& c) const { return weightless ? float(c.count) / float(count) : c.partial; }
     X2_HD float cdf(float& partial, const volume::Step& s, U32 index) const {
         if (index + 1 >= count) return total;
         if (weightless) return float(index + 1) / float(count);
@@ -769,9 +832,17 @@ struct ReplaySteps {
         if (partial > total) partial = total;
         return partial;
     }
-    X2_HD volume::Step pick(float r, float& pdf, float& remapped) const {
+    X2_CALL volume::Step pick(float r, float& pdf, float& remapped) const {
         const float rw = r * total;
-        float partial = 0.0f, prev = 0.0f, found = total, before = 0.0f;
+        // The last checkpoint whose cdf so far is still short of rw: no step before it is the one.
+        const MarchCheckpoint* from = nullptr;
+        if (record)
+            for (U32 j = record->used; j-- > 0;)
+                if (record->at[j].count < count && cdfBefore(record->at[j]) < rw) {
+                    from = &record->at[j];
+                    break;
+                }
+        float partial = from ? from->partial : 0.0f, prev = from ? cdfBefore(*from) : 0.0f, found = total, before = 0.0f;
         volume::Step chosen{};
         auto emit = [&](const volume::Step& s, U32 i) {
             const float here = cdf(partial, s, i);
@@ -783,14 +854,22 @@ struct ReplaySteps {
             prev = here;
             return true;
         };
-        m.run(emit);
+        m.run(emit, from);
         const float value = found - before;
         pdf = value / total;
         remapped = (rw - before) / value;
         return chosen;
     }
-    X2_HD volume::Step at(float t, float& pdf) const {
-        float partial = 0.0f, here = 0.0f, kept = 0.0f, keptPrev = 0.0f;
+    X2_CALL volume::Step at(float t, float& pdf) const {
+        // The last checkpoint whose step starts at or before t: every step before it starts before t too.
+        const MarchCheckpoint* from = nullptr;
+        if (record)
+            for (U32 j = record->used; j-- > 0;)
+                if (record->at[j].count < count && record->at[j].stepStart <= t) {
+                    from = &record->at[j];
+                    break;
+                }
+        float partial = from ? from->partial : 0.0f, here = from ? cdfBefore(*from) : 0.0f, kept = 0.0f, keptPrev = 0.0f;
         volume::Step chosen{};
         auto emit = [&](const volume::Step& s, U32 i) {
             if (i > 0 && s.tStart > t) return false;
@@ -799,11 +878,273 @@ struct ReplaySteps {
             chosen = s, kept = here, keptPrev = i > 0 ? before : 0.0f;
             return i + 1 < count;
         };
-        m.run(emit);
+        m.run(emit, from);
         pdf = (kept - keptPrev) / total;
         return chosen;
     }
 };
+// volumeRadiance's parts, each a function of its own (X2_CALL: on the card OptiX compiles each apart, so the program's
+// largest function is a third the size it was; asked 2026-11-07, the compile took a 64 GB machine past 30 GB). Each
+// adds into radiance as volumeRadiance did, in the same order. Lookup: the steps (the CPU's TableSteps, the GPU's
+// ReplaySteps).
+// What the parts share, by reference (one pointer a call on the card). pv is volumeRadiance's own: its volume depth as it
+// stands when each part runs.
+template <class Lookup>
+struct VolumeSpan {
+    const mixed::Config& c;
+    const sample::Identity& root;
+    const paths::Pending& pv;
+    U64 volumeBranch;
+    const Lookup& lookup;
+    V3 org, dir, T;
+    float firstStart, rayEnd;
+    const volume::Shader* shaders;
+    const volume::Grids* grids;
+    U32 rayMask;
+    int volumeState;
+    const VolumeLpe* lpe;
+};
+X2_HD inline void volumeLpeAdd(const VolumeLpe* lpe, V3 contribution, int state) {
+    if (lpe) aov::light(*lpe->t, lpe->aovs, lpe->depths, contribution, nullptr, 0, state);
+}
+// integrateVolumeScatteringDirect: each light's single scattering at the steps.
+template <class Backend, class Lookup>
+X2_CALL void volumeScatterDirect(Backend& backend, const VolumeSpan<Lookup>& s, V3& radiance) {
+    using namespace paths;
+    const mixed::Config& c = s.c;
+    const sample::Identity& root = s.root;
+    const paths::Pending& pv = s.pv;
+    const U64 volumeBranch = s.volumeBranch;
+    const Lookup& lookup = s.lookup;
+    const V3 org = s.org, dir = s.dir, T = s.T;
+    const int volumeState = s.volumeState;
+    const VolumeLpe* lpe = s.lpe;
+    const float firstStart = s.firstStart, rayEnd = s.rayEnd;
+    const bool highQuality = pv.nonMirrorDepth == 0;
+    const U32 samplesPerLight = highQuality ? c.lightSamples : 1, scatterCount = highQuality ? c.volumeIlluminationSamples : 1;
+    if (scatterCount > 0) {
+        const float invN = 1.0f / float(samplesPerLight * scatterCount);
+        for (U32 li = 0; li < c.lightCount; ++li) {
+            const lights::Light& L = backend.light(li);
+            const bool equiAngular = volume::bounded(L);
+            V3 direct{0, 0, 0};  // LDirect: the light's single scattering, one LPE sum
+            for (U32 ls = 0; ls < samplesPerLight; ++ls) {
+                for (U32 ts = 0; ts < scatterCount; ++ts) {
+                    sample::Identity sid = root;
+                    sid.branch = childBranch(volumeBranch, 1 + li, ls * scatterCount + ts);
+                    Stream ss(sid, pv.depth, 0);
+                    float D = 0.0f, thetaA = 0.0f, thetaB = 0.0f, offset = 0.0f;
+                    if (equiAngular) {
+                        // equiAngularVolumeScattering: about a pivot on the light (its sample reused at the point)
+                        const float ue = ss.next();
+                        const float uel[3] = {ss.next(), ss.next(), ss.next()};
+                        const V3 pivot = volume::pivot(L, uel);
+                        offset = surface::dot(surface::add(pivot, surface::mul(org, -1.0f)), dir);
+                        const V3 foot = surface::add(org, surface::mul(dir, offset));
+                        D = shade::length(surface::add(pivot, surface::mul(foot, -1.0f)));
+                        thetaA = atan2f(firstStart - offset, D);
+                        thetaB = atan2f(rayEnd - offset, D);
+                        const float te = volume::sampleEquiAngular(ue, D, thetaA, thetaB);
+                        const float pdfTe = volume::pdfEquiAngular(te, D, thetaA, thetaB);
+                        if (pdfTe != 0.0f && volume::finitef(pdfTe)) {
+                            const float tePrime = te + offset;
+                            float pdfK;  // findInterval: the last step starting at or before tePrime, and its pdfDiscrete
+                            const volume::Step vp = lookup.at(tePrime, pdfK);
+                            if (!volume::black(vp.sigmaS) && backend.inSet(vp.lightSet, li)) {
+                                const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH),
+                                                                   volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), tePrime - vp.tStart));
+                                float mis = 1.0f;
+                                const float pdfTd = pdfK *
+                                                    volume::pdfDistanceExponential(tePrime, volume::lum(vp.sigmaT), vp.tStart,
+                                                                                   vp.tStart + vp.delta);
+                                if (volume::finitef(pdfTd)) mis = lights::powerHeuristic(pdfTe, pdfTd);
+                                const V3 Ls =
+                                    volumeSourceTerm(c, backend, ss, L, surface::add(org, surface::mul(dir, tePrime)), dir, vp.g, uel, 1.0f);
+                                direct = volume::plus(direct, volume::scaled(volume::times(volume::times(T, vp.sigmaS), volume::times(trScatter, Ls)),
+                                                                             invN * mis / pdfTe));
+                            }
+                        }
+                    }
+                    // distanceVolumeScatteringDirect
+                    const float ud = ss.next();
+                    const float udl[3] = {ss.next(), ss.next(), ss.next()};
+                    float pdfDensity, udRemapped;
+                    const volume::Step vp = lookup.pick(ud, pdfDensity, udRemapped);
+                    if (pdfDensity == 0.0f) continue;
+                    if (volume::black(vp.sigmaS) || !backend.inSet(vp.lightSet, li)) continue;
+                    const float sigmaT = volume::lum(vp.sigmaT), t0 = vp.tStart, t1 = vp.tStart + vp.delta;
+                    const float td = volume::sampleDistanceExponential(udRemapped, sigmaT, t0, t1);
+                    const float pdfTd = pdfDensity * volume::pdfDistanceExponential(td, sigmaT, t0, t1);
+                    if (pdfTd == 0.0f || !volume::finitef(pdfTd)) continue;
+                    const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH), volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), td - t0));
+                    float mis = 1.0f;
+                    if (equiAngular) {
+                        const float pdfTe = volume::pdfEquiAngular(td - offset, D, thetaA, thetaB);
+                        if (volume::finitef(pdfTe)) mis = lights::powerHeuristic(pdfTd, pdfTe);
+                    }
+                    const V3 Ls = volumeSourceTerm(c, backend, ss, L, surface::add(org, surface::mul(dir, td)), dir, vp.g, udl, 1.0f);
+                    direct = volume::plus(direct, volume::scaled(volume::times(volume::times(T, vp.sigmaS), volume::times(trScatter, Ls)),
+                                                                 invN * mis / pdfTd));
+                }
+            }
+            radiance = volume::plus(radiance, direct);
+            if (lpe) volumeLpeAdd(lpe, direct, aov::lpeNext(*lpe->t, volumeState, aov::LpeLight, L.lpeLabel));
+        }
+    }
+}
+// Emissive volumes lighting the steps (computeRadianceEmissiveRegionsVolumes).
+template <class Backend, class Lookup>
+X2_CALL void volumeScatterRegions(Backend& backend, const VolumeSpan<Lookup>& s, V3& radiance) {
+    using namespace paths;
+    const mixed::Config& c = s.c;
+    const sample::Identity& root = s.root;
+    const paths::Pending& pv = s.pv;
+    const U64 volumeBranch = s.volumeBranch;
+    const Lookup& lookup = s.lookup;
+    const V3 org = s.org, dir = s.dir, T = s.T;
+    const int volumeState = s.volumeState;
+    const VolumeLpe* lpe = s.lpe;
+    const float firstStart = s.firstStart, rayEnd = s.rayEnd;
+    const volume::Shader* shaders = s.shaders;
+    {
+        const volume::Regions er = backend.emissiveRegions();
+        const bool hq = pv.nonMirrorDepth == 0;
+        const U32 nls = hq ? c.lightSamples : 1, nss = hq ? c.volumeIlluminationSamples : 1;
+        const float invN = 1.0f / float(nls * nss);
+        const float rayStart = firstStart, rayStop = rayEnd;
+        for (U32 ri = 0; ri < er.count && nss > 0; ++ri) {
+            const volume::Region& R = er.regions[ri];
+            if (!(R.visibility & 0x100u)) continue;
+            V3 regionLight{0, 0, 0};  // the region's in-scattering, one LPE sum
+            for (U32 k = 0; k < nls * nss; ++k) {
+                sample::Identity eid = root;
+                eid.branch = childBranch(volumeBranch, 0xfe00u + ri, k);
+                Stream es(eid, pv.depth, 0);
+                const float u1 = es.next(), u2 = es.next(), u3 = es.next();
+                const V3 pivot = volume::regionPoint(R, er.pool, u1, u2, u3);
+                const float ue = es.next();
+                const float offset = surface::dot(surface::add(pivot, surface::mul(org, -1.0f)), dir);
+                const V3 foot = surface::add(org, surface::mul(dir, offset));
+                const float D = shade::length(surface::add(pivot, surface::mul(foot, -1.0f)));
+                const float thetaA = atan2f(rayStart - offset, D), thetaB = atan2f(rayStop - offset, D);
+                const float te = volume::sampleEquiAngular(ue, D, thetaA, thetaB);
+                const float pdfTe = volume::pdfEquiAngular(te, D, thetaA, thetaB);
+                if (pdfTe == 0.0f || !volume::finitef(pdfTe)) continue;
+                const float tePrime = te + offset;
+                float pdfK;  // findInterval over the steps' starts and the march's end (its pdf unused)
+                const volume::Step vp = lookup.at(tePrime, pdfK);
+                if (volume::black(vp.sigmaS)) continue;
+                const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH),
+                                                   volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), tePrime - vp.tStart));
+                const V3 scatterPoint = surface::add(org, surface::mul(dir, tePrime));
+                V3 wi = surface::add(pivot, surface::mul(scatterPoint, -1.0f));
+                wi = surface::mul(wi, 1.0f / shade::length(wi));
+                float tEnd;
+                const float pdfWi = volume::regionPdf(R, er.pool, scatterPoint, wi, tEnd);
+                if (pdfWi == 0.0f || !volume::finitef(pdfWi)) continue;
+                const V3 Le = emissiveVolumeIntegral(c, backend, es, scatterPoint, wi, 0.0f, tEnd, R.volume, int(pv.depth) + 1);
+                const float ph = volume::phaseEval(vp.g, V3{-dir.x, -dir.y, -dir.z}, wi);
+                regionLight = volume::plus(regionLight, volume::scaled(volume::times(volume::times(T, vp.sigmaS), volume::times(trScatter, Le)),
+                                                                       invN * ph / (pdfTe * pdfWi)));
+            }
+            radiance = volume::plus(radiance, regionLight);
+            if (lpe) volumeLpeAdd(lpe, regionLight, aov::lpeNext(*lpe->t, volumeState, aov::LpeEmission, shaders[R.volume].lpeLabel));
+        }
+    }
+}
+// approximateVolumeMultipleScattering (pv's volume depth already one on).
+template <class Backend, class Lookup>
+X2_CALL void volumeMultipleScatter(Backend& backend, const VolumeSpan<Lookup>& s, V3& radiance) {
+    using namespace paths;
+    const mixed::Config& c = s.c;
+    const sample::Identity& root = s.root;
+    const paths::Pending& pv = s.pv;
+    const U64 volumeBranch = s.volumeBranch;
+    const Lookup& lookup = s.lookup;
+    const V3 org = s.org, dir = s.dir, T = s.T;
+    const int volumeState = s.volumeState;
+    const VolumeLpe* lpe = s.lpe;
+    const volume::Shader* shaders = s.shaders;
+    const volume::Grids& grids = *s.grids;
+    const U32 rayMask = s.rayMask;
+    // approximateVolumeMultipleScattering (Wrenninge 2015): scatter events along the ray, then free paths from
+    // them with the extinction, contribution and anisotropy shrinking each order.
+    if (pv.volumeDepth < c.maxVolumeDepth && c.volumeIlluminationSamples > 0) {
+        const U32 scatterSamples = c.volumeIlluminationSamples;
+        const float invN = 1.0f / float(scatterSamples);
+        for (U32 i = 0; i < scatterSamples; ++i) {
+            sample::Identity mid = root;
+            mid.branch = childBranch(volumeBranch, 0xffff, i);
+            Stream ms(mid, pv.depth, 0);
+            float pdfDensity, utRemapped;
+            const volume::Step vp = lookup.pick(ms.next(), pdfDensity, utRemapped);
+            float sigmaT = volume::lum(volume::plus(vp.sigmaT, vp.sigmaTh));
+            const float t0 = vp.tStart, t1 = vp.tStart + vp.delta;
+            const float td = volume::sampleDistanceExponential(utRemapped, sigmaT, t0, t1);
+            const float pdfT = pdfDensity * volume::pdfDistanceExponential(td, sigmaT, t0, t1);
+            if (pdfT == 0.0f || !volume::finitef(pdfT)) continue;
+            const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH), volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), td - t0));
+            V3 scatterPoint = surface::add(org, surface::mul(dir, td));
+            V3 throughput = volume::scaled(volume::times(volume::times(T, vp.sigmaS), trScatter), 1.0f / pdfT);
+            const float up0 = ms.next(), up1 = ms.next();
+            V3 scatterDir = volume::phaseSample(vp.g, V3{-dir.x, -dir.y, -dir.z}, up0, up1);
+            int scatterState = volumeState;  // a volume event at the first scatter, another at each order's
+            for (U32 depth = pv.volumeDepth; depth < c.maxVolumeDepth; ++depth) {
+                if (volume::lum(throughput) < c.volumeTransmittanceThreshold) break;
+                const float ai = powf(c.volumeAttenuationFactor, float(depth)), bi = powf(c.volumeContributionFactor, float(depth)),
+                            ci = powf(c.volumePhaseAttenuationFactor, float(depth));
+                const float tFreePath = -logf(1.0f - ms.next()) / sigmaT;
+                volume::Crossing y[volume::MaxCrossings];
+                U32 here;
+                const U32 m = volumeIntervals(backend, scatterPoint, scatterDir, volume::Epsilon, y, here, rayMask);
+                if (backend.deferred()) break;  // a volume the GPU does not render: the CPU lane renders the sample (its data is not here)
+                for (U32 j = 0; j < m && y[j].t <= tFreePath; ++j) volume::apply(here, y[j]);
+                const V3 rayDir = scatterDir;
+                scatterPoint = surface::add(scatterPoint, surface::mul(scatterDir, tFreePath));
+                if (!here) break;
+                const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? ms.next() : 0.0f;
+                const volume::Coefficients kk =
+                    volume::evalShadersAt(shaders, grids, here, c.volumeOverlapMode, rnd, scatterPoint, -1.0f, volume::NoGrid, nullptr, nullptr);
+                const float g = kk.g * ci;
+                sigmaT = volume::lum(kk.sigmaT);
+                if (volume::isZero(sigmaT)) break;
+                throughput = volume::scaled(volume::times(throughput, kk.sigmaS), 1.0f / sigmaT);
+                if (lpe) scatterState = aov::lpeVolume(*lpe->t, scatterState);
+                U32 firstVolume = 0;  // the light set of the first volume here
+                while (!(here >> firstVolume & 1)) ++firstVolume;
+                const U32 lightSet = shaders[firstVolume].lightSet;
+                for (U32 li = 0; li < c.lightCount; ++li) {
+                    const float usl[3] = {ms.next(), ms.next(), ms.next()};
+                    if (!backend.inSet(lightSet, li)) continue;
+                    const V3 Ls = volumeSourceTerm(c, backend, ms, backend.light(li), scatterPoint, rayDir, g, usl, ai);
+                    const V3 contribution = volume::scaled(volume::times(throughput, Ls), invN * bi);
+                    radiance = volume::plus(radiance, contribution);
+                    if (lpe) volumeLpeAdd(lpe, contribution, aov::lpeNext(*lpe->t, scatterState, aov::LpeLight, backend.light(li).lpeLabel));
+                }
+                // The emissive volumes lighting this scatter (a direction toward each region that lights volumes,
+                // through its emissive volume integral, by the phase function).
+                {
+                    const volume::Regions er = backend.emissiveRegions();
+                    for (U32 ri = 0; ri < er.count; ++ri) {
+                        const volume::Region& R = er.regions[ri];
+                        if (!(R.visibility & 0x100u)) continue;
+                        const float ue0 = ms.next(), ue1 = ms.next(), ue2 = ms.next();
+                        float pdfWi, tEnd;
+                        const V3 wi = volume::regionSample(R, er.pool, scatterPoint, ue0, ue1, ue2, pdfWi, tEnd);
+                        if (pdfWi == 0.0f || !volume::finitef(pdfWi)) continue;
+                        const V3 Le = emissiveVolumeIntegral(c, backend, ms, scatterPoint, wi, 0.0f, tEnd, R.volume, int(pv.depth) + 1);
+                        const float ph = volume::phaseEval(g, V3{-rayDir.x, -rayDir.y, -rayDir.z}, wi);
+                        const V3 contribution = volume::scaled(volume::times(throughput, Le), invN * bi * ph / pdfWi);
+                        radiance = volume::plus(radiance, contribution);
+                        if (lpe) volumeLpeAdd(lpe, contribution, aov::lpeNext(*lpe->t, scatterState, aov::LpeEmission, shaders[R.volume].lpeLabel));
+                    }
+                }
+                const float uq0 = ms.next(), uq1 = ms.next();
+                scatterDir = volume::phaseSample(g, V3{-rayDir.x, -rayDir.y, -rayDir.z}, uq0, uq1);
+            }
+        }
+    }
+}
 template <class Backend>
 X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, Backend& backend, paths::Pending& pv, V3 org, V3 dir,
                           float tnear, float tfar, V3* alphaTransmittance = nullptr, V3* minTransmittance = nullptr,
@@ -878,7 +1219,14 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
         }
         return true;
     };
+#if defined(__CUDACC__)
+    // The card's lookups march again for each light sample: from the first march's checkpoints, not from the start.
+    MarchRecord record;
+    march.record = &record;
+    march.weightsSoFar = &weights;
+#endif
     march.run(first);
+    march.record = nullptr;
     const U32 count = march.count;
     if (count == 0) return radiance;
     V3 vt = march.vt, vth = march.vth, vta = march.vta, vtm = march.vtm;
@@ -914,7 +1262,8 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
     const int volumeState = lpe ? aov::lpeVolume(*lpe->t, pv.lpe) : -1;
     if (pv.volumeDepth < c.maxVolumeDepth) {
 #if defined(__CUDACC__)
-        const ReplaySteps<VolumeMarch<Backend>> lookup{march, count, weights != 0.0f ? weights : 1.0f, weights == 0.0f};
+        const ReplaySteps<VolumeMarch<Backend>> lookup{march, count, weights != 0.0f ? weights : 1.0f, weights == 0.0f,
+                                                       volume::gpuMarchCheckpoints() ? &record : nullptr};
 #else
         // The steps' weights for distance sampling: their scattering, through what lies before them.
         float* density = space.density;
@@ -925,207 +1274,14 @@ X2_CALL V3 volumeRadiance(const mixed::Config& c, const sample::Identity& root, 
 #endif
         const float rayEnd = lastEnd;
         // integrateVolumeScatteringDirect
-        const bool highQuality = pv.nonMirrorDepth == 0;
-        const U32 samplesPerLight = highQuality ? c.lightSamples : 1, scatterCount = highQuality ? c.volumeIlluminationSamples : 1;
-        if (scatterCount > 0) {
-            const float invN = 1.0f / float(samplesPerLight * scatterCount);
-            for (U32 li = 0; li < c.lightCount; ++li) {
-                const lights::Light& L = backend.light(li);
-                const bool equiAngular = volume::bounded(L);
-                V3 direct{0, 0, 0};  // LDirect: the light's single scattering, one LPE sum
-                for (U32 ls = 0; ls < samplesPerLight; ++ls) {
-                    for (U32 ts = 0; ts < scatterCount; ++ts) {
-                        sample::Identity sid = root;
-                        sid.branch = childBranch(volumeBranch, 1 + li, ls * scatterCount + ts);
-                        Stream ss(sid, pv.depth, 0);
-                        float D = 0.0f, thetaA = 0.0f, thetaB = 0.0f, offset = 0.0f;
-                        if (equiAngular) {
-                            // equiAngularVolumeScattering: about a pivot on the light (its sample reused at the point)
-                            const float ue = ss.next();
-                            const float uel[3] = {ss.next(), ss.next(), ss.next()};
-                            const V3 pivot = volume::pivot(L, uel);
-                            offset = surface::dot(surface::add(pivot, surface::mul(org, -1.0f)), dir);
-                            const V3 foot = surface::add(org, surface::mul(dir, offset));
-                            D = shade::length(surface::add(pivot, surface::mul(foot, -1.0f)));
-                            thetaA = atan2f(firstStart - offset, D);
-                            thetaB = atan2f(rayEnd - offset, D);
-                            const float te = volume::sampleEquiAngular(ue, D, thetaA, thetaB);
-                            const float pdfTe = volume::pdfEquiAngular(te, D, thetaA, thetaB);
-                            if (pdfTe != 0.0f && volume::finitef(pdfTe)) {
-                                const float tePrime = te + offset;
-                                float pdfK;  // findInterval: the last step starting at or before tePrime, and its pdfDiscrete
-                                const volume::Step vp = lookup.at(tePrime, pdfK);
-                                if (!volume::black(vp.sigmaS) && backend.inSet(vp.lightSet, li)) {
-                                    const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH),
-                                                                       volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), tePrime - vp.tStart));
-                                    float mis = 1.0f;
-                                    const float pdfTd = pdfK *
-                                                        volume::pdfDistanceExponential(tePrime, volume::lum(vp.sigmaT), vp.tStart,
-                                                                                       vp.tStart + vp.delta);
-                                    if (volume::finitef(pdfTd)) mis = lights::powerHeuristic(pdfTe, pdfTd);
-                                    const V3 Ls =
-                                        volumeSourceTerm(c, backend, ss, L, surface::add(org, surface::mul(dir, tePrime)), dir, vp.g, uel, 1.0f);
-                                    direct = volume::plus(direct, volume::scaled(volume::times(volume::times(T, vp.sigmaS), volume::times(trScatter, Ls)),
-                                                                                 invN * mis / pdfTe));
-                                }
-                            }
-                        }
-                        // distanceVolumeScatteringDirect
-                        const float ud = ss.next();
-                        const float udl[3] = {ss.next(), ss.next(), ss.next()};
-                        float pdfDensity, udRemapped;
-                        const volume::Step vp = lookup.pick(ud, pdfDensity, udRemapped);
-                        if (pdfDensity == 0.0f) continue;
-                        if (volume::black(vp.sigmaS) || !backend.inSet(vp.lightSet, li)) continue;
-                        const float sigmaT = volume::lum(vp.sigmaT), t0 = vp.tStart, t1 = vp.tStart + vp.delta;
-                        const float td = volume::sampleDistanceExponential(udRemapped, sigmaT, t0, t1);
-                        const float pdfTd = pdfDensity * volume::pdfDistanceExponential(td, sigmaT, t0, t1);
-                        if (pdfTd == 0.0f || !volume::finitef(pdfTd)) continue;
-                        const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH), volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), td - t0));
-                        float mis = 1.0f;
-                        if (equiAngular) {
-                            const float pdfTe = volume::pdfEquiAngular(td - offset, D, thetaA, thetaB);
-                            if (volume::finitef(pdfTe)) mis = lights::powerHeuristic(pdfTd, pdfTe);
-                        }
-                        const V3 Ls = volumeSourceTerm(c, backend, ss, L, surface::add(org, surface::mul(dir, td)), dir, vp.g, udl, 1.0f);
-                        direct = volume::plus(direct, volume::scaled(volume::times(volume::times(T, vp.sigmaS), volume::times(trScatter, Ls)),
-                                                                     invN * mis / pdfTd));
-                    }
-                }
-                radiance = volume::plus(radiance, direct);
-                if (lpe) lpeAdd(direct, aov::lpeNext(*lpe->t, volumeState, aov::LpeLight, L.lpeLabel));
-            }
-        }
-#if !defined(__CUDACC__)
-        // Emissive volumes lighting the steps (computeRadianceEmissiveRegionsVolumes): equi-angular samples about a
-        // place in each region its geometry lets light volumes, each through its emissive volume integral.
-        {
-            const volume::Regions er = backend.emissiveRegions();
-            const bool hq = pv.nonMirrorDepth == 0;
-            const U32 nls = hq ? c.lightSamples : 1, nss = hq ? c.volumeIlluminationSamples : 1;
-            const float invN = 1.0f / float(nls * nss);
-            const float rayStart = steps[0].tStart, rayStop = steps[count - 1].tStart + steps[count - 1].delta;
-            for (U32 ri = 0; ri < er.count && nss > 0; ++ri) {
-                const volume::Region& R = er.regions[ri];
-                if (!(R.visibility & 0x100u)) continue;
-                V3 regionLight{0, 0, 0};  // the region's in-scattering, one LPE sum
-                for (U32 k = 0; k < nls * nss; ++k) {
-                    sample::Identity eid = root;
-                    eid.branch = childBranch(volumeBranch, 0xfe00u + ri, k);
-                    Stream es(eid, pv.depth, 0);
-                    const float u1 = es.next(), u2 = es.next(), u3 = es.next();
-                    const V3 pivot = volume::regionPoint(R, er.pool, u1, u2, u3);
-                    const float ue = es.next();
-                    const float offset = surface::dot(surface::add(pivot, surface::mul(org, -1.0f)), dir);
-                    const V3 foot = surface::add(org, surface::mul(dir, offset));
-                    const float D = shade::length(surface::add(pivot, surface::mul(foot, -1.0f)));
-                    const float thetaA = atan2f(rayStart - offset, D), thetaB = atan2f(rayStop - offset, D);
-                    const float te = volume::sampleEquiAngular(ue, D, thetaA, thetaB);
-                    const float pdfTe = volume::pdfEquiAngular(te, D, thetaA, thetaB);
-                    if (pdfTe == 0.0f || !volume::finitef(pdfTe)) continue;
-                    const float tePrime = te + offset;
-                    U32 kk = 0;  // findInterval over the steps' starts and the march's end
-                    while (kk + 1 < count && steps[kk + 1].tStart <= tePrime) ++kk;
-                    const volume::Step& vp = steps[kk];
-                    if (volume::black(vp.sigmaS)) continue;
-                    const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH),
-                                                       volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), tePrime - vp.tStart));
-                    const V3 scatterPoint = surface::add(org, surface::mul(dir, tePrime));
-                    V3 wi = surface::add(pivot, surface::mul(scatterPoint, -1.0f));
-                    wi = surface::mul(wi, 1.0f / shade::length(wi));
-                    float tEnd;
-                    const float pdfWi = volume::regionPdf(R, er.pool, scatterPoint, wi, tEnd);
-                    if (pdfWi == 0.0f || !volume::finitef(pdfWi)) continue;
-                    const V3 Le = emissiveVolumeIntegral(c, backend, es, scatterPoint, wi, 0.0f, tEnd, R.volume, int(pv.depth) + 1);
-                    const float ph = volume::phaseEval(vp.g, V3{-dir.x, -dir.y, -dir.z}, wi);
-                    regionLight = volume::plus(regionLight, volume::scaled(volume::times(volume::times(T, vp.sigmaS), volume::times(trScatter, Le)),
-                                                                           invN * ph / (pdfTe * pdfWi)));
-                }
-                radiance = volume::plus(radiance, regionLight);
-                if (lpe) lpeAdd(regionLight, aov::lpeNext(*lpe->t, volumeState, aov::LpeEmission, shaders[R.volume].lpeLabel));
-            }
-        }
-#endif
+        // integrateVolumeScatteringDirect, the emissive regions lighting the steps, then (a depth on) the multiple
+        // scattering: each a function of its own (volumeScatterDirect, volumeScatterRegions, volumeMultipleScatter).
+        const VolumeSpan<decltype(lookup)> span{c, root, pv, volumeBranch, lookup, org, dir, T, firstStart, rayEnd, shaders, &grids, rayMask,
+                                                volumeState, lpe};
+        volumeScatterDirect(backend, span, radiance);
+        volumeScatterRegions(backend, span, radiance);
         ++pv.volumeDepth;
-        // approximateVolumeMultipleScattering (Wrenninge 2015): scatter events along the ray, then free paths from
-        // them with the extinction, contribution and anisotropy shrinking each order.
-        if (pv.volumeDepth < c.maxVolumeDepth && c.volumeIlluminationSamples > 0) {
-            const U32 scatterSamples = c.volumeIlluminationSamples;
-            const float invN = 1.0f / float(scatterSamples);
-            for (U32 i = 0; i < scatterSamples; ++i) {
-                sample::Identity mid = root;
-                mid.branch = childBranch(volumeBranch, 0xffff, i);
-                Stream ms(mid, pv.depth, 0);
-                float pdfDensity, utRemapped;
-                const volume::Step vp = lookup.pick(ms.next(), pdfDensity, utRemapped);
-                float sigmaT = volume::lum(volume::plus(vp.sigmaT, vp.sigmaTh));
-                const float t0 = vp.tStart, t1 = vp.tStart + vp.delta;
-                const float td = volume::sampleDistanceExponential(utRemapped, sigmaT, t0, t1);
-                const float pdfT = pdfDensity * volume::pdfDistanceExponential(td, sigmaT, t0, t1);
-                if (pdfT == 0.0f || !volume::finitef(pdfT)) continue;
-                const V3 trScatter = volume::times(volume::times(vp.tr, vp.trH), volume::expNeg(volume::plus(vp.sigmaT, vp.sigmaTh), td - t0));
-                V3 scatterPoint = surface::add(org, surface::mul(dir, td));
-                V3 throughput = volume::scaled(volume::times(volume::times(T, vp.sigmaS), trScatter), 1.0f / pdfT);
-                const float up0 = ms.next(), up1 = ms.next();
-                V3 scatterDir = volume::phaseSample(vp.g, V3{-dir.x, -dir.y, -dir.z}, up0, up1);
-                int scatterState = volumeState;  // a volume event at the first scatter, another at each order's
-                for (U32 depth = pv.volumeDepth; depth < c.maxVolumeDepth; ++depth) {
-                    if (volume::lum(throughput) < c.volumeTransmittanceThreshold) break;
-                    const float ai = powf(c.volumeAttenuationFactor, float(depth)), bi = powf(c.volumeContributionFactor, float(depth)),
-                                ci = powf(c.volumePhaseAttenuationFactor, float(depth));
-                    const float tFreePath = -logf(1.0f - ms.next()) / sigmaT;
-                    volume::Crossing y[volume::MaxCrossings];
-                    U32 here;
-                    const U32 m = volumeIntervals(backend, scatterPoint, scatterDir, volume::Epsilon, y, here, rayMask);
-                    if (backend.deferred()) break;  // a volume the GPU does not render: the CPU lane renders the sample (its data is not here)
-                    for (U32 j = 0; j < m && y[j].t <= tFreePath; ++j) volume::apply(here, y[j]);
-                    const V3 rayDir = scatterDir;
-                    scatterPoint = surface::add(scatterPoint, surface::mul(scatterDir, tFreePath));
-                    if (!here) break;
-                    const float rnd = c.volumeOverlapMode == volume::OverlapRnd ? ms.next() : 0.0f;
-                    const volume::Coefficients kk =
-                        volume::evalShadersAt(shaders, grids, here, c.volumeOverlapMode, rnd, scatterPoint, -1.0f, volume::NoGrid, nullptr, nullptr);
-                    const float g = kk.g * ci;
-                    sigmaT = volume::lum(kk.sigmaT);
-                    if (volume::isZero(sigmaT)) break;
-                    throughput = volume::scaled(volume::times(throughput, kk.sigmaS), 1.0f / sigmaT);
-                    if (lpe) scatterState = aov::lpeVolume(*lpe->t, scatterState);
-                    U32 firstVolume = 0;  // the light set of the first volume here
-                    while (!(here >> firstVolume & 1)) ++firstVolume;
-                    const U32 lightSet = shaders[firstVolume].lightSet;
-                    for (U32 li = 0; li < c.lightCount; ++li) {
-                        const float usl[3] = {ms.next(), ms.next(), ms.next()};
-                        if (!backend.inSet(lightSet, li)) continue;
-                        const V3 Ls = volumeSourceTerm(c, backend, ms, backend.light(li), scatterPoint, rayDir, g, usl, ai);
-                        const V3 contribution = volume::scaled(volume::times(throughput, Ls), invN * bi);
-                        radiance = volume::plus(radiance, contribution);
-                        if (lpe) lpeAdd(contribution, aov::lpeNext(*lpe->t, scatterState, aov::LpeLight, backend.light(li).lpeLabel));
-                    }
-#if !defined(__CUDACC__)
-                    // The emissive volumes lighting this scatter (a direction toward each region that lights volumes,
-                    // through its emissive volume integral, by the phase function).
-                    {
-                        const volume::Regions er = backend.emissiveRegions();
-                        for (U32 ri = 0; ri < er.count; ++ri) {
-                            const volume::Region& R = er.regions[ri];
-                            if (!(R.visibility & 0x100u)) continue;
-                            const float ue0 = ms.next(), ue1 = ms.next(), ue2 = ms.next();
-                            float pdfWi, tEnd;
-                            const V3 wi = volume::regionSample(R, er.pool, scatterPoint, ue0, ue1, ue2, pdfWi, tEnd);
-                            if (pdfWi == 0.0f || !volume::finitef(pdfWi)) continue;
-                            const V3 Le = emissiveVolumeIntegral(c, backend, ms, scatterPoint, wi, 0.0f, tEnd, R.volume, int(pv.depth) + 1);
-                            const float ph = volume::phaseEval(g, V3{-rayDir.x, -rayDir.y, -rayDir.z}, wi);
-                            const V3 contribution = volume::scaled(volume::times(throughput, Le), invN * bi * ph / pdfWi);
-                            radiance = volume::plus(radiance, contribution);
-                            if (lpe) lpeAdd(contribution, aov::lpeNext(*lpe->t, scatterState, aov::LpeEmission, shaders[R.volume].lpeLabel));
-                        }
-                    }
-#endif
-                    const float uq0 = ms.next(), uq1 = ms.next();
-                    scatterDir = volume::phaseSample(g, V3{-rayDir.x, -rayDir.y, -rayDir.z}, uq0, uq1);
-                }
-            }
-        }
+        volumeMultipleScatter(backend, span, radiance);
     }
     pv.T = volume::times(pv.T, volume::times(vt, vth));
     return radiance;
@@ -1793,6 +1949,11 @@ X2_HD inline V3 subsurfaceRadianceCall(const mixed::Config& c, const sample::Ide
     return subsurfaceRadiance(c, root, backend, lightSet, pv, subsurfaceDepth, st, hit, rayDir, bsdf, doIndirect, stack, top, status, lpe, ssAov);
 }
 template <class Backend>
+X2_HD inline V3 emissiveVolumeIntegralCall(const mixed::Config& c, Backend& backend, paths::Stream& s, V3 org, V3 dir, float tnear, float tEnd,
+                                           U32 volume, int depth) {
+    return emissiveVolumeIntegral(c, backend, s, org, dir, tnear, tEnd, volume, depth);
+}
+template <class Backend>
 X2_HD inline V3 volumeTransmittanceCall(const mixed::Config& c, Backend& backend, paths::Stream& s, V3 org, V3 dir, float tnear, float tfar,
                                         float scale, int depth) {
     return volumeTransmittance(c, backend, s, org, dir, tnear, tfar, scale, depth);
@@ -2278,7 +2439,6 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
         // it; bounces skip the epsilon over the cosine to Ng.
         const float curveEpsilon = hit.epsilon;
 
-#if !defined(__CUDACC__)
         // Emissive volumes (computeRadianceEmissiveRegionsBundled): per region, the lobes its geometry is visible to as
         // a BsdfOneSampler (picked by albedo), light samples (a place in its emission distribution) and BSDF samples,
         // MIS-weighted, each through the region's emissive volume integral.
@@ -2333,7 +2493,7 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                 };
                 auto emitted = [&](const V3& wi, float tEnd, Stream& es) {
                     const V3 from = curveEpsilon > 0.0f ? st.P : (shade::dot(wi, st.Ng) >= 0.0f ? above : below);
-                    return emissiveVolumeIntegral(c, backend, es, from, wi, curveEpsilon > 0.0f ? curveEpsilon : 0.0f, tEnd, R.volume,
+                    return emissiveVolumeIntegralCall(c, backend, es, from, wi, curveEpsilon > 0.0f ? curveEpsilon : 0.0f, tEnd, R.volume,
                                                   int(pv.depth) + 1);
                 };
                 auto add = [&](V3 contribution) {
@@ -2409,7 +2569,6 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                 }
             }
         }();
-#endif
         // Light samples (drawLightSamples, integrateLightSetSample): each light of the hit's set; with adaptive light
         // sampling, the lights outside the set's tree and those the tree picks (chooseLightsToSample), a sample's pdf
         // times the probability its light was picked while the MIS weights keep the light's own (misPdf).

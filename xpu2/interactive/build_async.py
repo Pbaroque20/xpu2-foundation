@@ -45,13 +45,14 @@ def build_all(source, runtime, out):
         (out / 'lights').mkdir()
         (out / 'lobes').mkdir()
         (out / 'volumes').mkdir()
+        (out / 'volumemaps').mkdir()
         (out / 'dwa').mkdir()
         (out / 'dwalobes').mkdir()
         (out / 'extras').mkdir()
         # The modules the path tracer's callables reach (the volume module calls the others as the path tracer does).
         calls = ['-DXPU2_MATERIAL_MODULE=1', '-DXPU2_LIGHT_MODULE=1', '-DXPU2_LOBE_MODULE=1', '-DXPU2_EXTRAS_MODULE=1']
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(9) as pool:
+        with ThreadPoolExecutor(10) as pool:
             main = pool.submit(compile_ptx, source, out, 'async_gpu.cu', HEADERS, FAST_FLAGS + calls + ['-DXPU2_VOLUME_MODULE=1'])
             # Relocatable: their callables are entry points no code in the module calls (NVRTC would drop them).
             material = pool.submit(compile_ptx, source, out / 'material', 'async_material.cu', HEADERS,
@@ -64,12 +65,16 @@ def build_all(source, runtime, out):
             lobes = pool.submit(compile_ptx, source, out / 'lobes', 'async_lobes.cu', HEADERS, FAST_FLAGS + ['--relocatable-device-code=true'])
             volumes = pool.submit(compile_ptx, source, out / 'volumes', 'async_volumes.cu', HEADERS,
                                   FAST_FLAGS + calls + ['--relocatable-device-code=true'])
+            # Again with the volumes' map program in the march, for the scenes that need it (async_gpu_device.h).
+            volumeMaps = pool.submit(compile_ptx, source, out / 'volumemaps', 'async_volumes.cu', HEADERS,
+                                     FAST_FLAGS + calls + ['--relocatable-device-code=true', '-DXPU2_VOLUME_MAPS_MODULE=1'])
             ptx, report['cuda_build'] = main.result()
             materialPtx, report['cuda_build_material'] = material.result()
             mapsPtx, report['cuda_build_maps'] = maps.result()
             lightsPtx, report['cuda_build_lights'] = lights.result()
             lobesPtx, report['cuda_build_lobes'] = lobes.result()
             volumesPtx, report['cuda_build_volumes'] = volumes.result()
+            volumeMapsPtx, report['cuda_build_volumemaps'] = volumeMaps.result()
             dwaPtx, report['cuda_build_dwa'] = dwa.result()
             dwaLobesPtx, report['cuda_build_dwalobes'] = dwaLobes.result()
             extrasPtx, report['cuda_build_extras'] = extras.result()
@@ -94,10 +99,10 @@ def build_all(source, runtime, out):
             shutil.copyfile(sampler / name, out / name)
         if any(sha(Path(k)) != v for k, v in held.items()):
             raise RuntimeError('Build source drift')
-        report.update(status='passed', exe=str(exe), ptx=str(ptx), ptx_material=str(materialPtx), ptx_maps=str(mapsPtx), ptx_lights=str(lightsPtx), ptx_lobes=str(lobesPtx), ptx_volumes=str(volumesPtx), ptx_dwa=str(dwaPtx), ptx_dwalobes=str(dwaLobesPtx), ptx_extras=str(extrasPtx),
+        report.update(status='passed', exe=str(exe), ptx=str(ptx), ptx_material=str(materialPtx), ptx_maps=str(mapsPtx), ptx_lights=str(lightsPtx), ptx_lobes=str(lobesPtx), ptx_volumes=str(volumesPtx), ptx_volumemaps=str(volumeMapsPtx), ptx_dwa=str(dwaPtx), ptx_dwalobes=str(dwaLobesPtx), ptx_extras=str(extrasPtx),
                       ptx_chain=str(chain),
                       binary_hashes={'exe': sha(exe), 'ptx': sha(ptx), 'ptx_material': sha(materialPtx), 'ptx_maps': sha(mapsPtx),
-                                     'ptx_lights': sha(lightsPtx), 'ptx_lobes': sha(lobesPtx), 'ptx_volumes': sha(volumesPtx), 'ptx_dwa': sha(dwaPtx), 'ptx_dwalobes': sha(dwaLobesPtx), 'ptx_extras': sha(extrasPtx), 'ptx_chain': sha(chain)})
+                                     'ptx_lights': sha(lightsPtx), 'ptx_lobes': sha(lobesPtx), 'ptx_volumes': sha(volumesPtx), 'ptx_volumemaps': sha(volumeMapsPtx), 'ptx_dwa': sha(dwaPtx), 'ptx_dwalobes': sha(dwaLobesPtx), 'ptx_extras': sha(extrasPtx), 'ptx_chain': sha(chain)})
     except Exception as error:
         report.update(status='failed', error=str(error))
     (out / 'build.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')

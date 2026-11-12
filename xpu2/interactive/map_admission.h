@@ -266,6 +266,8 @@ struct MapProgramBuilder {
 
     // An ImageMap with alpha_only reads its files' alpha (texture::File::alpha) while it is admitted.
     bool alphaLookup = false;
+    // Whether the program reads an image file (fileIndex): a mapped volume's are then the host's alone (mapsOnHost).
+    bool readsTextures = false;
     unsigned textureIndex(const rdl::SceneObject& o, const char* attribute = "texture") {
         const std::string path = get<rdl::String>(o, attribute);
         if (path.empty()) return shade::MapNoTexture;
@@ -311,6 +313,7 @@ struct MapProgramBuilder {
         return tiles;
     }
     unsigned fileIndex(const rdl::SceneObject& o, const std::string& path) {
+        readsTextures = true;
         need(!textures.assetRoot.empty() && textures.textures && textures.system, "Textured preparation requires frozen asset admission");
         texture::admittedPath(fs::path(path), textures.assetRoot);
         auto& table = *textures.textures;

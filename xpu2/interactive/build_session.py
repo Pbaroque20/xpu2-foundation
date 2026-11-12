@@ -111,12 +111,13 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
         (rt / 'lights').mkdir(parents=True)
         (rt / 'lobes').mkdir(parents=True)
         (rt / 'volumes').mkdir(parents=True)
+        (rt / 'volumemaps').mkdir(parents=True)
         (rt / 'dwa').mkdir(parents=True)
         (rt / 'dwalobes').mkdir(parents=True)
         (rt / 'extras').mkdir(parents=True)
         shutil.copyfile(exe, rt / 'moonray_xpu2.exe')
         shutil.copyfile(out / 'geom' / 'xpu2_geom.dll', rt / 'xpu2_geom.dll')
-        for name in ('async_gpu.ptx', 'material/async_material.ptx', 'maps/async_maps.ptx', 'lights/async_lights.ptx', 'lobes/async_lobes.ptx', 'volumes/async_volumes.ptx', 'dwa/async_dwa.ptx', 'dwalobes/async_dwalobes.ptx', 'extras/async_extras.ptx', 'adaptive/async_adaptive.ptx',
+        for name in ('async_gpu.ptx', 'material/async_material.ptx', 'maps/async_maps.ptx', 'lights/async_lights.ptx', 'lobes/async_lobes.ptx', 'volumes/async_volumes.ptx', 'volumemaps/async_volumes.ptx', 'dwa/async_dwa.ptx', 'dwalobes/async_dwalobes.ptx', 'extras/async_extras.ptx', 'adaptive/async_adaptive.ptx',
                      'bc_1D_integrator_points_4096_sequences_of_1024.bin',
                      'ppd_2D_integrator_points_4096_sequences_of_1024.bin'):
             shutil.copyfile(async_build / name, rt / name)
@@ -144,6 +145,7 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
         manifest = {'executable_sha256': sha(rt / 'moonray_xpu2.exe'),
                     'programs': {n: sha(rt / n) for n in ('async_gpu.ptx', 'material/async_material.ptx', 'maps/async_maps.ptx',
                                                           'lights/async_lights.ptx', 'lobes/async_lobes.ptx', 'volumes/async_volumes.ptx',
+                                                          'volumemaps/async_volumes.ptx',
                                                           'dwa/async_dwa.ptx', 'dwalobes/async_dwalobes.ptx', 'extras/async_extras.ptx',
                                                           'adaptive/async_adaptive.ptx')},
                     'libraries': [p.name for p in libraries], 'proxies': len(proxies)}

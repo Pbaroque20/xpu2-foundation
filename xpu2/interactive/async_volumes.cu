@@ -26,3 +26,11 @@ extern "C" __device__ void __continuation_callable__volumeTransmittance(const mi
                                                                         int depth, surface::V3* out) {
     *out = volumeTransmittance(*c, *backend, *s, org, dir, tnear, tfar, scale, depth);
 }
+
+// The emissive volume integral, for the path tracer's surfaces lit by glowing volumes: compiled here alone (the main
+// module calls this instead of holding its own copy).
+extern "C" __device__ void __continuation_callable__emissiveVolumeIntegral(const mixed::Config* c, GpuBackend* backend, paths::Stream* s,
+                                                                            surface::V3 org, surface::V3 dir, float tnear, float tEnd, U32 volume,
+                                                                            int depth, surface::V3* out) {
+    *out = emissiveVolumeIntegral(*c, *backend, *s, org, dir, tnear, tEnd, volume, depth);
+}
