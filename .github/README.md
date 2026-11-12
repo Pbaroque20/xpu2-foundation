@@ -63,7 +63,8 @@ The mantra for XPU2 is: "Use your silicon!"
   fails), work moves between neighbours by the same cellular rules, and every machine's RAM and card memory form one
   pool. A node fetches texture data from the pool only as its render reads it, and a cell goes back to the machine
   that rendered it the frame before, where that data already is. Peers find each other on a local network, and
-  behind routers and VPNs by probing addresses. Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
+  behind routers and VPNs by probing addresses. Artists get it in MoonRay for Modo 0.5.4, from one window in Modo.
+  Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
   branch, also MIT.
 
 ## Reference renderer: MoonRay
@@ -76,7 +77,7 @@ XPU. [Feature progress](/xpu2/interactive/FEATURE_PROGRESS.md) lists each featur
 ## Showcase: MoonRay for Modo
 
 XPU2 renders previews in [MoonRay for Modo](https://www.github.com/pbaroque20/moonrayformodo/) on real production scenes, as part of the standard kit since 0.5, a
-pre-production release. Measured on an RTX 3090 and an i7-4930K (6 cores, 12 threads):
+pre-production release; since 0.5.4 it also renders headless (`moonray_xpu2 render`) and across machines with Rhizome. Measured on an RTX 3090 and an i7-4930K (6 cores, 12 threads):
 
 | Scene | XPU2 (CPU + GPU) | MoonRay | Image vs MoonRay |
 |---|---|---|---|
