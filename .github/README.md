@@ -82,6 +82,30 @@ Windows Firewall rule. Install the same release on every machine that takes part
 
 ![The Rhizome window in Modo: two frames rendered on the swarm by two nodes, the master's log showing the audit and each node's share](https://raw.githubusercontent.com/Pbaroque20/MoonRayForModo/codex/native-avx-modo/docs/images/rhizome-window.png)
 
+### Setting it up
+
+**On every machine, once:** install the same release, and run Compile XPU2 Shaders (System > Preferences > MoonRay >
+XPU2 > Device Management). In the Rhizome window, type the **Rhizome key** at the top: any words, the same on every
+machine; it never leaves the machine. On **Approvals and Firewall**, click **Add Rule...** and accept Windows'
+administrator prompt (the rule covers private and domain networks, not public ones).
+
+**On each machine that helps:** on **This Machine as a Node**, click **Start Node**. The node keeps running after
+Modo is closed, until **Stop Node**. On a workstation it can render only when the keyboard and mouse have been idle,
+only between set hours, or step back while someone works.
+
+**On the machine that renders:** open the scene, choose **This frame** or **Frames** and the **Pictures in** folder on
+the **Render** page, and click **Render on the Swarm**. The scene is exported, the nodes found render their shares,
+and the pictures come out as `<scene>.exr` or `<scene>.####.exr`. **Stop** ends it; started again on the same frames,
+it picks up where it stopped. The other machines need neither the scene nor its textures.
+
+**When nodes are not found:** behind a router or over a VPN, give their addresses under **Nodes by address**
+(`host:47100`) or a range under **Look for nodes in** (`10.8.0.0/24`, or `*`); a machine found once is remembered.
+The ports are 47100 and 47110 over TCP, and 47101 to 47104 over UDP. To keep unknown machines out, tick **Only
+machines approved** and approve each new one on **Approvals and Firewall**.
+
+The full steps are in MoonRay for Modo's
+[installation guide](https://github.com/Pbaroque20/MoonRayForModo/blob/MoonLightIPR/docs/INSTALLATION.md#rendering-across-machines-with-rhizome).
+
 ## Running it
 
 ```
