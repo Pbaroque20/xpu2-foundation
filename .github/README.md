@@ -63,9 +63,10 @@ The mantra for XPU2 is: "Use your silicon!"
   fails), work moves between neighbours by the same cellular rules, and every machine's RAM and card memory form one
   pool. A node fetches texture data from the pool only as its render reads it, and a cell goes back to the machine
   that rendered it the frame before, where that data already is. Peers find each other on a local network, and
-  behind routers and VPNs by probing addresses. Artists get it in MoonRay for Modo 0.5.4, from one window in Modo.
-  Its architecture and state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network)
-  branch, also MIT.
+  behind routers and VPNs by probing addresses. Artists get it in MoonRay for Modo 0.5.4, from one window in Modo;
+  setting it up is a key, a firewall rule and Start Node on each machine
+  ([steps](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network#setting-it-up)). Its architecture and
+  state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network) branch, also MIT.
 
 ## Reference renderer: MoonRay
 
@@ -99,6 +100,7 @@ Test conditions are in the [kit history](/xpu2/interactive/KIT_ROADMAP.md) and t
 | The core in depth | [Asynchronous renderer](/xpu2/interactive/ASYNC.md), [indexer and scheduling](/xpu2/interactive/INDEXER.md) |
 | The MoonRay port | [Path tracer and shaders](/xpu2/interactive/PATH_TRACER.md), [feature progress](/xpu2/interactive/FEATURE_PROGRESS.md) |
 | Running XPU2 in Modo | [Manual: XPU2 in MoonRay for Modo](/xpu2/manual/README.md#13-xpu2-in-moonray-for-modo), [tools](/xpu2/tools/README.md) |
+| Rendering across machines from Modo (Rhizome) | [Setting it up](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network#setting-it-up), [MoonRay for Modo's installation guide](https://github.com/Pbaroque20/MoonRayForModo/blob/MoonLightIPR/docs/INSTALLATION.md#rendering-across-machines-with-rhizome) |
 | Building, and a frame rendered without Modo (`moonray_xpu2 render -in scene.rdla -out beauty.exr`) | [Manual: building and running](/xpu2/manual/README.md#14-building-and-running) |
 
 ## Repository layout
