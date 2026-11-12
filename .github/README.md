@@ -84,7 +84,9 @@ moonray_xpu2 rhizome status --watch                           every machine's ro
 moonray_xpu2 rhizome firewall                                 the firewall rule a machine needs, added once
 ```
 
-Each verb has `--help`. Building XPU2 is in the [engineer manual](/xpu2/manual/README.md#14-building-and-running).
+Each verb has `--help`; `status --json` gives the swarm's state to a script. What a program or script can rely on
+(every option, a machine's folder, `status.json`, the job files, the ports) is in
+[RHIZOME_API.md](/xpu2/interactive/RHIZOME_API.md). Building XPU2 is in the [engineer manual](/xpu2/manual/README.md#14-building-and-running).
 The unit checks are `xpu2/interactive/rhizome_test.cc` and `rhizome_trust_test.cc`.
 
 ## Branches
