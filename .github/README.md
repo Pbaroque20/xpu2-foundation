@@ -68,10 +68,17 @@ with the master killed part way or every machine stopped and started again. They
 MoonRay and a VDB cloud. A node renders a scene's textures (121 MB in the test) straight from the swarm's memory
 with the same picture, and with the camera moving, 35 of a frame's 49 cells stay with the machine that rendered them
 the frame before. With broadcast switched off, a master found two nodes by sweeping their addresses, then by the
-remembered addresses alone.
+remembered addresses alone. Textured lights are read from the swarm's memory too, and pass the master's audit.
 
 Still to do: a test on two real machines, and macOS, with the platform roadmap. The full design and the plan, part
 by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
+
+## In Modo
+
+Rhizome comes to artists in [MoonRay for Modo](https://github.com/Pbaroque20/MoonRayForModo) 0.5.4, under
+MoonRay > Rhizome: Decentralized Rendering. One window renders this frame or a range of frames on the swarm, makes
+this machine a node, shows every machine at work, approves new machines and adds the Windows Firewall rule. Each
+machine needs the same kit version.
 
 ## Running it
 
@@ -95,4 +102,5 @@ The unit checks are `xpu2/interactive/rhizome_test.cc` and `rhizome_trust_test.c
 - [`xpu2-async`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-async): XPU2's core and its documents.
 - `xpu-plus`: XPU+, the earlier synchronous approach.
 
-The kit's side, a Rhizome render started from Modo, belongs to [MoonRay for Modo](https://github.com/Pbaroque20/MoonRayForModo).
+The Modo window and the kit belong to [MoonRay for Modo](https://github.com/Pbaroque20/MoonRayForModo), branch
+`MoonLightIPR`, which carries Rhizome with XPU2.
