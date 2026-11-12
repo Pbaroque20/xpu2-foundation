@@ -98,7 +98,7 @@ Test conditions are in the [kit history](/xpu2/interactive/KIT_ROADMAP.md) and t
 | The core in depth | [Asynchronous renderer](/xpu2/interactive/ASYNC.md), [indexer and scheduling](/xpu2/interactive/INDEXER.md) |
 | The MoonRay port | [Path tracer and shaders](/xpu2/interactive/PATH_TRACER.md), [feature progress](/xpu2/interactive/FEATURE_PROGRESS.md) |
 | Running XPU2 in Modo | [Manual: XPU2 in MoonRay for Modo](/xpu2/manual/README.md#13-xpu2-in-moonray-for-modo), [tools](/xpu2/tools/README.md) |
-| Building | [Manual: building and running](/xpu2/manual/README.md#14-building-and-running) |
+| Building, and a frame rendered without Modo (`moonray_xpu2 render -in scene.rdla -out beauty.exr`) | [Manual: building and running](/xpu2/manual/README.md#14-building-and-running) |
 
 ## Repository layout
 
