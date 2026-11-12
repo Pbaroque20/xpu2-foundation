@@ -75,10 +75,12 @@ by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
 
 ## In Modo
 
-Rhizome comes to artists in [MoonRay for Modo](https://github.com/Pbaroque20/MoonRayForModo) 0.5.4, under
-MoonRay > Rhizome: Decentralized Rendering. One window renders this frame or a range of frames on the swarm, makes
-this machine a node, shows every machine at work, approves new machines and adds the Windows Firewall rule. Each
-machine needs the same kit version.
+Rhizome is released in [MoonRay for Modo 0.5.4](https://github.com/Pbaroque20/MoonRayForModo/releases/tag/v0.5.4)
+(11 November 2026), under MoonRay > Rhizome: Decentralized Rendering. One window renders this frame or a range of
+frames on the swarm, makes this machine a node, shows every machine at work, approves new machines and adds the
+Windows Firewall rule. Install the same release on every machine that takes part.
+
+![The Rhizome window in Modo: two frames rendered on the swarm by two nodes, the master's log showing the audit and each node's share](https://raw.githubusercontent.com/Pbaroque20/MoonRayForModo/codex/native-avx-modo/docs/images/rhizome-window.png)
 
 ## Running it
 
