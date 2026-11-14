@@ -460,7 +460,16 @@ public:
         scene_.load(a.scenes);
         for (const auto& d : deltas) scene_.apply(d);
         scene_.prepare();
-        if (mode_ != 0) makeGpu();
+        // A card that cannot take the job (its programs would not load, a driver refusing them): the node renders it on
+        // its processor rather than sitting the job out, as it does when the programs are missing or still compiling.
+        if (mode_ != 0) {
+            try {
+                makeGpu();
+            } catch (const std::exception& e) {
+                gpu_.reset();
+                std::printf("MoonRay XPU2 Rhizome: the graphics card could not take this job (%s): the CPU alone\n", e.what());
+            }
+        }
         renderer_ = std::make_unique<async::Renderer>(scene_.plan, *scene_.cpuScene, gpu_.get());
         std::printf("MoonRay XPU2 Rhizome: scene ready (%ux%u, %u samples a pixel), %s, %u threads\n", plan().width, plan().height, plan().spp,
                     gpu_ ? (mode_ == 1 ? "the GPU alone" : "CPU and GPU") : "the CPU alone", threads_);
