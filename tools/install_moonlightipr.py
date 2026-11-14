@@ -77,10 +77,36 @@ for old in [kit / 'runtime/moonlight']:
         held = backup / 'before-the-rename' / old.name
         held.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(old), str(held))
-# The native geometry adapter, where it has been built with the reader for heavy meshes (tools/build_modo_bridge.py
-# --output-dir build/modo-geometry-fast --geometry-only --skip-tests). Modo must be closed: it holds the file open.
-adapter = root / 'build/modo-geometry-fast/MoonRayGeometry.lx'
-if adapter.is_file() and (kit / 'bin').is_dir():
+# The native geometry adapter (tools/build_modo_bridge.py --output-dir build/modo-geometry-<name> --geometry-only): the
+# newest build that has every function the adapter's source in native-modo exports, as a release is given it. One
+# fixed folder, built on 2026-10-30, went into every install after the adapter had gained hair, projections and fur.
+# Modo must be closed: it holds the file open.
+def current_adapter():
+    import hashlib
+    import json
+    import re
+    wanted = set()
+    for path in (root / 'native-modo').glob('*.cpp'):
+        wanted.update(re.findall(r'dllexport\)[^(;{]*?\b(MR_\w+)\s*\(', path.read_text(encoding='utf-8', errors='replace')))
+    found = []
+    for build in (root / 'build').glob('modo-geometry*/build.json'):
+        plugin = build.with_name('MoonRayGeometry.lx')
+        try:
+            noted = json.loads(build.read_text(encoding='utf-8'))
+            data = plugin.read_bytes()
+        except (OSError, ValueError):
+            continue
+        if noted.get('geometry_only') and hashlib.sha256(data).hexdigest() == noted.get('plugin_sha256') \
+                and all(name.encode() + b'\0' in data for name in wanted):
+            found.append((plugin.stat().st_mtime, plugin))
+    if not found:
+        print('No geometry adapter built from the current native-modo source: the installed one is left as it is')
+        return None
+    return max(found)[1]
+
+
+adapter = current_adapter()
+if adapter is not None and (kit / 'bin').is_dir():
     held = kit / 'bin' / adapter.name
     if held.is_file():
         backup.mkdir(parents=True, exist_ok=True)
