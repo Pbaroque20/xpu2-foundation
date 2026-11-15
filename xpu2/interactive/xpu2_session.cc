@@ -845,6 +845,22 @@ struct Scene {
         }
         return false;
     }
+    // The kit's texture needs (texture_density.py: the UserData /modo/xpu2/texture_density, paths and sides), handed to
+    // texture overflow mode (host_texture.h setNeeds); none where the scene has none.
+    void readTextureNeeds() const {
+        std::vector<std::string> paths;
+        std::vector<int> sides;
+        try {
+            if (source && source->sceneObjectExists("/modo/xpu2/texture_density")) {
+                const rdl::SceneObject* o = source->getSceneObject("/modo/xpu2/texture_density");
+                for (const auto& path : o->get<rdl::StringVector>("string_values")) paths.push_back(path);
+                for (const int side : o->get<rdl::IntVector>("int_values")) sides.push_back(side);
+            }
+        } catch (...) {
+            paths.clear();
+        }
+        texture::setNeeds(paths, sides);
+    }
     // Whether the kit asks for realtime (the generations' UserData, its ninth value), read before the plan is made.
     bool realtimeAsked() const {
         if (!source || !source->sceneObjectExists("/modo/xpu2/generations")) return false;
@@ -1891,6 +1907,7 @@ int session(const Args& args, const fs::path& directory) {
     };
     try {
         scene.load(args.scenes);
+        scene.readTextureNeeds();
     } catch (const std::exception& e) {
         fallback(std::string("the scene did not load: ") + e.what());
         return 0;
@@ -2574,8 +2591,9 @@ int session(const Args& args, const fs::path& directory) {
                     scene.dropForOverflow();
                     gpuPlan.reset();
                     if (gpu) gpu->dropScene();  // what it holds of the scene gone before the scene is made again, not after
-                    // Realtime's textures are 1024 pixels a side at most on the card: larger steps would free nothing there.
-                    while (scene.realtimeAsked() && texture::overflowSide().load() > 1024 && texture::nextOverflowSide()) {}
+                    // Where realtime's textures are capped (Pyramid::realtimeSide), steps above the cap would free nothing there.
+                    while (scene.realtimeAsked() && texture::Pyramid::realtimeSide() &&
+                           texture::overflowSide().load() > texture::Pyramid::realtimeSide() && texture::nextOverflowSide()) {}
                     goto renderFrame;
                 }
                 fallback(e.what());
@@ -2611,11 +2629,11 @@ int session(const Args& args, const fs::path& directory) {
                 }
                 refining.reset();
                 scene.coarse = scene.coarseCamera = false;
-                texture::overflowSide().store(0);  // a scene loaded anew may fit: it steps down again if not
-                texture::overflowCompress().store(false);
+                texture::resetOverflow();  // a scene loaded anew may fit: it steps down again if not
                 if (gpu) gpu->dropScene();
                 gpuPlan.reset();
                 scene.load(list);
+                scene.readTextureNeeds();
                 event("RELOADED", id);
             } else if (mode_ == "delta") {
                 scene.apply(delta);

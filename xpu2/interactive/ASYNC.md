@@ -29,8 +29,10 @@ build: exact shared triangle arithmetic, fixed ownership and byte-repeatable ima
   devices finish together (the lookahead).
 - **Textures** (§13). The files are the system of record. Host RAM holds the coarser levels of every texture and each
   level-0 tile once it is first read, decoded on the spot, so the CPU never misses; under memory pressure the oldest
-  of those tiles are let go (see Decided, below). VRAM holds each texture's mip levels from 1 up, for the whole session, and a bounded
-  cache of fine-detail (level-0) tiles, loaded on demand and evicted least recently used. A GPU sample that needs a
+  of those tiles are let go (see Decided, below). VRAM holds each texture's coarsest mip levels (128 pixels a side or
+  less) for the whole session, and a bounded cache of the tiles of every larger level, loaded on demand and evicted
+  least recently used (since 2026-11-14; before, levels 1 and up were all resident and only level 0 was on demand).
+  Realtime frames still read each texture from its first level of 1024 pixels or less (`XPU2_SESSION_RT_TEXTURE_SIDE`). A GPU sample that needs a
   tile that is not resident parks in a bounded queue on the GPU, asks for the tile once, and runs again on the GPU,
   with the same random numbers, after the tile has landed. The host sizes launches so the queue cannot overflow.
 - **Ownership** (CA-10, CA-12). Cells keep their owner from frame to frame and flip towards the device that rendered

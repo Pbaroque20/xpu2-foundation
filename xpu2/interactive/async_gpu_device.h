@@ -46,10 +46,13 @@ struct RequestSink {
         if (!params.touched[tile]) params.touched[tile] = 1;
     }
     __device__ bool coarse() const { return mark != nullptr; }
-    // A texel's parent a level up (tex::parentTexel), out of line (each of the filter's fetches calls it on a miss).
-    // Read, it marks the launch thread's sample provisional with the tile it missed.
+    // A texel's parent on the nearest level up that is on the card (tex::parentTexel): the next where its tile is there,
+    // else further up, to the coarsest levels, which always are (async_gpu.h's prepareTextures). Out of line (each of the
+    // filter's fetches calls it on a miss). Read, it marks the launch thread's sample provisional with the tile it missed.
     __device__ __noinline__ unsigned parent(const tex::Image& image, unsigned level, unsigned x, unsigned y, surface::V3& out) const {
-        const unsigned status = tex::parentTexel(image, level, x, y, out);
+        unsigned status = tex::Miss;
+        for (; level < image.count; ++level, x /= 2, y /= 2)
+            if ((status = tex::parentTexel(image, level, x, y, out)) != tex::Miss) break;
         if (status == tex::Ready) *mark = missed ? missed : ~0u;
         return status;
     }
