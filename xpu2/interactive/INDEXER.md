@@ -314,6 +314,11 @@ refused before drawing:
 
 - A displacement on fur (9 Spheres): MoonRay displaces meshes alone (PolyMesh, OpenSubdivMesh); on curves and points it
   is now left out as there, not refused.
+- Fur again, 2 November (9 Spheres): `meshHasMotion`, asked of every geometry since the preparation's speed-up (34332c0), read
+  mesh motion lists `ModoFurGeometry` does not have, and threw. It reads only the lists a class has.
+- A procedural layer (9 Spheres): `ModoProceduralMap` is newer than the reference runtime, so its scene did not load, and it had no
+  map node. It has both (`build_session.py`, `shade_mapnodes.h`). 9 Spheres from a fresh export of the 0.5.2 kit: 67 s at 1280x960
+  and 16 samples, no fallback.
 - A signed texture (−1 to 0.74, a displacement map): texels below zero are kept (host_texture.h, texture_core.h's
   texel), as MoonRay's sampler keeps them; non-finite ones are still refused.
 - Named UV sets (Dose, Interior): ModoTextureMap's modes 12 and 13 read uv_name's primitive attribute and

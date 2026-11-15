@@ -1566,7 +1566,18 @@ X2_CALL V3 randomWalkRadiance(const mixed::Config& c, const sample::Identity& ro
         b.fresnel != shade::NoIndex ? shade::fresnelEval(bsdf.fresnels, b.fresnel, fabsf(shade::dot(st.N, st.wo))) : shade::rgb(1);
     const U64 branch = childBranch(pv.branch, 0xfffc, 0);
     const U32 material = backend.materialId(hit.geom);
-    const shade::Frame frame = shade::frame(st.N);
+    // Crease attenuation (PathIntegratorSubsurface): over 0, the frame is the normal and the first principal direction,
+    // and where the surface curves outward the walk's first direction is drawn from a cosine cap narrowed by the two
+    // principal curvatures, so that fewer zero-scatter rays leave through the creases. 0: the hemisphere, as before.
+    float creaseK1 = 0.0f, creaseK2 = 0.0f;
+    shade::Frame frame;
+    if (b.creaseAttenuation == 0.0f) {
+        frame = shade::frame(st.N);
+    } else {
+        V3 v1;
+        shade::principalCurvatures(st.dPds, st.dPdt, st.dNds, st.dNdt, creaseK1, creaseK2, v1);
+        frame = shade::frame(st.N, v1);
+    }
     const float wBackwardSampling = 0.9f;
     auto expC = [](Color a) { return Color{expf(a.x), expf(a.y), expf(a.z)}; };
     U32 evaluated = 0;
@@ -1608,7 +1619,16 @@ X2_CALL V3 randomWalkRadiance(const mixed::Config& c, const sample::Identity& ro
         };
         float u0, u1;
         nextDirection(u0, u1);
-        V3 dir = -shade::localToGlobal(frame, shade::sampleLocalHemisphereCosine(u0, u1));
+        V3 dir;
+        if (b.creaseAttenuation != 0.0f && creaseK1 > 0.0f) {
+            // The user's value scaled by 0.01, as MoonRay takes it.
+            const float creaseScale = b.creaseAttenuation * 0.01f;
+            const float sinThetaMax1 = 1.0f / (creaseK1 * creaseScale + 1.0f),
+                        sinThetaMax2 = creaseK2 > 0.0f ? 1.0f / (creaseK2 * creaseScale + 1.0f) : 1.0f;
+            dir = -shade::localToGlobal(frame, shade::sampleLocalSphericalEllipticCapCosine(u0, u1, sinThetaMax1, sinThetaMax2));
+        } else {
+            dir = -shade::localToGlobal(frame, shade::sampleLocalHemisphereCosine(u0, u1));
+        }
         // Below the surface: the hit's far-side origin.
         V3 org = shade::dot(dir, hit.normal) >= 0.0f ? hit.origin : hit.below;
         bool reachSurface = false, hadScatterEvent = false, choseDwivedi = false;
@@ -2429,6 +2449,7 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
         }
         // Sample counts per lobe (computeLobeSampleCount): mirrors take one.
         U32 lobeSamples[shade::MaxLobes];
+        X2_IN_MEMORY(lobeSamples);  // live across the lobe module's calls (X2_IN_MEMORY)
         for (U32 k = 0; k < bsdf.topCount; ++k)
             lobeSamples[k] = (!split || (shade::topLobe(bsdf, k).type & shade::Mirror)) ? 1 : c.bsdfSamples;
         U32 plannedBounces = 0;
@@ -2449,6 +2470,8 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                 const volume::Region& R = er.regions[ri];
                 U32 recs[shade::MaxLobes];
                 float cdf[shade::MaxLobes];
+                X2_IN_MEMORY(recs);
+                X2_IN_MEMORY(cdf);
                 U32 nRec = 0;
                 float norm = 0.0f;
                 bool spherical = false;
@@ -2471,6 +2494,8 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                 const int label = backend.volumes()[R.volume].lpeLabel;
                 Color fs[shade::MaxLobes];
                 U32 matched[shade::MaxLobes], nMatched = 0;
+                X2_IN_MEMORY(fs);
+                X2_IN_MEMORY(matched);
                 // BsdfOneSampler::eval: the matching lobes' sum (each kept), the pdf weighted by the lobes' picks.
                 auto oneEval = [&](V3 wi, float& pdf) {
                     const U32 flags = shade::surfaceFlags(slice, spherical, wi);
@@ -2626,6 +2651,11 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
                 // LightSampleLPE: each lobe's share and its LPE state as if the light were reached.
                 Color lobeT[shade::MaxLobes];
                 int lobeLpe[shade::MaxLobes];
+                // Kept in memory across the lobe module's calls (lobeEval, a direct callable on the card): held in a
+                // register, the first lobe's state came back as a value of the next lobe's evaluation, and its light
+                // left the light path AOVs (the beauty kept it), patches where the card rendered its cells.
+                X2_IN_MEMORY(lobeT);
+                X2_IN_MEMORY(lobeLpe);
                 for (U32 k = 0; k < bsdf.topCount; ++k) {
                     lobeLpe[k] = -1;
                     const shade::Lobe& lobe = shade::topLobe(bsdf, k);
@@ -2738,6 +2768,7 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
 
         // BSDF samples (drawBsdfSamples, integrateBsdfSample, addIndirectAndDirectVisibleContributions).
         float albedo[3 * shade::MaxLobes];
+        X2_IN_MEMORY(albedo);
         for (U32 k = 0; k < 3 * shade::MaxLobes; ++k) albedo[k] = 0.0f;
         // The BSDF samples out of line (X2_OUT_OF_LINE); a full stack of pending paths ends the sample as before.
         [&]() X2_OUT_OF_LINE {

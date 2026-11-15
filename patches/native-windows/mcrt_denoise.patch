@@ -37,6 +37,96 @@ index a48bb07..ae48df7 100644
                  -pipe                           # Use pipes rather than intermediate files.
                  -pthread                        # Define additional macros required for using the POSIX threads library.
                  -w                              # Inhibit all warning messages.
+diff --git a/lib/denoiser/OIDNDenoiserImpl.cc b/lib/denoiser/OIDNDenoiserImpl.cc
+index 144533d..1095c41 100644
+--- a/lib/denoiser/OIDNDenoiserImpl.cc
++++ b/lib/denoiser/OIDNDenoiserImpl.cc
+@@ -81,6 +81,25 @@ OIDNDenoiserImpl::OIDNDenoiserImpl(OIDNDeviceType deviceType,
+         oidnSetFilterImage(mFilter, "normal", mInputNormals3, OIDN_FORMAT_FLOAT3, mWidth, mHeight, 0, 0, 0);
+     }
+     
++    // Modo: with MOONRAY_MODO_DENOISE_CLEAN_GUIDES each guide is cleaned first by a filter of its own, in place, and
++    // the beauty's filter is told the guides are clean (cleanAux). Off, as MoonRay's source: the guides as rendered.
++    if (modoCleanGuides() && (mUseAlbedo || mUseNormals)) {
++        if (mUseAlbedo) {
++            mModoAlbedoFilter = oidnNewFilter(mDevice, "RT");
++            oidnSetFilterImage(mModoAlbedoFilter, "albedo", mInputAlbedo3, OIDN_FORMAT_FLOAT3, mWidth, mHeight, 0, 0, 0);
++            oidnSetFilterImage(mModoAlbedoFilter, "output", mInputAlbedo3, OIDN_FORMAT_FLOAT3, mWidth, mHeight, 0, 0, 0);
++            oidnCommitFilter(mModoAlbedoFilter);
++        }
++        if (mUseNormals) {
++            mModoNormalFilter = oidnNewFilter(mDevice, "RT");
++            oidnSetFilterImage(mModoNormalFilter, "normal", mInputNormals3, OIDN_FORMAT_FLOAT3, mWidth, mHeight, 0, 0, 0);
++            oidnSetFilterImage(mModoNormalFilter, "output", mInputNormals3, OIDN_FORMAT_FLOAT3, mWidth, mHeight, 0, 0, 0);
++            oidnCommitFilter(mModoNormalFilter);
++        }
++        oidnSetFilter1b(mFilter, "cleanAux", true);
++        scene_rdl2::logging::Logger::info("Open Image Denoise cleans the guides first");
++    }
++
+     oidnCommitFilter(mFilter);
+ 
+     if (oidnGetDeviceError(mDevice, &oidnErrorMessage) != OIDN_ERROR_NONE) {
+@@ -115,6 +134,8 @@ OIDNDenoiserImpl::~OIDNDenoiserImpl()
+     if (mUseNormals && mInputNormals3) oidnReleaseBuffer(mInputNormals3);
+     if (mOutput3) oidnReleaseBuffer(mOutput3);
+ 
++    if (mModoAlbedoFilter) oidnReleaseFilter(mModoAlbedoFilter);
++    if (mModoNormalFilter) oidnReleaseFilter(mModoNormalFilter);
+     if (mFilter) oidnReleaseFilter(mFilter);
+     if (mDevice) oidnReleaseDevice(mDevice);
+ }
+@@ -155,6 +176,10 @@ OIDNDenoiserImpl::denoise(const float *inputBeauty,
+     // scene_rdl2::rec_time::RecTime denoiseTimer;
+     // denoiseTimer.start();
+ 
++    // Modo: the guides cleaned first (MOONRAY_MODO_DENOISE_CLEAN_GUIDES).
++    if (mModoAlbedoFilter) oidnExecuteFilter(mModoAlbedoFilter);
++    if (mModoNormalFilter) oidnExecuteFilter(mModoNormalFilter);
++
+     oidnExecuteFilter(mFilter);
+ 
+     const char* oidnErrorMessage;
+diff --git a/lib/denoiser/OIDNDenoiserImpl.h b/lib/denoiser/OIDNDenoiserImpl.h
+index 55c7841..1283451 100644
+--- a/lib/denoiser/OIDNDenoiserImpl.h
++++ b/lib/denoiser/OIDNDenoiserImpl.h
+@@ -6,12 +6,25 @@
+ #include "DenoiserImpl.h"
+ 
+ #include <OpenImageDenoise/oidn.h>
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ 
+ namespace moonray {
+ namespace denoiser {
+ 
++// Modo: Open Image Denoise cleans the albedo and normal guides first and is told they are clean (cleanAux)
++// (tools/port_denoise_overrides.py). True when the denoiser was started with MOONRAY_MODO_DENOISE_CLEAN_GUIDES=1; read
++// once. Off, the denoiser is MoonRay's own.
++inline bool modoCleanGuides()
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_DENOISE_CLEAN_GUIDES");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++
+ class OIDNDenoiserImpl : public DenoiserImpl
+ {
+ public:
+@@ -37,6 +50,9 @@ private:
+     OIDNBuffer mInputAlbedo3;
+     OIDNBuffer mInputNormals3;
+     OIDNBuffer mOutput3; 
++    // Modo: the guides' own filters, which clean them first (MOONRAY_MODO_DENOISE_CLEAN_GUIDES).
++    OIDNFilter mModoAlbedoFilter = nullptr;
++    OIDNFilter mModoNormalFilter = nullptr;
+ };
+ 
+ } // namespace denoiser
 diff --git a/lib/denoiser/OptixDenoiserImpl.cc b/lib/denoiser/OptixDenoiserImpl.cc
 index df8c82a..bba3b3d 100644
 --- a/lib/denoiser/OptixDenoiserImpl.cc

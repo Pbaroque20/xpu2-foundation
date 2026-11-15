@@ -981,8 +981,8 @@ inline MotionParams motionParams(const rdl::SceneVariables& sv,const rdl::SceneO
 inline bool meshHasMotion(const rdl::SceneObject& o){
  namespace sm=scene_rdl2::math;
  if(!sm::isEqual(sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN)),sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END))))return true;
- // Asked of any geometry: a VdbGeometry has none of these lists, and asking one it does not have throws.
- // A second step the same as the first is no motion: a host may write one for meshes that do not deform.
+ // Asked of any geometry: ModoFurGeometry has none of these lists, and asking one it does not have throws.
+ // A second step the same as the first is no motion: the kit writes one for meshes that do not deform (Hydra's).
  for(const char* name:{"vertex_list_1","velocity_list_0","velocity_list_1","accleration_list"})
   for(auto i=o.getSceneClass().beginAttributes();i!=o.getSceneClass().endAttributes();++i)
    if((*i)->getName()==name&&!o.get<rdl::Vec3fVector>(name).empty()&&

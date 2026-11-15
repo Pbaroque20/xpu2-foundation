@@ -1,5 +1,7 @@
 # Rhizome: XPU2 across machines
 
+![Rhizome architecture](../manual/rhizome_architecture.svg)
+
 Rhizome renders one picture on many machines. It is a swarm: every machine that can contributes, finds the others,
 takes work and passes it on by the same cellular rules XPU2 uses between a processor and a graphics card. One
 machine, chosen by the user, is the **master integrator**: it holds the scene indexer, sends the cells out, adds what

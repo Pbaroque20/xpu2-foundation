@@ -321,7 +321,18 @@ void moonray::RaasCommandLineApplication::renderPersistent(const std::string& di
         if(!command.enabled())fs::remove(mailbox);
         if (mode == "quit") return;
         if (mode == "full" || (mode == "delta" && requireReload)) {
-            mOptions.setSceneFiles({full});
+            // A scene may come as several files, read in turn: its text, then the binary file holding its
+            // geometry's long lists (the plugin's rdlb.py). They are named one after another, split by |, which no
+            // Windows path holds.
+            std::vector<std::string> files;
+            for (size_t at = 0;;) {
+                const size_t bar = full.find('|', at);
+                files.push_back(full.substr(at, bar == std::string::npos ? std::string::npos : bar - at));
+                if (bar == std::string::npos) break;
+                at = bar + 1;
+            }
+            if (files.size() > 1) std::cout << "Modo session: scene files " << files.size() << std::endl;
+            mOptions.setSceneFiles(files);
             load();
             event("RELOADED", id);
         } else if (mode == "delta") {

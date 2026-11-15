@@ -9,6 +9,7 @@
 #include "shade_maps.h"
 #include "shade_colorcorrect.h"
 #include "texture_core.h"
+#include "../../native-port/maps/ModoProcedural/modo_patterns.h"
 namespace xpu2 { namespace interactive { namespace shade {
 
 // Attribute types, as the parameter block stores them (a bool or int is a float).
@@ -82,6 +83,10 @@ enum MapAttrType : U32 { MapAttrBool, MapAttrInt, MapAttrFloat, MapAttrRgb, MapA
     F(Int, octaves) F(Float, lacunarity) F(Float, persistence) F(Bool, use_coordinates) F(Rgb, coordinates) F(Float, distance) \
     F(Int, tile_u) F(Int, tile_v) F(Int, component) F(Vec4f, uv_affine) F(Vec2f, uv_offset)
 #define X2_MAP_MODO_NORMAL(F) F(Vec3f, input)
+// ModoProceduralMap: its settings, a float vector, are its 24 floats after the attributes.
+#define X2_MAP_MODO_PROCEDURAL(F) \
+    F(Int, pattern) F(Int, type) F(Rgb, color1) F(Rgb, color2) F(Float, alpha1) F(Float, alpha2) F(Int, output) F(Int, space) \
+    F(Vec4f, row0) F(Vec4f, row1) F(Vec4f, row2) F(Rgb, input)
 
 #define X2_MAP_OP(F) \
     F(Int, operation) F(Rgb, op1) F(Rgb, op2) F(Float, op1_factor) F(Float, op2_factor) F(Bool, clamp) F(Float, tolerance)
@@ -194,6 +199,7 @@ enum MapAttrType : U32 { MapAttrBool, MapAttrInt, MapAttrFloat, MapAttrRgb, MapA
     X(MapImageNormal, "ImageNormalMap", X2_MAP_IMAGE_NORMAL) \
     X(MapModoTexture, "ModoTextureMap", X2_MAP_MODO_TEXTURE) \
     X(MapModoNormal, "ModoNormalMap", X2_MAP_MODO_NORMAL) \
+    X(MapModoProcedural, "ModoProceduralMap", X2_MAP_MODO_PROCEDURAL) \
     X(MapOp, "OpMap", X2_MAP_OP) \
     X(MapGradient, "GradientMap", X2_MAP_GRADIENT) \
     X(MapRamp, "RampMap", X2_MAP_RAMP) \
@@ -534,6 +540,41 @@ X2_CALL U32 sampleImageNormalMap(const MapNodeHeader& h, const MapParams& P, con
     return tex::Ready;
 }
 
+// ModoProceduralMap (native-port/maps/ModoProcedural): Modo's procedural textures worked out at each point, by the patterns
+// MoonRay's map and MoonLightIPR's kernel share. Space 0 is the world (st.P), 2 the texture coordinates; the admission
+// refuses the object space, which the kit does not write.
+X2_HD inline Color sampleModoProcedural(const MapParams& P, const State& st) {
+    using Q = MapModoProceduralParams;
+    const Q& q = *reinterpret_cast<const Q*>(P.p);
+    MP_Settings settings;
+    const float* given = P.p + sizeof(Q) / sizeof(float);
+    for (int i = 0; i < 24; ++i) settings.v[i] = given[i];
+    const int pattern = int(q.pattern);
+    if (pattern >= 400) {
+        // A process: its colour made from the colour beneath it, wholly there.
+        const Color beneath = P.c(X2_OFF(Q, input));
+        const MP_Rgb made = mp_process(pattern, beneath.x, beneath.y, beneath.z, settings);
+        return int(q.output) == 1 ? Color{1.0f, 1.0f, 1.0f} : Color{made.r, made.g, made.b};
+    }
+    float px = st.P.x, py = st.P.y, pz = st.P.z;
+    if (int(q.space) == 2) {
+        const float coordinates[2] = {st.s, st.t};
+        px = coordinates[0];
+        py = coordinates[1];
+        pz = 0.0f;
+    }
+    const float x = q.row0[0] * px + q.row0[1] * py + q.row0[2] * pz + q.row0[3];
+    const float y = q.row1[0] * px + q.row1[1] * py + q.row1[2] * pz + q.row1[3];
+    const float z = q.row2[0] * px + q.row2[1] * py + q.row2[2] * pz + q.row2[3];
+    const float t = mp_pattern(pattern, int(q.type), x, y, z, settings);
+    if (int(q.output) == 1) {
+        const float low = fminf(q.alpha1, q.alpha2), high = fmaxf(q.alpha1, q.alpha2);
+        const float alpha = fminf(high, fmaxf(low, q.alpha1 * t + q.alpha2 * (1.0f - t)));
+        return Color{alpha, alpha, alpha};
+    }
+    const Color one = P.c(X2_OFF(Q, color1)), two = P.c(X2_OFF(Q, color2));
+    return one * t + two * (1.0f - t);
+}
 // ModoTextureMap (native-port/maps/ModoTexture): Modo's texture layers. Repeat=0, Edge=1, Mirror=2, Reset=3.
 X2_HD inline float modoTileCoordinate(float value, int mode) {
     if (mode == 0) return value - floorf(value);
@@ -2310,6 +2351,7 @@ X2_CALL U32 sampleMap(const MapNodeHeader& h, const MapParams& P, const State& s
     case MapCombineNormal: return sampleMapCaseCombineNormal(h, P, st, tex, out);
     case MapImageNormal: return sampleMapCaseImageNormal(h, P, st, tex, out);
     case MapModoTexture: return sampleMapCaseModoTexture(h, P, st, tex, out);
+    case MapModoProcedural: (void)h; (void)tex; out = sampleModoProcedural(P, st); return tex::Ready;
     case MapOp: return sampleMapCaseOp(h, P, st, tex, out);
     case MapGradient: return sampleMapCaseGradient(h, P, st, tex, out);
     case MapRamp: return sampleMapCaseRamp(h, P, st, tex, out);

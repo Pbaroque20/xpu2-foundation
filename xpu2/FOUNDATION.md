@@ -18,6 +18,10 @@ The mantra for XPU2 is: "Use your silicon!"
 
 ## Core ideas
 
+![Cellular automata scheduling in XPU2](/xpu2/manual/xpu2-cellular-scheduling.gif)
+
+*Cellular automata scheduling in XPU2*
+
 - **Samples are defined by identity.** A sample is a pixel, a sample index and a frame seed, and its random numbers
   derive from those alone. Either device produces the same result, so work moves between them freely.
 - **One integrator.** The path tracer is written once and compiled for both the CPU and the GPU.
@@ -45,9 +49,17 @@ The mantra for XPU2 is: "Use your silicon!"
 - **Tiered texture memory.** Host RAM holds the coarse mip levels and the fine tiles read so far, which are decoded on
   demand and let go under memory pressure. VRAM holds the coarse levels and a cache of fine tiles. A GPU sample that
   misses a fine tile shades from a coarser level and is re-rendered in full before the frame ends. A scene that does
-  not fit has its textures compressed (BC6H), then made smaller, and the preview says so.
+  not fit has its textures compressed (BC6H), then made smaller, and the preview says so. Texels are kept as half
+  floats, grey maps in one channel and flat tiles as one value, so textures take about a third of the memory.
 - **Sampling generations.** One sampler handles both uniform and adaptive sampling, spending samples where the error
   is highest. A frame runs for as long as uniform sampling would take, or to an exact sample count.
+- **Every device in the machine.** Extra graphics cards follow the first, each with its own scene and film, taking
+  cells from the same grid at their own rate. CPU workers span every Windows processor group. Realtime denoising goes
+  to the first card that can run OptiX's denoiser, then to Open Image Denoise on the CPU. Each card and processor
+  group can be switched off (`--list-devices` lists them).
+- **NUMA-aware.** Workers are placed a share on each NUMA node, each card is fed and its texture tiles decoded on the
+  node nearest it, and decoded tiles live in their node's memory. A node short of memory moves its oldest tiles to
+  another node before letting any go. A simulation app tests cards, groups, nodes and denoiser hand-offs on one card.
 - **Audited results.** Each device keeps its own film. When a frame ends the films merge and every pixel's sample
   count is checked.
 

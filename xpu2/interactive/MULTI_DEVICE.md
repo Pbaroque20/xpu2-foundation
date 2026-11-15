@@ -87,9 +87,9 @@ the move to another node runs on one socket. Speed can only be measured on a mac
 processor's name) and each card (`card`, CUDA's number, its UUID, its memory in bytes, its name), simulated ones as
 they render. `XPU2_CARD_LIST=0,2` and `XPU2_GROUP_LIST=0,1` use only those (a list that leaves nothing keeps
 everything); `--compile-shaders` compiles for every card whatever the list says, so a card switched on later renders
-at once. A host application lists the devices this way, keeps a switch for each (a card by its UUID, a group by its
-number, as the numbering can change) and starts XPU2 with the lists and the matching `XPU2_SESSION_MODE`, keeping one
-device at least on.
+at once. The kit's Preferences > MoonRay > XPU2 > Device Management (`devices.py`, `moonray_devices.py`) lists the devices,
+keeps a switch for each (a card by its UUID, a group by its number) and starts XPU2 with the lists and the matching
+`XPU2_SESSION_MODE`. One device at least stays on.
 
 ## Simulation
 

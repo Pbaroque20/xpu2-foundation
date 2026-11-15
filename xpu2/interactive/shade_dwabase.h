@@ -1276,7 +1276,8 @@ X2_CALL bool createDwaLobes(const DwaParams& p, const DwaUniformParams& u, const
             else if (u.subsurface == SubsurfaceNormalizedDiffusion)
                 addDiffusion(bb, BssrdfNormalizedDiffusion, d, p.fabricAttenuation, Physical, DwaLabelDiffuse);
             else if (u.subsurface == SubsurfaceRandomWalk)
-                addRandomWalk(bb, RandomWalkProfile{p.diffuseNormal, reflectionAlbedo, p.scatteringRadius, p.sssResolveSelfIntersections},
+                addRandomWalk(bb, RandomWalkProfile{p.diffuseNormal, reflectionAlbedo, p.scatteringRadius, p.sssResolveSelfIntersections,
+                                                    p.creaseAttenuation},
                               p.fabricAttenuation, Physical, DwaLabelDiffuse);
             else return false;
         }

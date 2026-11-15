@@ -356,6 +356,7 @@ std::vector<std::pair<int, std::string>> uncompiledCards(const fs::path& mark, b
     std::vector<std::pair<int, std::string>> out;
     std::set<std::string> listed;
     for (int card : multi::cardOrdinals(gpu::cardCount(), every)) {
+        if (!gpu::supported(card)) continue;  // older than XPU2's programs can run on: never compiled for
         const std::string kind = cardKind(card);
         if (!held.count(kind) && listed.insert(kind).second) out.emplace_back(card, kind);
     }
@@ -431,9 +432,24 @@ private:
     double floor_ = 2.0;
 };
 
+// The machine's cards, each named, that are too old for XPU2's programs (gpu::supported); empty where none is.
+std::string olderCards() {
+    std::string names;
+    for (int card = 0; card < gpu::cardCount(); ++card)
+        if (!gpu::supported(card)) names += (names.empty() ? "" : ", ") + cardKind(card);
+    return names;
+}
+
 int compileShaders(const fs::path& folder) {
     const auto began = Clock::now();
     auto seconds = [&] { return std::chrono::duration<double>(Clock::now() - began).count(); };
+    // Cards, but none XPU2's programs run on (a GTX 1080 Ti): nothing to compile, and the processor renders.
+    if (gpu::cardCount() > 0 && !gpu::anySupported()) {
+        std::cout << "MoonRay XPU2 shaders: not needed: " << olderCards()
+                  << " is older than XPU2's GPU programs run on (an RTX 20 series card or newer); XPU2 renders on the processor"
+                  << std::endl;
+        return 0;
+    }
     try {
         const Programs p = programs(folder);
         std::cout << "MoonRay XPU2 shaders: compiling (about an hour the first time; at once when OptiX's cache has them)"
@@ -508,6 +524,10 @@ int listDevices() {
 }
 
 int shadersCompiled(const fs::path& folder) {
+    if (gpu::cardCount() > 0 && !gpu::anySupported()) {
+        std::cout << "MoonRay XPU2 shaders: not needed: " << olderCards() << " is too old for them; the processor renders" << std::endl;
+        return 0;
+    }
     try {
         const ShaderStamp stamp = shaderStamp(programs(folder));
         if (fs::exists(stamp.mark)) {
@@ -1777,7 +1797,17 @@ int session(const Args& args, const fs::path& directory) {
     const bool useShared = std::getenv("MOONRAY_MODO_SHARED") != nullptr;
     // The investigation switches: CPU only or GPU only (0 or 1, else both), the adaptive pass chain on the GPU
     // (the fastest, its tiles unknown to the host) and the progressive pictures' interval.
-    const int mode = std::getenv("XPU2_SESSION_MODE") ? std::atoi(std::getenv("XPU2_SESSION_MODE")) : 2;
+    int mode = std::getenv("XPU2_SESSION_MODE") ? std::atoi(std::getenv("XPU2_SESSION_MODE")) : 2;
+    // Cards, but none XPU2's programs run on (gpu::supported): both becomes the processor alone; the cards alone cannot be.
+    if (mode != 0 && gpu::cardCount() > 0 && !gpu::anySupported()) {
+        if (mode == 1) {
+            fallback("XPU2 cannot use " + olderCards() + ": it needs an RTX 20 series card or newer. Choose the processor in "
+                     "System > Preferences > MoonRay > XPU2 > Device Management");
+            return 0;
+        }
+        std::printf("MoonRay XPU2: %s is older than XPU2's GPU programs run on; the processor renders\n", olderCards().c_str());
+        mode = 0;
+    }
     const bool deviceChain = envOn("XPU2_SESSION_CHAIN", false);
     // Partial shading (texture misses finished a level up, rendered again in full later; off: they wait for the tile).
     const bool partial = envOn("XPU2_SESSION_PARTIAL", true);
@@ -1901,6 +1931,7 @@ int session(const Args& args, const fs::path& directory) {
                         const std::set<std::string> held = compiledKinds(shaderMark(p));
                         std::string left;
                         for (int card : multi::cardOrdinals(gpu::cardCount())) {
+                            if (!gpu::supported(card)) continue;  // too old for XPU2's programs: left out
                             if (held.count(cardKind(card))) cards.push_back(card);
                             else left += (left.empty() ? "" : ", ") + cardKind(card);
                         }
