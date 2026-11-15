@@ -182,6 +182,71 @@ static __device__ void mergeCrypto(U32 pixel, const aov::CryptoEvent* events, U3
         }
     }
 }
+// A sample's camera hit into its pixel's deep segments (DeepBuffer::addSample8x8), without locks as mergeCrypto: a
+// segment's IDs, first distance, ray z and normal are written before it is put in front of the list by a
+// compare-and-swap and never change; the rest is added by atomics (the distances' bounds as ordered integers: they
+// are positive). A node made for a swap that lost is left unlinked.
+static __device__ void mergeDeep(U32 pixel, const aov::DeepHit& h, const Radiance& r) {
+    if (!h.hit) return;
+    const aov::Tables& at = *params.aovTables;
+    surface::V3 n = h.normal;
+    const float l = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+    if (l > 0.0f) n = surface::V3{n.x / l, n.y / l, n.z / l};
+    U32 lo, hi;
+    aov::deepMask(h.sx, h.sy, params.deepRes, lo, hi);
+    U32* head = params.deepHeads + pixel;
+    volatile U32* node = nullptr;
+    U32 spare = ~0u;
+    for (U32 from = *reinterpret_cast<volatile U32*>(head), stop = ~0u;;) {
+        __threadfence();
+        for (U32 k = from; k != stop && k != ~0u;) {
+            volatile U32* m = params.deepNodes + size_t(k) * aov::DeepWords;
+            const float ids[aov::DeepMaxIds] = {__uint_as_float(m[aov::DeepId0]), __uint_as_float(m[aov::DeepId0 + 1]), __uint_as_float(m[aov::DeepId0 + 2])};
+            const surface::V3 sn{__uint_as_float(m[aov::DeepNx]), __uint_as_float(m[aov::DeepNy]), __uint_as_float(m[aov::DeepNz])};
+            if (aov::deepJoins(h.ids, ids, at.deepIdCount, n, sn, h.t, __uint_as_float(m[aov::DeepFirst]), __uint_as_float(m[aov::DeepRayZ]),
+                               params.deepCos, params.deepZ)) {
+                node = m;
+                break;
+            }
+            k = m[aov::DeepNext];
+        }
+        if (node) break;
+        if (spare == ~0u) {
+            spare = atomicAdd(params.deepNodeCount, 1u);
+            if (spare >= params.deepNodeCapacity) {
+                atomicAdd(&params.state->errors, 1u);
+                return;
+            }
+        }
+        volatile U32* m = params.deepNodes + size_t(spare) * aov::DeepWords;
+        m[aov::DeepNext] = from;
+        for (U32 i = 0; i < aov::DeepMaxIds; ++i) m[aov::DeepId0 + i] = __float_as_uint(h.ids[i]);
+        m[aov::DeepFirst] = __float_as_uint(h.t);
+        m[aov::DeepRayZ] = __float_as_uint(h.rayZ);
+        m[aov::DeepNx] = __float_as_uint(n.x);
+        m[aov::DeepNy] = __float_as_uint(n.y);
+        m[aov::DeepNz] = __float_as_uint(n.z);
+        m[aov::DeepFront] = __float_as_uint(h.t);
+        m[aov::DeepBack] = __float_as_uint(h.t);
+        for (U32 w = aov::DeepMaskLo; w < aov::DeepWords; ++w) m[w] = 0u;
+        __threadfence();
+        const U32 was = atomicCAS(head, from, spare);
+        if (was == from) {
+            node = m;
+            break;
+        }
+        stop = from;
+        from = was;
+    }
+    U32* s = const_cast<U32*>(node);
+    atomicMin(reinterpret_cast<int*>(s + aov::DeepFront), __float_as_int(h.t));
+    atomicMax(reinterpret_cast<int*>(s + aov::DeepBack), __float_as_int(h.t));
+    atomicOr(s + aov::DeepMaskLo, lo);
+    atomicOr(s + aov::DeepMaskHi, hi);
+    atomicAdd(reinterpret_cast<float*>(s + aov::DeepAlpha), float(r.alpha));
+    atomicAdd(reinterpret_cast<float*>(s + aov::DeepWeight), 1.0f);
+    for (U32 c = 0; c < 3; ++c) atomicAdd(reinterpret_cast<float*>(s + aov::DeepR + c), float(r.rgb[c]));
+}
 // mode 4: a pixel's accumulators readied for a frame (initAovPixel): +inf for min, -inf for max, 0 for the rest,
 // and the closest filter's depths +inf.
 static __device__ void initAovs() {
@@ -199,6 +264,10 @@ static __device__ void initAovs() {
     if (params.cryptoHeads) {
         for (U32 c = 0; c < params.cryptoCategories; ++c) params.cryptoHeads[size_t(i) * params.cryptoCategories + c] = ~0u;
         if (i == 0) *params.cryptoNodeCount = 0u;
+    }
+    if (params.deepHeads) {
+        params.deepHeads[i] = ~0u;
+        if (i == 0) *params.deepNodeCount = 0u;
     }
 }
 
@@ -257,6 +326,7 @@ static __device__ __noinline__ void run(GpuBackend& backend, U32 pixel, U32 inde
     if (status == SampleStatus::Done) {
         if (at.channels) mergeAovs(at, pixel, r.aov, r.aovDepth);
         if (params.cryptoHeads) mergeCrypto(pixel, r.crypto, r.cryptoCount);
+        if (params.deepHeads) mergeDeep(pixel, r.deep, r);
         if (params.heat) atomicAdd(params.heat + pixel, double(clock64() - began) * params.secondsPerTick);
         double* s = params.sums + size_t(pixel) * 4;
         atomicAdd(s + 0, r.rgb[0]);

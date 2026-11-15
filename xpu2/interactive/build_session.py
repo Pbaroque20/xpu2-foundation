@@ -73,7 +73,10 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
                    source / 'toolchain/xpu/cuda_cudart-windows-x86_64-12.8.90-archive/include',
                    source / 'upstream/openmoonray/moonray/moonray/lib/rendering/lpe',
                    source / 'upstream/openmoonray/moonray/moonray/lib/rendering/displayfilter',
-                   source / 'build/native-renderer-avx/moonray/lib/rendering/displayfilter']
+                   source / 'build/native-renderer-avx/moonray/lib/rendering/displayfilter',
+                   # MoonRay's OpenDCX (libdeepfile) for deep files (aov_deep_write.h).
+                   source / 'upstream/openmoonray/moonray/moonray/lib',
+                   source / 'toolchain/msys64/ucrt64/include/Imath', source / 'toolchain/msys64/ucrt64/include/OpenEXR']
         # MoonRay's own subdivision surface tessellation (xpu2_geom.cc), built with MoonRay's flags on its own thread
         # beside the session's units, or taken from the cache when its sources and build script are unchanged.
         import threading
@@ -96,7 +99,8 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
             kernels, kernel_flags = bc6h_kernels(source, out / 'bc6h')
             exe, report['native_build'] = build_units(source, [HERE / 'xpu2_session.cc', HERE / 'xpu2_scene.cc', HERE / 'xpu2_cpu.cc', HERE / 'xpu2_meshopt.cc', HERE / 'xpu2_bc6h.cc'], out / 'native',
                                                       [runtime / 'libembree4.dll', runtime / 'librendering_lpe.dll',
-                                                       runtime / 'librendering_displayfilter.dll', *kernels, '-lcfgmgr32', '-lwinmm', '-lbcrypt', '-lws2_32', '-liphlpapi'],
+                                                       runtime / 'librendering_displayfilter.dll', runtime / 'libdeepfile.dll',
+                                                       runtime / 'libOpenEXR-3_4.dll', runtime / 'libImath-3_2.dll', *kernels, '-lcfgmgr32', '-lwinmm', '-lbcrypt', '-lws2_32', '-liphlpapi'],
                                                       ['-I' + str(v) for v in include] + ['-I' + str(source / 'upstream/meshoptimizer/src'), '-DXPU2_SPLIT_UNITS'] + kernel_flags)
         finally:
             geom_thread.join()

@@ -31,6 +31,7 @@
 #include "../../native-port/modo_shared_image.h"
 #include <OpenImageIO/imageio.h>
 #include "aov_write.h"
+#include "aov_deep_write.h"
 #include "entity_classes.h"
 #include "aov_display.h"
 #include <scene_rdl2/scene/rdl2/RenderOutput.h>
@@ -43,6 +44,7 @@
 #include <psapi.h>
 #include <functional>
 #include <dxgi.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -1212,12 +1214,24 @@ struct Scene {
 
 // What the frame writes when it ends: the scene's render outputs (aov_plan.h, aov_write.h), as MoonRay writes them.
 // What XPU2 does not make yet leaves the scene to MoonRay.
-void checkOutputs(const aov::Plan& plan, bool gpu) {
-    cpu::need(!plan.deep, "Deep outputs are not rendered by XPU2 yet");
-    // Checkpoints are saved (Safe Denoising). A render to be continued from a saved one starts again: MoonRay could not
-    // take up XPU2's saves (they carry no progressCheckpointTileSamples), and XPU2 does not yet know which samples a
-    // save holds (a pixel's may not be its first ones yet).
-    if (plan.resume) std::printf("MoonRay XPU2: Continue starts this render again (XPU2 does not take up a saved render yet)\n");
+void checkOutputs(const aov::Plan& plan, bool gpu, bool volumes) {
+    // Deep outputs (aov_deep.h, aov_deep_write.h): hard surfaces' beauty and alpha, up to three deep IDs, files of deep
+    // outputs alone; a scene with volumes is left to MoonRay, whose deep volume segments XPU2 does not make.
+    if (plan.deep) {
+        cpu::need(plan.deepRefused.empty(), plan.deepRefused + " is not rendered by XPU2 yet");
+        cpu::need(plan.deepIds.size() <= 3, "Deep output with more than three deep ID attributes is not rendered by XPU2 yet");
+        cpu::need(!volumes, "Deep output of a scene with volumes is not rendered by XPU2 yet (deep volume segments)");
+        for (const aov::File& f : plan.files) {
+            bool mixed = false;
+            aov::deepFile(f, mixed);
+            cpu::need(!mixed, f.name + " has a mixture of deep and non-deep images");
+        }
+    }
+    // Checkpoints and resume: a frame by sampling generations saves its films and where its generations stood between two
+    // of them (async::ResumeState, saveGenerations); a uniform frame goes in stages of samples (stagedFrame). Either is
+    // saved beside its checkpoint files and read back by a render taken up. MoonRay's own saves are not read (they say
+    // which samples a tile holds, progressCheckpointTileSamples, not XPU2's film): such a render begins anew, and says so.
+    (void)plan;
 }
 
 // A checkpoint render's saves (Safe Denoising), on a thread of their own so that the render goes on meanwhile: each the
@@ -1243,10 +1257,12 @@ public:
         width_ = width;
         height_ = height;
     }
-    void save(async::RenderResult&& sofar) {
+    // first: written before the save's files (a resumable checkpoint's state), so that their "Wrote:" lines mean it is whole.
+    void save(async::RenderResult&& sofar, std::function<void()> first = {}) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (busy_ || !plan_) return;
         pending_ = std::move(sofar);
+        first_ = std::move(first);
         busy_ = true;
         wake_.notify_all();
     }
@@ -1260,6 +1276,7 @@ private:
     void loop() {
         for (;;) {
             async::RenderResult r;
+            std::function<void()> first;
             const aov::Plan* plan;
             aov::DisplayFilters* filters;
             unsigned width, height;
@@ -1268,12 +1285,14 @@ private:
                 wake_.wait(lock, [&] { return stop_ || busy_; });
                 if (stop_) return;
                 r = std::move(pending_);
+                first = std::move(first_);
                 plan = plan_;
                 filters = filters_;
                 width = width_;
                 height = height_;
             }
             try {
+                if (first) first();
                 if (filters && !filters->empty()) {
                     std::vector<std::vector<float>> filtered;
                     filters->run(*plan, r, filtered);
@@ -1302,11 +1321,448 @@ private:
     std::condition_variable wake_, done_;
     bool stop_ = false, busy_ = false;
     async::RenderResult pending_;
+    std::function<void()> first_;
     const aov::Plan* plan_ = nullptr;
     aov::DisplayFilters* filters_ = nullptr;
     unsigned width_ = 0, height_ = 0;
     std::thread thread_;
 };
+
+// A checkpoint render's film (checkpoint_active, resume_render): the frame rendered in stages of sample indices, each
+// stage every pixel's samples [first, first + count) as Rhizome's shares render them (RenderOptions::share), merged here
+// by each output's filter (async::mergeAovPixel). After every stage the film holds exactly the first `done` samples of
+// every pixel, so a save says which samples it holds, and a render taken up from it renders the rest: the samples
+// are defined by their identity, so the frame is the one an uninterrupted render makes. Saved beside the checkpoint
+// files as <checkpoint file>.xpu2resume.
+struct StagedFilm {
+    aov::Tables tables;
+    U32 width = 0, height = 0, spp = 0, done = 0;
+    size_t pixels = 0;
+    std::vector<double> sums, odd, aovs;
+    std::vector<float> depths;
+    std::vector<U32> counts;
+    std::shared_ptr<aov::CryptoBuffer> crypto;
+    bool multiPresence = false;
+
+    static constexpr uint32_t Magic = 0x53523258u;  // "X2RS"
+    static constexpr uint32_t Version = 1;
+
+    void init(const async::Renderer& r, const cpu::Plan& plan) {
+        tables = r.aovTables();
+        width = plan.width, height = plan.height, done = 0;
+        spp = plan.spp;
+        for (unsigned s : plan.pixelSamples) spp = std::max<U32>(spp, s);
+        pixels = size_t(width) * height;
+        sums.assign(pixels * 4, 0.0);
+        counts.assign(pixels, 0u);
+        odd.clear(), aovs.clear(), depths.clear();
+        if (plan.aovs && (plan.aovs->beautyAux || plan.aovs->alphaAux)) odd.assign(pixels * 4, 0.0);
+        if (tables.channels) {
+            aovs.resize(pixels * tables.channels);
+            depths.resize(pixels * std::max<U32>(tables.closestCount, 1));
+            for (size_t p = 0; p < pixels; ++p) async::initAovPixel(tables, aovs.data() + p * tables.channels, depths.data() + p * tables.closestCount);
+        }
+        crypto.reset();
+        if (plan.aovs && plan.aovs->cryptomatte) {
+            crypto = std::make_shared<aov::CryptoBuffer>();
+            multiPresence = plan.aovs->cryptoMultiPresence;
+            crypto->init(width, height, plan.aovs->cryptoCategories, multiPresence);
+        }
+    }
+    // A stage's result (a share of the whole frame) added in.
+    void add(const async::RenderResult& r) {
+        for (size_t p = 0; p < pixels && p < r.counts.size(); ++p) {
+            const U32 k = r.counts[p];
+            if (!k) continue;
+            counts[p] += k;
+            for (int c = 0; c < 4; ++c) sums[p * 4 + c] += double(r.rgba[p * 4 + c]) * k;
+            if (!odd.empty() && r.odd.size() >= (p + 1) * 4)
+                for (int c = 0; c < 4; ++c) odd[p * 4 + c] += double(r.odd[p * 4 + c]) * k;
+        }
+        if (tables.channels && !r.aovRaw.empty())
+            for (size_t p = r.shareFrom; p < r.shareTo && p < pixels; ++p) {
+                const size_t b = p - r.shareFrom;
+                async::mergeAovPixel(tables, aovs.data() + p * tables.channels, depths.data() + p * tables.closestCount,
+                                     r.aovRaw.data() + b * tables.channels, r.aovRawDepths.data() + b * tables.closestCount);
+            }
+        if (crypto && r.crypto && !r.crypto->empty())
+            for (size_t p = 0; p < pixels; ++p)
+                for (U32 c = 0; c < crypto->categories() && c < r.crypto->categories(); ++c)
+                    for (const auto& g : r.crypto->fragments(c, p)) crypto->merge(p, c, g);
+    }
+    // The frame so far as a frame's end makes it: means, AOVs resolved, Cryptomatte finalized. Statistics from base.
+    async::RenderResult result(async::Renderer& renderer, async::RenderResult base = {}) const {
+        base.rgba.assign(pixels * 4, 0.0f);
+        base.counts = counts;
+        base.odd.clear();
+        if (!odd.empty()) base.odd.assign(pixels * 4, 0.0f);
+        for (size_t p = 0; p < pixels; ++p)
+            if (counts[p])
+                for (int c = 0; c < 4; ++c) {
+                    base.rgba[p * 4 + c] = float(sums[p * 4 + c] / counts[p]);
+                    if (!odd.empty()) base.odd[p * 4 + c] = float(odd[p * 4 + c] / counts[p]);
+                }
+        base.aov.clear();
+        if (tables.channels) renderer.resolveMerged(aovs, depths, base.counts, base.aov);
+        base.crypto.reset();
+        if (crypto) {
+            base.crypto = std::make_shared<aov::CryptoBuffer>(*crypto);
+            base.crypto->finalize(base.counts);
+        }
+        base.aovRaw.clear(), base.aovRawDepths.clear();
+        return base;
+    }
+    // The film and how far it is, to path (written whole, then named).
+    bool save(const std::string& path, std::string& error) const {
+        const std::string part = path + ".part";
+        {
+            std::ofstream f(part, std::ios::binary | std::ios::trunc);
+            if (!f) {
+                error = "cannot write " + part;
+                return false;
+            }
+            auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), sizeof v); };
+            auto u64 = [&](uint64_t v) { f.write(reinterpret_cast<const char*>(&v), sizeof v); };
+            auto array = [&](const auto& v) {
+                u64(v.size());
+                f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * sizeof(v[0])));
+            };
+            u32(Magic), u32(Version), u32(width), u32(height), u32(spp), u32(done), u32(tables.channels), u32(tables.closestCount);
+            array(sums), array(counts), array(odd), array(aovs), array(depths);
+            const U32 cats = crypto ? crypto->categories() : 0u;
+            u32(cats);
+            for (size_t p = 0; p < pixels && cats; ++p)
+                for (U32 c = 0; c < cats; ++c) {
+                    const auto& list = crypto->fragments(c, p);
+                    u32(uint32_t(list.size()));
+                    f.write(reinterpret_cast<const char*>(list.data()), std::streamsize(list.size() * sizeof(aov::CryptoBuffer::Fragment)));
+                }
+            if (!f) {
+                error = "cannot write " + part;
+                return false;
+            }
+        }
+        std::error_code e;
+        std::filesystem::rename(part, path, e);
+        if (e) {
+            error = "cannot name " + path + ": " + e.message();
+            return false;
+        }
+        return true;
+    }
+    // A save read back into this film (initialised for the same scene); why not, if it does not fit.
+    bool load(const std::string& path, std::string& why) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            why = "no saved render at " + path;
+            return false;
+        }
+        bool bad = false;
+        auto u32 = [&]() {
+            uint32_t v = 0;
+            if (!f.read(reinterpret_cast<char*>(&v), sizeof v)) bad = true;
+            return v;
+        };
+        auto array = [&](auto& v, size_t expected) {
+            uint64_t n = 0;
+            if (!f.read(reinterpret_cast<char*>(&n), sizeof n) || n != expected) {
+                bad = true;
+                return;
+            }
+            v.resize(size_t(n));
+            if (!f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size() * sizeof(v[0])))) bad = true;
+        };
+        if (u32() != Magic || u32() != Version) {
+            why = path + " is not an XPU2 save";
+            return false;
+        }
+        const U32 w = u32(), h = u32(), s = u32(), d = u32(), ch = u32(), cl = u32();
+        if (bad || w != width || h != height || s != spp || ch != tables.channels || cl != tables.closestCount || d > spp) {
+            why = path + " is of another render (its size, samples or outputs differ)";
+            return false;
+        }
+        std::vector<double> sums2, odd2, aovs2;
+        std::vector<U32> counts2;
+        std::vector<float> depths2;
+        array(sums2, sums.size()), array(counts2, counts.size()), array(odd2, odd.size()), array(aovs2, aovs.size()), array(depths2, depths.size());
+        const U32 cats = u32();
+        if (bad || cats != (crypto ? crypto->categories() : 0u)) {
+            why = path + " is of another render (its outputs differ)";
+            return false;
+        }
+        std::shared_ptr<aov::CryptoBuffer> crypto2;
+        if (crypto) {
+            crypto2 = std::make_shared<aov::CryptoBuffer>();
+            crypto2->init(width, height, cats, multiPresence);
+            for (size_t p = 0; p < pixels && !bad; ++p)
+                for (U32 c = 0; c < cats && !bad; ++c) {
+                    const uint32_t n = u32();
+                    if (n > 4096) bad = true;
+                    for (uint32_t k = 0; k < n && !bad; ++k) {
+                        aov::CryptoBuffer::Fragment g;
+                        if (!f.read(reinterpret_cast<char*>(&g), sizeof g)) bad = true;
+                        else crypto2->merge(p, c, g);
+                    }
+                }
+        }
+        if (bad) {
+            why = path + " is cut short";
+            return false;
+        }
+        sums.swap(sums2), counts.swap(counts2), odd.swap(odd2), aovs.swap(aovs2), depths.swap(depths2);
+        if (crypto) crypto = crypto2;
+        done = d;
+        return true;
+    }
+};
+
+// Where a checkpoint render's film is saved, beside its first checkpoint file (or its first file), and where a render to
+// be taken up looks for it: beside its resume file, its checkpoint file or its file, the first there.
+inline std::string stagedSavePath(const aov::Plan& plan) {
+    for (const aov::File& f : plan.files)
+        if (!f.checkpoint.empty()) return f.checkpoint + ".xpu2resume";
+    return plan.files.empty() ? std::string("checkpoint.exr.xpu2resume") : plan.files[0].name + ".xpu2resume";
+}
+inline std::string stagedResumePath(const aov::Plan& plan) {
+    for (const aov::File& f : plan.files)
+        for (const std::string* name : {&f.resume, &f.checkpoint, &f.name})
+            if (!name->empty() && std::filesystem::exists(*name + ".xpu2resume")) return *name + ".xpu2resume";
+    return stagedSavePath(plan);
+}
+// The samples a stage takes: about a sixteenth of the frame's (XPU2_SESSION_CHECKPOINT_STAGE sets it).
+inline U32 stagedStep(U32 spp) {
+    if (const char* v = std::getenv("XPU2_SESSION_CHECKPOINT_STAGE")) {
+        const long n = std::strtol(v, nullptr, 10);
+        if (n > 0) return U32(n);
+    }
+    return std::max<U32>(1u, (spp + 15) / 16);
+}
+
+// A checkpoint render: the frame in stages (StagedFilm), its pictures the film so far with the stage under way blended
+// in, the film saved every checkpoint_interval (the checkpoint files, and the .xpu2resume beside them), and with
+// resume_render taken up from its save. Uniform: a stage samples every pixel alike, whatever the scene's sampling.
+async::RenderResult stagedFrame(async::Renderer& renderer, const async::RenderOptions& base, const async::Watch& watch,
+                                const cpu::Plan& plan, Checkpoints& checkpoints) {
+    using Clock = std::chrono::steady_clock;
+    const aov::Plan& outputs = *plan.aovs;
+    StagedFilm film;
+    film.init(renderer, plan);
+    if (outputs.resume) {
+        const std::string path = stagedResumePath(outputs);
+        std::string why;
+        if (film.load(path, why))
+            std::printf("MoonRay XPU2: the render taken up from %s: %u of %u samples a pixel done\n", path.c_str(), film.done, film.spp);
+        else
+            std::printf("MoonRay XPU2: the render begun anew (%s)\n", why.c_str());
+        std::fflush(stdout);
+    }
+    std::printf("MoonRay XPU2: a checkpoint render: every pixel sampled alike, %u samples a pixel in stages of %u\n", film.spp, stagedStep(film.spp));
+    std::fflush(stdout);
+    const std::string savePath = stagedSavePath(outputs);
+    const double interval = std::max(1.0, outputs.checkpointMinutes * 60.0);
+    auto lastSave = Clock::now();
+    async::RenderResult last, total;
+    unsigned long long cpuSamples = 0, gpuSamples = 0, launches = 0;
+    double seconds = 0;
+    bool drained = false;
+    while (film.done < film.spp) {
+        const U32 first = film.done, count = std::min(stagedStep(film.spp), film.spp - first);
+        const double whole = double(film.spp);
+        // The pictures: the film so far, the stage's samples blended in by how far it is.
+        async::Watch stage = watch;
+        stage.checkpoint = nullptr;
+        stage.checkpointSeconds = 0;
+        auto blend = [&film, count](const float* stageMean, size_t stride, double fraction, float* out, size_t outStride) {
+            const double n = fraction * count;
+            for (size_t p = 0; p < film.pixels; ++p) {
+                const double k = film.counts[p];
+                for (int c = 0; c < 3; ++c) {
+                    const double s = std::isfinite(stageMean[p * stride + c]) ? stageMean[p * stride + c] : 0.0;
+                    out[p * outStride + c] = k + n > 0 ? float((film.sums[p * 4 + c] + s * n) / (k + n)) : 0.0f;
+                }
+            }
+        };
+        if (watch.preview)
+            stage.preview = [&, first](const std::vector<float>& rgb, U32 w, U32 h, double fraction) {
+                if (!first || rgb.size() < film.pixels * 3) return watch.preview(rgb, w, h, (first + fraction * count) / whole);
+                std::vector<float> mixed(rgb.size());
+                blend(rgb.data(), 3, fraction, mixed.data(), 3);
+                watch.preview(mixed, w, h, (first + fraction * count) / whole);
+            };
+        if (watch.previewResult)
+            stage.previewResult = [&, first](const async::RenderResult& sofar, double fraction) {
+                if (!first || sofar.rgba.size() < film.pixels * 4) return watch.previewResult(sofar, (first + fraction * count) / whole);
+                async::RenderResult mixed = sofar;
+                blend(sofar.rgba.data(), 4, fraction, mixed.rgba.data(), 4);
+                for (size_t p = 0; p < film.pixels && p < mixed.counts.size(); ++p) mixed.counts[p] += film.counts[p];
+                watch.previewResult(mixed, (first + fraction * count) / whole);
+            };
+        async::RenderOptions o = base;
+        o.watch = &stage;
+        o.share = true;
+        o.region[0] = 0, o.region[1] = 0, o.region[2] = int(plan.width), o.region[3] = int(plan.height);
+        o.sampleFirst = first, o.sampleCount = count;
+        o.partial = false;  // every sample whole: the stages must add up to the frame
+        o.deviceChain = false;
+        last = renderer.render(o);
+        if (last.failed || last.cancelled) return last;
+        film.add(last);
+        cpuSamples += last.cpuSamples, gpuSamples += last.gpuSamples, launches += last.launches, seconds += last.seconds;
+        if (last.drained) {
+            drained = true;
+            break;
+        }
+        film.done = first + count;
+        // A save every checkpoint_interval: the checkpoint files (on their own thread) and the film beside them.
+        if (outputs.checkpoint && film.done < film.spp &&
+            std::chrono::duration<double>(Clock::now() - lastSave).count() >= interval) {
+            lastSave = Clock::now();
+            checkpoints.save(film.result(renderer));
+            std::string error;
+            if (film.save(savePath, error))
+                std::printf("MoonRay XPU2: checkpoint: %u of %u samples a pixel, saved to %s\n", film.done, film.spp, savePath.c_str());
+            else
+                std::printf("MoonRay XPU2: checkpoint not saved: %s\n", error.c_str());
+            std::fflush(stdout);
+        }
+    }
+    total = film.result(renderer, std::move(last));
+    total.cpuSamples = cpuSamples, total.gpuSamples = gpuSamples, total.launches = launches, total.seconds = seconds;
+    total.drained = drained;
+    // A finished render's save: the whole frame, so that a render taken up from it again has nothing left to do.
+    if (outputs.checkpoint && !drained) {
+        std::string error;
+        if (!film.save(savePath, error)) std::printf("MoonRay XPU2: checkpoint not saved: %s\n", error.c_str());
+    }
+    return total;
+}
+
+// A frame by sampling generations as its resumable checkpoint saves it (async::ResumeState), beside its checkpoint files
+// as <checkpoint file>.xpu2resume, under its own mark ("X2RG"; a uniform frame's staged film is "X2RS"): the frame's
+// size and sampling first, to be checked when it is read back, then the films and the generations.
+constexpr uint32_t GenerationsMagic = 0x47523258u, GenerationsVersion = 1;
+struct GenerationsHeader {
+    uint32_t magic = GenerationsMagic, version = GenerationsVersion, width = 0, height = 0, minSamples = 0, maxSamples = 0;
+    unsigned long long budget = 0;
+    uint32_t bySamples = 0, channels = 0, closest = 0;
+    float noise = 0;
+    static GenerationsHeader of(const cpu::Plan& plan, const aov::Tables& t) {
+        GenerationsHeader h;
+        h.width = plan.width, h.height = plan.height, h.minSamples = plan.minSamples, h.maxSamples = plan.maxSamples;
+        h.budget = plan.sampleBudget, h.bySamples = plan.budgetBySamples ? 1u : 0u, h.noise = plan.noiseTarget;
+        h.channels = t.channels, h.closest = t.closestCount;
+        return h;
+    }
+    bool same(const GenerationsHeader& o) const {
+        return magic == o.magic && version == o.version && width == o.width && height == o.height && minSamples == o.minSamples &&
+               maxSamples == o.maxSamples && budget == o.budget && bySamples == o.bySamples && noise == o.noise && channels == o.channels &&
+               closest == o.closest;
+    }
+};
+inline bool saveGenerations(const std::string& path, const GenerationsHeader& h, const async::ResumeState& s, std::string& error) {
+    const std::string part = path + ".part";
+    {
+        std::ofstream f(part, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            error = "cannot write " + part;
+            return false;
+        }
+        auto raw = [&](const void* p, size_t n) { f.write(static_cast<const char*>(p), std::streamsize(n)); };
+        auto array = [&](const auto& v) {
+            const uint64_t n = v.size();
+            raw(&n, sizeof n);
+            raw(v.data(), v.size() * sizeof(v[0]));
+        };
+        raw(&h, sizeof h);
+        array(s.sums), array(s.odd), array(s.counts), array(s.planned), array(s.aovRaw), array(s.aovDepths), array(s.expected),
+            array(s.trace), array(s.cells);
+        const uint32_t generated = s.generated, stop = s.stop ? 1u : 0u;
+        raw(&generated, sizeof generated), raw(&stop, sizeof stop);
+        raw(&s.spent, sizeof s.spent), raw(&s.budgetSeconds, sizeof s.budgetSeconds), raw(&s.elapsed, sizeof s.elapsed);
+        const uint32_t cats = s.crypto && !s.crypto->empty() ? s.crypto->categories() : 0u;
+        raw(&cats, sizeof cats);
+        const size_t pixels = size_t(h.width) * h.height;
+        for (size_t p = 0; p < pixels && cats; ++p)
+            for (uint32_t c = 0; c < cats; ++c) {
+                const auto& list = s.crypto->fragments(c, p);
+                const uint32_t n = uint32_t(list.size());
+                raw(&n, sizeof n);
+                raw(list.data(), list.size() * sizeof(aov::CryptoBuffer::Fragment));
+            }
+        if (!f) {
+            error = "cannot write " + part;
+            return false;
+        }
+    }
+    std::error_code e;
+    std::filesystem::rename(part, path, e);
+    if (e) {
+        error = "cannot name " + path + ": " + e.message();
+        return false;
+    }
+    return true;
+}
+inline std::shared_ptr<async::ResumeState> loadGenerations(const std::string& path, const GenerationsHeader& want, bool multiPresence,
+                                                           std::string& why) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        why = "no saved render at " + path;
+        return nullptr;
+    }
+    bool bad = false;
+    auto raw = [&](void* p, size_t n) {
+        if (n && !f.read(static_cast<char*>(p), std::streamsize(n))) bad = true;
+    };
+    auto array = [&](auto& v) {
+        uint64_t n = 0;
+        raw(&n, sizeof n);
+        if (bad || n > (uint64_t(1) << 34)) {
+            bad = true;
+            return;
+        }
+        v.resize(size_t(n));
+        raw(v.data(), v.size() * sizeof(v[0]));
+    };
+    GenerationsHeader h;
+    raw(&h, sizeof h);
+    if (bad || h.magic != GenerationsMagic) {
+        why = path + " is not a saved render by sampling generations";
+        return nullptr;
+    }
+    if (!h.same(want)) {
+        why = path + " is of another render (its size, sampling or outputs differ)";
+        return nullptr;
+    }
+    auto s = std::make_shared<async::ResumeState>();
+    array(s->sums), array(s->odd), array(s->counts), array(s->planned), array(s->aovRaw), array(s->aovDepths), array(s->expected),
+        array(s->trace), array(s->cells);
+    uint32_t generated = 0, stop = 0, cats = 0;
+    raw(&generated, sizeof generated), raw(&stop, sizeof stop);
+    raw(&s->spent, sizeof s->spent), raw(&s->budgetSeconds, sizeof s->budgetSeconds), raw(&s->elapsed, sizeof s->elapsed);
+    raw(&cats, sizeof cats);
+    s->generated = generated, s->stop = stop != 0;
+    const size_t pixels = size_t(h.width) * h.height;
+    if (cats && !bad) {
+        s->crypto = std::make_shared<aov::CryptoBuffer>();
+        s->crypto->init(h.width, h.height, cats, multiPresence);
+        for (size_t p = 0; p < pixels && !bad; ++p)
+            for (uint32_t c = 0; c < cats && !bad; ++c) {
+                uint32_t n = 0;
+                raw(&n, sizeof n);
+                if (n > 4096) bad = true;
+                for (uint32_t k = 0; k < n && !bad; ++k) {
+                    aov::CryptoBuffer::Fragment g;
+                    raw(&g, sizeof g);
+                    if (!bad) s->crypto->merge(p, c, g);
+                }
+            }
+    }
+    if (bad || s->sums.size() != pixels * 4 || s->counts.size() != pixels || s->planned.size() != pixels) {
+        why = path + " is cut short";
+        return nullptr;
+    }
+    return s;
+}
 
 // The outlines of the work, thirty times a second, from a thread of their own.
 class Outlines {
@@ -1932,7 +2388,7 @@ int session(const Args& args, const fs::path& directory) {
                 if (const std::string overflow = texture::overflowWords(); !overflow.empty())
                     modoProtocolLine("@@MODO_XPU2 NOTICE Texture Overflow: memory ran short, so textures are " + overflow +
                                      ". Free memory, or use fewer or smaller textures, then start the preview again for full detail.");
-                if (scene.plan->aovs) checkOutputs(*scene.plan->aovs, mode != 0);
+                if (scene.plan->aovs) checkOutputs(*scene.plan->aovs, mode != 0, !scene.plan->volumes.empty());
                 if (mode != 0 && !gpu) {
                     const Programs p = programs(folder);
                     if (!fs::exists(shaderMark(p))) {
@@ -2460,7 +2916,49 @@ int session(const Args& args, const fs::path& directory) {
                         std::fflush(stdout);
                     }
                 }
-                result = renderer->render(options);
+                // A checkpoint render, or one taken up from a save (Safe Denoising, Continue): every save can be taken up. A
+                // frame by sampling generations saves between two of them, its sampling as any frame's (saveGenerations); a
+                // uniform frame goes in stages of samples (stagedFrame). A deep render's saves are the frame so far.
+                const bool checkpointed = scene.plan->aovs && (scene.plan->aovs->checkpoint || scene.plan->aovs->resume) &&
+                                          !scene.plan->realtime && !scene.plan->aovs->deep;
+                const bool generations = scene.plan->adaptive && (options.cellular || scene.plan->sampleBudget);
+                if (checkpointed && generations) {
+                    const aov::Plan& outputs = *scene.plan->aovs;
+                    const GenerationsHeader header = GenerationsHeader::of(*scene.plan, renderer->aovTables());
+                    if (outputs.resume) {
+                        const std::string path = stagedResumePath(outputs);
+                        std::string why;
+                        if (auto saved = loadGenerations(path, header, outputs.cryptoMultiPresence, why)) {
+                            std::printf("MoonRay XPU2: the render taken up from %s: %u generations done\n", path.c_str(), saved->generated);
+                            options.resumeFrom = std::move(saved);
+                        } else {
+                            std::printf("MoonRay XPU2: the render begun anew (%s)\n", why.c_str());
+                        }
+                        std::fflush(stdout);
+                    }
+                    if (outputs.checkpoint) {
+                        const std::string savePath = stagedSavePath(outputs);
+                        watch.checkpoint = nullptr;
+                        watch.resumableSeconds = std::max(1.0, outputs.checkpointMinutes * 60.0);
+                        watch.resumable = [&checkpoints, header, savePath](std::shared_ptr<async::ResumeState> state, async::RenderResult&& sofar) {
+                            const U32 done = state->generated;
+                            checkpoints.wait();  // a save under way first: a stop's save is never let go
+                            checkpoints.save(std::move(sofar), [state, header, savePath, done] {
+                                std::string error;
+                                if (saveGenerations(savePath, header, *state, error))
+                                    std::printf("MoonRay XPU2: checkpoint: %u generations, saved to %s\n", done, savePath.c_str());
+                                else
+                                    std::printf("MoonRay XPU2: checkpoint not saved: %s\n", error.c_str());
+                                std::fflush(stdout);
+                            });
+                        };
+                    }
+                    result = renderer->render(options);
+                    options.resumeFrom.reset();
+                } else if (checkpointed)
+                    result = stagedFrame(*renderer, options, watch, *scene.plan, checkpoints);
+                else
+                    result = renderer->render(options);
                 hideBelow = 0;
                 checkpoints.wait();  // a save under way is whole before the frame's own files, or another scene
                 if (renderer->deviceRatio() > 0) deviceRatio = renderer->deviceRatio();
@@ -2563,6 +3061,15 @@ int session(const Args& args, const fs::path& directory) {
                             const std::string error = aov::writeOutputs(*scene.plan->aovs, result, width, height, warnings);
                             for (const auto& w : warnings) std::puts(("MoonRay XPU2: " + w).c_str());
                             cpu::need(error.empty(), error);
+                            // Deep files (aov_deep_write.h), "Wrote deep:" as MoonRay says it.
+                            if (scene.plan->aovs->deep && result.deep)
+                                for (const aov::File& f : scene.plan->aovs->files) {
+                                    bool mixed = false;
+                                    if (!aov::deepFile(f, mixed)) continue;
+                                    const std::string deepError = aov::writeDeepFile(f.name, f, *scene.plan->aovs, *result.deep, result.counts);
+                                    cpu::need(deepError.empty(), deepError);
+                                    std::printf("Wrote deep: %s\n", f.name.c_str());
+                                }
                         }
                         if (standalone().on && !standalone().beauty.empty()) writeBeauty(standalone().beauty, result, width, height);
                         complete = true;

@@ -1234,13 +1234,40 @@ public:
         if (plan && plan->cryptomatte) crypto_.init(width_, height_, plan->cryptoCategories, plan->cryptoMultiPresence);
     }
     aov::CryptoBuffer& crypto() { return crypto_; }
+    // Deep output's segments (aov_deep.h), where the AOV tables ask for deep output: spp, the frame's samples a pixel.
+    void initDeep(const aov::Plan* plan, U32 spp) {
+        if (plan && aovTables_.deep) deep_.init(width_, height_, aovTables_.deepIdCount, plan->deepCurvature, plan->deepZ, spp);
+    }
+    aov::DeepFilm& deep() { return deep_; }
+    // A frame taken up from a resumable checkpoint (async_render.h ResumeState): the saved samples' beauty (where no card
+    // renders: else the card's film takes them), AOV accumulators and Cryptomatte fragments, before any sample of its own.
+    void seedBeauty(const std::vector<double>& sums, const std::vector<double>& odd, const std::vector<U32>& counts) {
+        if (sums.size() == sums_.size()) sums_ = sums;
+        if (odd.size() == odd_.size()) odd_ = odd;
+        if (counts.size() == counts_.size()) counts_ = counts;
+    }
+    void seedAovs(const std::vector<double>& acc, const std::vector<float>& depths) {
+        if (acc.size() == aov_.size() && depths.size() == aovDepth_.size()) aov_ = acc, aovDepth_ = depths;
+    }
+    void seedCrypto(const aov::CryptoBuffer& c) {
+        if (!crypto_.empty() && c.categories() == crypto_.categories()) crypto_ = c;
+    }
+    // A sample's camera hit into its pixel's segments (under the tile's lock).
+    void addDeep(U32 pixel, const aov::DeepHit& h, const double* rgb, double alpha) {
+        if (!deep_.empty()) deep_.add(pixel, h, rgb, alpha);
+    }
+    struct DeepSample {
+        aov::DeepHit hit;
+        double rgb[3], alpha;
+    };
     // A sample's events into its pixel's fragments: those that reach the film.
     void addCrypto(U32 pixel, const aov::CryptoEvent& e) {
         if (!crypto_.empty() && e.used && (e.increment || e.credit)) crypto_.add(pixel, e);
     }
     void add(U32 tile, const U32* pixels, const double (*sums)[4], const double (*odd)[4], const U32* counts, const double* aovs = nullptr,
              const float* aovDepths = nullptr, const double* heat = nullptr,
-             const std::vector<std::pair<U32, aov::CryptoEvent>>* cryptoEvents = nullptr) {
+             const std::vector<std::pair<U32, aov::CryptoEvent>>* cryptoEvents = nullptr,
+             const std::vector<std::pair<U32, DeepSample>>* deepSamples = nullptr) {
         auto& lock = locks_[tile].flag;
         while (lock.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
         const U32 C = aovTables_.channels, K = aovTables_.closestCount;
@@ -1258,6 +1285,8 @@ public:
         }
         if (cryptoEvents)
             for (const auto& pe : *cryptoEvents) addCrypto(pe.first, pe.second);
+        if (deepSamples)
+            for (const auto& ds : *deepSamples) addDeep(ds.first, ds.second.hit, ds.second.rgb, ds.second.alpha);
         lock.clear(std::memory_order_release);
     }
     // Partial shading: the GPU's provisional samples rendered again in full here, whose values leave the GPU's
@@ -1300,6 +1329,7 @@ public:
                           r.aov, r.aovDepth);
         if (!heat_.empty()) heat_[pixel] += seconds;
         for (U32 k = 0; r.crypto && k < r.cryptoCount; ++k) addCrypto(pixel, r.crypto[k]);
+        addDeep(pixel, r.deep, r.rgb, r.alpha);
         lock.clear(std::memory_order_release);
     }
     // A copy that is consistent tile by tile, taken while workers keep adding.
@@ -1426,6 +1456,7 @@ private:
     std::vector<float> aovDepth_;
     std::vector<double> heat_;
     aov::CryptoBuffer crypto_;
+    aov::DeepFilm deep_;
     std::vector<double> settled_;  // partial shading: provisional samples settled here (initSettled)
     std::vector<U32> settledCounts_;
 };
@@ -1563,9 +1594,12 @@ inline U64 renderChunk(const CpuScene& scene, const mixed::Config& config, const
     // Cryptomatte: a sample's events, and the tile's that reach the film.
     thread_local std::vector<aov::CryptoEvent> sampleCrypto;
     thread_local std::vector<std::pair<U32, aov::CryptoEvent>> tileCrypto;
+    thread_local std::vector<std::pair<U32, HostFilm::DeepSample>> tileDeep;
     const bool crypto = !film.crypto().empty();
     if (crypto) sampleCrypto.resize(aov::CryptoMaxEvents);
     tileCrypto.clear();
+    tileDeep.clear();
+    const bool deep = !film.deep().empty();
     double heat[TilePixels] = {};
     const bool timing = !film.heat().empty();
     if (C) {
@@ -1621,10 +1655,11 @@ inline U64 renderChunk(const CpuScene& scene, const mixed::Config& config, const
             if (C) mergeAovPixel(at, tileAov.data() + size_t(p) * C, tileDepth.data() + size_t(p) * K, sampleAov.data(), sampleDepth.data());
             for (U32 k = 0; k < r.cryptoCount; ++k)
                 if (r.crypto[k].used && (r.crypto[k].increment || r.crypto[k].credit)) tileCrypto.push_back({pixels[p], r.crypto[k]});
+            if (deep && r.deep.hit) tileDeep.push_back({pixels[p], HostFilm::DeepSample{r.deep, {r.rgb[0], r.rgb[1], r.rgb[2]}, r.alpha}});
             ++counts[p];
         }
     film.add(chunk.tile, pixels, sums, odd, counts, C ? tileAov.data() : nullptr, C ? tileDepth.data() : nullptr, timing ? heat : nullptr,
-             crypto ? &tileCrypto : nullptr);
+             crypto ? &tileCrypto : nullptr, deep ? &tileDeep : nullptr);
     U64 done = skipped;
     for (U32 p = 0; p < TilePixels; ++p) done += counts[p];
     counters.samples.fetch_add(done, std::memory_order_relaxed);

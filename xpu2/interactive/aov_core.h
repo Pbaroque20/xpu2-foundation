@@ -129,6 +129,8 @@ struct Tables {
     U32 materialSecondary = 0;  // a material AOV asks for secondary rays
     // Cryptomatte (aov_crypto.h): on, its deep ID attribute's key and its UV attribute's (0: st).
     U32 crypto = 0, cryptoIdKey = 0, cryptoUvKey = 0;
+    // Deep output (aov_deep.h): on, the deep ID attributes' keys (deep_id_attribute_names, up to three).
+    U32 deep = 0, deepIdCount = 0, deepIdKeys[3] = {0, 0, 0};
 };
 
 X2_HD inline bool finitef(float v) { return v == v && v - v == 0.0f; }

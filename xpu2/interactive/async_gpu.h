@@ -18,6 +18,7 @@
 #pragma once
 #include "async_adaptive.h"
 #include "async_gpu_abi.h"
+#include "aov_deep.h"
 #include <chrono>
 #include "gpu_lane.h"
 #include "multi_device.h"
@@ -1302,6 +1303,20 @@ public:
             scene_.cryptoNodes = device(size_t(cryptoNodeCapacity_) * cryptoNodeWords_ * sizeof(U32));
             scene_.cryptoNodeCount = device(sizeof(U32));
         }
+        // Deep output's segment lists (aov_deep.h): a head a pixel, and the node pool (four segments a pixel and a
+        // million more).
+        deep_ = plan->aovs && plan->aovs->deep && plan->aovs->deepRefused.empty();
+        if (deep_) {
+            const aov::Plan& a = *plan->aovs;
+            deepRes_ = aov::deepSubpixelRes(aov::deepFrameSpp(plan->adaptive, plan->maxSamples, plan->spp, plan->pixelSamples));
+            deepCos_ = float(std::cos(double(a.deepCurvature) * 3.14159265358979323846 / 180.0));
+            deepZ_ = a.deepZ;
+            deepNodeCapacity_ = U32(std::min<size_t>(pixels * 4 + (size_t(1) << 20), size_t(0x7fffffff) / aov::DeepWords));
+            scene_.deepHeads = device(pixels * sizeof(U32));
+            gpu::Allocating what("deep output's segments");
+            scene_.deepNodes = device(size_t(deepNodeCapacity_) * aov::DeepWords * sizeof(U32));
+            scene_.deepNodeCount = device(sizeof(U32));
+        }
         scene_.hostSums = pinned(pixels * 4 * sizeof(double));
         scene_.hostOdd = pinned(pixels * 4 * sizeof(double));
         scene_.hostCounts = pinned(pixels * sizeof(U32));
@@ -1387,7 +1402,7 @@ public:
         deferredHead_ = 0;
         deferredOut_.clear();
         memset32(state_->pointer, 0, sizeof(DeviceState) / 4);
-        if (aovChannels_ || scene_.heat || cryptoEvents_) {  // mode 4: the AOV film readied
+        if (aovChannels_ || scene_.heat || cryptoEvents_ || deep_) {  // mode 4: the AOV film readied
             LaunchParams p = baseParams();
             p.mode = 4;
             auto& slot = takeParams(p);
@@ -1574,6 +1589,22 @@ public:
     // A copy of the device film as it will stand once the launches queued so far have finished, for a progressive
     // picture; previewReady() says when it has landed. Read through sums() and counts(); the frame's own download
     // (downloadFilm) writes the same copy.
+    // A frame taken up from a resumable checkpoint (RenderOptions::resumeFrom): the card's film starts with the saved
+    // samples' sums, odd-index sums and counts, so its passes' sample indices (passBase, from its counts) and its
+    // errors go on from them. On this card's stream ahead of any launch; after begin().
+    void seedFilm(const std::vector<double>& sums, const std::vector<double>& odd, const std::vector<U32>& counts) {
+        const size_t pixels = size_t(plan_->width) * plan_->height;
+        if (sums.size() != pixels * 4 || counts.size() != pixels) return;
+        std::memcpy(scene_.hostSums->host(), sums.data(), pixels * 4 * sizeof(double));
+        copyIn(scene_.sums, scene_.hostSums->host(), pixels * 4 * sizeof(double));
+        if (odd.size() == pixels * 4) {
+            std::memcpy(scene_.hostOdd->host(), odd.data(), pixels * 4 * sizeof(double));
+            copyIn(scene_.odd, scene_.hostOdd->host(), pixels * 4 * sizeof(double));
+        }
+        std::memcpy(scene_.hostCounts->host(), counts.data(), pixels * sizeof(U32));
+        copyIn(scene_.counts, scene_.hostCounts->host(), pixels * sizeof(U32));
+        driver.drain();  // the staging buffers are the downloads' too
+    }
     void downloadPreview(bool aovs = false) {
         if (!followers_.empty()) forward([&](GpuLane& f) { f.downloadPreview(aovs); });
         previewAdded_ = false;
@@ -1751,6 +1782,50 @@ public:
                     into.merge(p, c, g);
                 }
             }
+    }
+
+    // Deep output: the card's segments (its lists, oldest first) into the host's film by the merge rule (DeepFilm::merge).
+    void mergeDeep(aov::DeepFilm& into) {
+        if (!followers_.empty()) forward([&](GpuLane& f) { f.mergeDeep(into); });
+        if (!deep_ || into.empty()) return;
+        const size_t pixels = size_t(plan_->width) * plan_->height;
+        B countHost = pinned(sizeof(U32)), headsHost = pinned(pixels * sizeof(U32));
+        copyOut(countHost, scene_.deepNodeCount, sizeof(U32));
+        copyOut(headsHost, scene_.deepHeads, pixels * sizeof(U32));
+        driver.drain();  // the frame's end
+        const U32 count = std::min(*static_cast<const U32*>(countHost->host()), deepNodeCapacity_);
+        if (!count) return;
+        const U32* heads = static_cast<const U32*>(headsHost->host());
+        B nodesHost = pinned(size_t(count) * aov::DeepWords * sizeof(U32));
+        copyOut(nodesHost, scene_.deepNodes, size_t(count) * aov::DeepWords * sizeof(U32));
+        driver.drain();
+        const U32* nodes = static_cast<const U32*>(nodesHost->host());
+        auto f = [](U32 w) {
+            float v;
+            std::memcpy(&v, &w, sizeof v);
+            return v;
+        };
+        std::vector<U32> order;
+        for (size_t p = 0; p < pixels; ++p) {
+            order.clear();
+            for (U32 n = heads[p]; n != ~0u && n < count; n = nodes[size_t(n) * aov::DeepWords + aov::DeepNext]) order.push_back(n);
+            for (auto it = order.rbegin(); it != order.rend(); ++it) {
+                const U32* m = nodes + size_t(*it) * aov::DeepWords;
+                aov::DeepFilm::Segment g;
+                for (U32 i = 0; i < aov::DeepMaxIds; ++i) g.ids[i] = f(m[aov::DeepId0 + i]);
+                g.first = f(m[aov::DeepFirst]);
+                g.rayZ = f(m[aov::DeepRayZ]);
+                g.normal = surface::V3{f(m[aov::DeepNx]), f(m[aov::DeepNy]), f(m[aov::DeepNz])};
+                g.front = f(m[aov::DeepFront]);
+                g.back = f(m[aov::DeepBack]);
+                g.maskLo = m[aov::DeepMaskLo];
+                g.maskHi = m[aov::DeepMaskHi];
+                g.alpha = f(m[aov::DeepAlpha]);
+                g.weight = f(m[aov::DeepWeight]);
+                for (int c = 0; c < 3; ++c) g.rgb[c] = f(m[aov::DeepR + c]);
+                into.merge(p, g);
+            }
+        }
     }
 
     // Adaptive frames. Every pixel's error, worked out on the device behind the
@@ -2695,7 +2770,7 @@ private:
         B geometry, materials, lights, meshLights, lightSetBits, lightTree, lightTreeRoots, lightMotion, lightMoved, volumes, meshVolumes, walkSequences, meshMaterials, meshAttributes, meshMotion, materialPool, scratch, config, maps, textures, sums, odd, counts,
             hostSums,
             hostOdd, hostCounts, aovTables, geomLabels, aovs, hostAovs, aovClosest, hostAovClosest, hostAovDepths, heat, hostHeat, cryptoHeads,
-            cryptoNodes, cryptoNodeCount;
+            cryptoNodes, cryptoNodeCount, deepHeads, deepNodes, deepNodeCount;
         B passMask[PassSlots], passBase[PassSlots], passStaging[PassSlots], errors, hostErrors;
         std::shared_ptr<gpu::Event> filmDone, errorsDone, previewDone, aovInitDone;
         size_t mipBytes = 0;
@@ -3277,6 +3352,15 @@ private:
             p.cryptoNodeWords = cryptoNodeWords_;
             p.cryptoNodeCapacity = cryptoNodeCapacity_;
         }
+        if (deep_) {
+            p.deepHeads = reinterpret_cast<U32*>(scene_.deepHeads->pointer);
+            p.deepNodes = reinterpret_cast<U32*>(scene_.deepNodes->pointer);
+            p.deepNodeCount = reinterpret_cast<U32*>(scene_.deepNodeCount->pointer);
+            p.deepNodeCapacity = deepNodeCapacity_;
+            p.deepRes = deepRes_;
+            p.deepCos = deepCos_;
+            p.deepZ = deepZ_;
+        }
         p.glitterOffset = plan_->glitter ? glitterOffset(plan_->dwaSlots) : 0;
         p.traversable = scene_.traversable;
         p.volumeTraversable = scene_.volumeTraversable;
@@ -3448,6 +3532,9 @@ private:
     U32 cardThreads_ = 0;  // the launch width by the card (constructor); prepare's is at most this
     size_t registersScratch_ = 0;  // a sample's map registers (X2_MAP_REGISTERS)
     // Cryptomatte: events a thread and their scratch, categories, multi presence, extras, node size and pool.
+    bool deep_ = false;
+    U32 deepNodeCapacity_ = 0, deepRes_ = 8;
+    float deepCos_ = 0.7071f, deepZ_ = 2.0f;
     U32 cryptoEvents_ = 0, cryptoCategories_ = 1, cryptoMultiPresence_ = 0, cryptoExtras_ = 0, cryptoNodeWords_ = 5, cryptoNodeCapacity_ = 0;
     size_t cryptoScratch_ = 0;
     double secondsPerTick_ = 0.0;

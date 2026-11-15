@@ -13,6 +13,7 @@
 #include "async_adaptive_core.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace xpu2::interactive::async::adaptive {
@@ -233,6 +234,49 @@ public:
     float ratio(size_t tile) const { return ratio_[tile]; }
     U32 generation() const { return generation_; }
     float lastTarget() const { return lastTarget_; }
+    // Its state as bytes, and back (a render taken up from a resumable checkpoint, xpu2_session.cc): false where the
+    // bytes are of another image's tiles.
+    std::vector<char> save() const {
+        std::vector<char> b;
+        auto put = [&](const void* p, size_t n) { b.insert(b.end(), static_cast<const char*>(p), static_cast<const char*>(p) + n); };
+        auto array = [&](const auto& v) {
+            const uint64_t n = v.size();
+            put(&n, sizeof n);
+            put(v.data(), v.size() * sizeof(v[0]));
+        };
+        put(&tilesX_, sizeof tilesX_), put(&tilesY_, sizeof tilesY_), put(&target_, sizeof target_), put(&lastTarget_, sizeof lastTarget_);
+        put(&generation_, sizeof generation_);
+        array(alive_), array(dead_), array(ratio_), array(error_), array(pixels_), array(samples_);
+        return b;
+    }
+    bool load(const std::vector<char>& b) {
+        size_t at = 0;
+        auto get = [&](void* p, size_t n) {
+            if (at + n > b.size()) return false;
+            if (n) std::memcpy(p, b.data() + at, n);
+            at += n;
+            return true;
+        };
+        auto array = [&](auto& v) {
+            uint64_t n = 0;
+            if (!get(&n, sizeof n) || n > b.size()) return false;
+            v.resize(size_t(n));
+            return get(v.data(), v.size() * sizeof(v[0]));
+        };
+        int tx = 0, ty = 0;
+        float target = 0, last = 0;
+        U32 generation = 0;
+        std::vector<char> alive, dead;
+        std::vector<float> ratio, error;
+        std::vector<double> pixels, samples;
+        if (!get(&tx, sizeof tx) || !get(&ty, sizeof ty) || !get(&target, sizeof target) || !get(&last, sizeof last) ||
+            !get(&generation, sizeof generation) || !array(alive) || !array(dead) || !array(ratio) || !array(error) || !array(pixels) ||
+            !array(samples) || tx != tilesX_ || ty != tilesY_ || alive.size() != alive_.size())
+            return false;
+        target_ = target, lastTarget_ = last, generation_ = generation;
+        alive_.swap(alive), dead_.swap(dead), ratio_.swap(ratio), error_.swap(error), pixels_.swap(pixels), samples_.swap(samples);
+        return true;
+    }
 
 private:
     // The error the samples still to spend would bring every tile to (Budget): the target whose cost, each tile's
