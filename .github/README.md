@@ -41,11 +41,13 @@ The mantra for XPU2 is: "Use your silicon!"
   narrower only when the card is short of memory. On an RTX 3090 a simple scene went from 10.9 GB of the card to 4.5 GB
   at the same speed and with the same picture, so smaller cards can render. The parked-sample queue and the subsurface
   stack are made only for scenes that use them, and the texture cache grows as tiles are read.
-- **Tiered texture memory.** Host RAM holds the coarse mip levels and the fine tiles read so far, which are decoded on
-  demand and let go under memory pressure. VRAM holds the coarse levels and a cache of fine tiles. A GPU sample that
-  misses a fine tile shades from a coarser level and is re-rendered in full before the frame ends. A scene that does
-  not fit has its textures compressed (BC6H), then made smaller, and the preview says so. Texels are kept as half
-  floats, grey maps in one channel and flat tiles as one value, so textures take about a third of the memory.
+- **Textures on demand.** Host RAM and VRAM keep each texture's coarse levels, up to 128 pixels a side; every larger
+  level is read tile by tile as frames sample it, decoded on demand and let go under memory pressure. A GPU sample that
+  misses a tile shades from a coarser level and is re-rendered in full before the frame ends, so pictures match loading
+  everything. Only what frames sample counts against memory, so texture overflow is rare; where a scene still does not
+  fit, each texture is fitted to what its meshes show on screen, then compressed (BC6H), then made smaller, and the
+  preview says so. Texels are kept as half floats, grey maps in one channel and flat tiles as one value, so textures
+  take about a third of the memory.
 - **Sampling generations.** One sampler handles both uniform and adaptive sampling, spending samples where the error
   is highest. A frame runs for as long as uniform sampling would take, or to an exact sample count.
 - **Audited results.** Each device keeps its own film. When a frame ends the films merge and every pixel's sample
@@ -91,6 +93,30 @@ pre-production release; since 0.5.4 it also renders headless (`moonray_xpu2 rend
 
 Test conditions are in the [kit history](/xpu2/interactive/KIT_ROADMAP.md) and the
 [indexer notes](/xpu2/interactive/INDEXER.md) (sections 14 and 15).
+
+## Limits
+
+Windows only. The graphics card needs to be an NVIDIA RTX 20 series or newer; older cards, or none, render on the processor. Still on the processor: volumes whose maps read image textures, light filters, shadow linking and lobe light sets. Still handed to MoonRay XPU: an instanced displaced polygon mesh that deforms, and a scene past its memory ceiling. Not done yet: resuming from a checkpoint and deep output. The whole list is in [section 21 of the manual](/xpu2/manual/README.md#21-not-done-yet).
+
+## Textures in XPU2 and MoonLightIPR
+
+The two GPU engines in MoonRay for Modo handle textures differently. XPU2 keeps textures exact and loads only the pieces a frame samples, compressing only when memory runs short. MoonLightIPR always compresses and keeps whole textures on the graphics card, which suits a fast preview.
+
+| | XPU2 | MoonLightIPR |
+|---|---|---|
+| **File the engine reads** | `.tx` (OpenImageIO's tiled, mipmapped format), made by `maketx` | Targa for 8-bit images, PFM for float ones, made by `oiiotool`; the session then caches its own prepared `.mlt` |
+| **Smaller detail levels (mips)** | Stored in the `.tx` | Made by the session when it prepares the texture, then cached |
+| **Compression** | None normally: bytes, half floats, or one channel for grey maps. BC6H (1 byte a texel) only in texture overflow | Always: BC7 for 8-bit images, BC6H for floats (Intel's ISPC compressor), about 1 byte a texel |
+| **Lossy?** | No, outside overflow | Yes, slightly (BC7 and BC6H) |
+| **Loading** | On demand: the small levels (128 a side and under) stay on the card; every larger level is read tile by tile, on the processor and the card, as frames sample it; tiles let go when memory runs short. Renders finish only once their tiles have landed, so pictures match loading everything | Whole texture uploaded to the card at load |
+| **When textures don't fit** | Rare, since only what frames sample counts. Texture overflow mode: fit each texture to what its meshes show on screen, then compress, then halve | Keeps the largest textures in the computer's memory, outside the card |
+| **Realtime size cap** | 1024 a side on the card, normal maps included | 1024 a side |
+| **Render size** | Full size | Full size (Render and Render Animation) |
+| **MoonShine graph bakes** | Not baked: graphs run natively as MoonRay maps | Baked to images: 512 or 2048 in realtime, the image's own size up to 8192 for a final Render |
+| **Shader Tree procedural layers** | Through the object, the native `ModoProceduralMap`; flat projections use the C++ 2D bake | The same C++ bake for flat projections (512 in realtime, 2048 for a Render); the native map through the object |
+| **Layered environments** | Composed natively, 2048 × 1024 | Composed natively, 1024 × 512 in realtime, 2048 × 1024 for a Render |
+| **Texture conversion** | Side by side, up to 8 converters | Side by side, up to 8 converters |
+| **Animations** | Overflow fitting sized over the whole shot, so no popping | No overflow fitting, so nothing to pop |
 
 ## Start here
 
