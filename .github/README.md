@@ -70,7 +70,9 @@ with the same picture, and with the camera moving, 35 of a frame's 49 cells stay
 the frame before. With broadcast switched off, a master found two nodes by sweeping their addresses, then by the
 remembered addresses alone. Textured lights are read from the swarm's memory too, and pass the master's audit.
 
-Still to do: a test on two real machines, and macOS, with the platform roadmap. The full design and the plan, part
+Confirmed by a user on 13 November 2026 between two computers: their main workstation (Ryzen 9 7950X, NVIDIA RTX 5090) and an AMD Ryzen Threadripper 1950X with an NVIDIA GTX 1080 Ti. The second machine found its 1080 Ti too old an architecture to compile XPU2's GPU programs for, and rendered its share on its processor.
+
+Still to do: macOS, with the platform roadmap. The full design and the plan, part
 by part, are in [RHIZOME.md](/xpu2/interactive/RHIZOME.md).
 
 ## In Modo

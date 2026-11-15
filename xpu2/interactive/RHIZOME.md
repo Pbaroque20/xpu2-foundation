@@ -162,6 +162,8 @@ The master logs each node's audit after every frame: pixels checked, outliers, b
 
 ## 6. Where it stands
 
+In use: Confirmed by a user on 13 November 2026 between two computers: their main workstation (Ryzen 9 7950X, NVIDIA RTX 5090) and an AMD Ryzen Threadripper 1950X with an NVIDIA GTX 1080 Ti. The second machine found its 1080 Ti too old an architecture to compile XPU2's GPU programs for, and rendered its share on its processor.
+
 | Part | State |
 |---|---|
 | Node hash, key pair kept in the node's folder, signed messages, rhizome key handshake (`rhizome_identity.h`, `rhizome_wire.h`) | built, tested |
