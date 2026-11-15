@@ -69,6 +69,7 @@ The mantra for XPU2 is: "Use your silicon!"
   setting it up is a key, a firewall rule and Start Node on each machine
   ([steps](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network#setting-it-up)). Its architecture and
   state are on the [`xpu2-network`](https://github.com/Pbaroque20/xpu2-foundation/tree/xpu2-network) branch, also MIT.
+  Confirmed by a user on 13 November 2026 between two computers: their main workstation (Ryzen 9 7950X, NVIDIA RTX 5090) and an AMD Ryzen Threadripper 1950X with an NVIDIA GTX 1080 Ti. The second machine found its 1080 Ti too old an architecture to compile XPU2's GPU programs for, and rendered its share on its processor.
 
 ## Reference renderer: MoonRay
 
