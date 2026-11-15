@@ -29,6 +29,9 @@ struct BssrdfRecord {
     Color rwAlbedo, sigmaT, dwivediV0, dwivediNormPdf, zeroScatterSigmaT;
     Color rwColor, rwRadius;  // VolumeSubsurface's mScatteringColor and mScatteringRadius (its material AOV properties)
     U32 resolveSelfIntersections;
+    // VolumeSubsurface's mCreaseAttenuation: over 0, the walk's first direction narrowed where the surface curves
+    // outward (PathIntegratorSubsurface, its zero-scatter rays out of creases).
+    float creaseAttenuation = 0.0f;
 };
 // VolumeSubsurface_init (Chiang et al., "Practical and Controllable Subsurface Scattering for Production Path
 // Tracing", with MoonRay's own albedo fit; the radius is taken in thirds).

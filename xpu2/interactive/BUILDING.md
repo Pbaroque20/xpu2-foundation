@@ -16,6 +16,8 @@ The builder reads an existing MoonRay Windows development tree supplied with `--
 
 The `--runtime` folder must match `reference-lock.json`, which pins 1,135 files from the tested Windows reference. The build fails closed if they differ. The lock and hashes are included, but those binaries are not. Do not weaken the verification or overwrite the lock to make a different runtime appear validated. An independently rebuilt reference requires a new, separately documented pin and all image/performance gates rerun. Reference build provenance is binary-pinned; a clean source-to-binary rebuild remains unverified.
 
+The reference is older than two of the kit's classes, so `build_session.py` takes these from the MoonRay build (`build/native-renderer-avx/bin`), outside the lock: `ToonDisplayFilter` and its proxy, and the proxy of `ModoProceduralMap`, without which a scene holding one does not load. A class the kit adds later needs the same, or scenes with it go to MoonRay XPU with "was never declared".
+
 ## Build the renderer and its session
 
 From the repository root, substitute your actual development-tree and pinned-runtime locations. Every output directory must be new. The steps after these (compiling the GPU programs, packaging) are in [the manual, section 14](../manual/README.md#14-building-and-running).

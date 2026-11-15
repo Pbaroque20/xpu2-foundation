@@ -1,10 +1,13 @@
-"""Make the private XPU2 test kit: the installed MoonRay for Modo kit (0.4.3.1) with XPU2 beside MoonRay XPU.
+"""Retired 2026-10-30: XPU2 is part of the standard kit since 0.5 (kit/MoonRayForModo), packaged by
+tools/package_development_release.py. Kept as a record; what follows says what this script did.
+
+Make the private XPU2 test kit: the installed MoonRay for Modo kit (0.4.3.1) with XPU2 beside MoonRay XPU.
 
     python build_xpu2_kit.py --session <xpu2-session-N folder> [--base <kit folder>]
 
 Writes MoonRayForModo/ next to this script (replacing an earlier one): the base kit, its runtime untouched, plus
 runtime-xpu2/ (XPU2's own runtime from the session build) and these changes:
-  - Preferences > MoonRay > XPU2 (experimental): GPU renderer MoonRay XPU / XPU2, XPU2's adaptive passes on the
+  - Preferences > MoonRay > XPU2: GPU renderer MoonRay XPU / XPU2, XPU2's adaptive passes on the
     graphics card, Compile XPU2 Shaders and the shaders' state;
   - the preview session starts XPU2 in MoonRay's place where it is chosen and the render's execution mode is XPU
     or Auto, and starts MoonRay instead where XPU2 says it does not render the scene (@@MODO_XPU2 FALLBACK) or ends
@@ -20,7 +23,7 @@ import os
 HERE = Path(__file__).resolve().parent
 KIT = HERE / 'MoonRayForModo'
 INSTALLED = Path(os.environ['APPDATA']) / 'Luxology' / 'Kits' / 'MoonRayForModo'
-MARKERS = ('XPU-PLUS-EXPERIMENTAL.txt', 'XPU2-EXPERIMENTAL.txt')
+MARKERS = ('XPU-PLUS-EXPERIMENTAL.txt', 'XPU2-EXPERIMENTAL.txt', 'XPU2-README.txt')
 
 
 class Patch:
@@ -42,7 +45,7 @@ class Patch:
 
 NATIVE = '''
 
-# XPU2, the private test build: its own runtime beside the kit's, chosen in Preferences > MoonRay > XPU2.
+# XPU2: its own runtime beside the kit's, chosen in Preferences > MoonRay > XPU2.
 def xpu2_runtime():
     """XPU2's runtime: its preview session (moonray_xpu2.exe), GPU programs and the libraries it was built with."""
     return Path(__file__).resolve().parents[2] / 'runtime-xpu2'
@@ -128,7 +131,7 @@ XPU2_NOT_COMPILED = ("Render unavailable: MoonRay XPU2's shaders not compiled. "
                      "System > Preferences > MoonRay > XPU2 > Compile XPU2 Shaders.")
 '''
 
-COMMANDS = '''"""XPU2, the private test build: compiling its GPU programs into OptiX's cache, and what state they are in."""
+COMMANDS = '''"""XPU2: compiling its GPU programs into OptiX's cache, and what state they are in."""
 import os
 import sys
 package_root = os.path.join(os.path.dirname(os.path.dirname(__file__)), "python")
@@ -337,20 +340,20 @@ lx.bless(ShaderState, 'moonray.xpu2.shaderState')
 '''
 
 SHEET_ENTRY = '''      <list type="Control" val="sub MoonRayXPU2:sheet">
-        <atom type="Label">XPU2 (experimental)</atom>
+        <atom type="Label">XPU2</atom>
         <atom type="ShowLabel">1</atom>
         <atom type="StartCollapsed">0</atom>
         <atom type="Hash">MoonRayXPU2:sheet</atom>
       </list>
 '''
 
-SHEET = '''    <!-- XPU2, the private test build: an asynchronous CPU and GPU renderer in MoonRay XPU's place for previews. -->
+SHEET = '''    <!-- XPU2: an asynchronous CPU and GPU renderer in MoonRay XPU's place for previews. -->
     <hash type="Sheet" key="MoonRayXPU2:sheet">
-      <atom type="Label">XPU2 (experimental)</atom>
+      <atom type="Label">XPU2</atom>
       <atom type="Layout">properties</atom>
       <list type="Control" val="cmd moonray.pref.xpu2 ?">
         <atom type="Label">GPU renderer</atom>
-        <atom type="Tooltip">What renders the preview when its execution mode is XPU or Auto. MoonRay XPU, as before; or XPU2, the experimental asynchronous renderer: the processor and the graphics card each take their own work from one grid. A scene XPU2 does not render yet (see the Render Log) is rendered by MoonRay XPU instead. A running preview restarts with the change</atom>
+        <atom type="Tooltip">What renders the preview when its execution mode is XPU or Auto. MoonRay XPU, as before; or XPU2, the asynchronous renderer: the processor and the graphics card each take their own work from one grid. A scene XPU2 does not render yet (see the Render Log) is rendered by MoonRay XPU instead. A running preview restarts with the change</atom>
       </list>
       <list type="Control" val="cmd moonray.pref.xpu2Devices ?">
         <atom type="Label">Devices</atom>
@@ -374,17 +377,17 @@ SHEET = '''    <!-- XPU2, the private test build: an asynchronous CPU and GPU re
     </hash>
 '''
 
-README = '''MoonRay for Modo {version} with XPU2 (experimental, private build - do not share)
+README = '''MoonRay for Modo {version} with XPU2
 
-XPU2 is an experimental renderer for MoonRay previews: MoonRay's path tracer and shader library ported to an
+XPU2 is a renderer for MoonRay previews: MoonRay's path tracer and shader library ported to an
 asynchronous design, where the processor and the graphics card each take their own work from one grid. It is not
 affiliated with or endorsed by DreamWorks Animation.
 
 It is the GPU renderer by default: System > Preferences > MoonRay > XPU2 > GPU renderer (MoonRay XPU or XPU2).
 It renders the preview when the render's execution mode is XPU or Auto. Final renders, MoonRay LS and MoonLightIPR
 are MoonRay's as before. XPU2 previews render the buffers the preview asks for (beauty, alpha and the AOVs) and are
-denoised as MoonRay's are: the Denoiser, Smart Render and Safe Denoising work with it. Continue after a Safe
-Denoising stop is MoonRay's still.
+denoised as MoonRay's are. Smart Render and Safe Denoising are MoonRay's: XPU2 is quick enough to need neither, and they
+are greyed while it renders the preview.
 
 First, once: Compile XPU2 Shaders on the same page (in the background; Modo stays usable, and the page shows how far
 it has come and about how long is left). Until the shaders are compiled, XPU2 does not render: the preview says so.
@@ -511,7 +514,7 @@ def generations(kit):
     p = Patch(py / 'scene_settings.py')
     p.rep("""    'denoising': {'engine': 'off', 'preview': True, 'final': True, 'safe': False, 'smart': 'off', 'detail': 'some'},""",
           """    'denoising': {'engine': 'off', 'preview': True, 'final': True, 'safe': False, 'smart': 'off', 'detail': 'some'},
-    # XPU2's sampling generations (the private test build): 16 samples a pixel on average and a noise target of 10 by
+    # XPU2's sampling generations: 16 samples a pixel on average and a noise target of 10 by
     # default; the rest are what XPU2 does without them.
     'xpu2_generations': {'on': True, 'samples': 16, 'spend': 'time', 'noise': 10.0, 'seed': 4, 'most': 0, 'cpu': True, 'realtime': 100},""")
     p.rep("""key in ('recovery', 'denoising', 'deep', 'exr')""", """key in ('recovery', 'denoising', 'deep', 'exr', 'xpu2_generations')""")
@@ -528,11 +531,11 @@ def generations(kit):
     p.save()
     p = Patch(py / 'scene_setup.py')
     p.rep("""    scene['execution_mode'] = values['execution_mode']""", """    scene['execution_mode'] = values['execution_mode']
-    # XPU2's sampling generations (the private test build), written into a preview's scene for XPU2 (rdla.py).
+    # XPU2's sampling generations, written into a preview's scene for XPU2 (rdla.py).
     scene['xpu2_generations'] = values['xpu2_generations']""")
     p.save()
     p = Patch(py / 'rdla.py')
-    p.rep("""    if safe and safe.get('data'):""", """    # XPU2's sampling generations (the private test build): its render settings in a preview, as a UserData that XPU2
+    p.rep("""    if safe and safe.get('data'):""", """    # XPU2's sampling generations: its render settings in a preview, as a UserData that XPU2
     # reads (cpu_scene.h: 1, on, samples, spend exactly, noise target, first generation, most samples, CPU workers,
     # realtime: the preview following the scene with RT on, panel.py) and MoonRay leaves alone.
     generation=scene.get('xpu2_generations')
@@ -554,7 +557,7 @@ def generations(kit):
     # ones; final renders, MoonRay's, still use them).
     p.rep("""            def basic_Enable(self,msg):
 """, """            def basic_Enable(self,msg):
-                # XPU2's sampling generations (the private test build): on, MoonRay's own sampling settings are greyed
+                # XPU2's sampling generations: on, MoonRay's own sampling settings are greyed
                 # (XPU2 previews use the XPU2 ones; final renders, MoonRay's, still use them).
                 if entry['key'] in ('sampling_mode','samples','min_adaptive_samples','max_adaptive_samples','target_adaptive_error'):
                     try:
@@ -564,7 +567,7 @@ def generations(kit):
     # Generation Samples left at 0 shows what XPU2 takes then: a uniform scene's Pixel Samples, squared.
     p.rep("""                value=scene_settings.get(scene_settings.complete(properties.scene_settings()),entry)
 """, """                value=scene_settings.get(scene_settings.complete(properties.scene_settings()),entry)
-                # Generation Samples left at 0 (the private test build): what XPU2 takes then, a uniform scene's Pixel Samples
+                # Generation Samples left at 0: what XPU2 takes then, a uniform scene's Pixel Samples
                 # squared, Pixel Samples itself being greyed while generations are on.
                 if entry['key']=='xpu2_samples' and not value:
                     try:
@@ -607,9 +610,9 @@ def realtime(kit):
     p = Patch(kit / 'python' / 'moonray_modo' / 'panel.py')
     p.rep("""        self.ipr_mode.setChecked(self._live())
         row.addWidget(self.preview_engine)
-""", """        # Realtime is off as the window opens: its switch, RT, turns it on (the private test build).
+""", """        # Realtime is off as the window opens: its switch, RT, turns it on.
         self.ipr_mode.setChecked(False)
-        # Realtime (the private test build): a switch of its own left of the engine, the Render button rendering once.
+        # Realtime: a switch of its own left of the engine, the Render button rendering once.
         # On, the preview follows the scene as it is edited: MoonLightIPR, or MoonRay where XPU2 renders the preview.
         # Each is greyed while the other is in use: Render while RT is on, RT while a render runs or stops.
         self.rt=QtWidgets.QPushButton('RT Off');self.rt.setCheckable(True)
@@ -621,7 +624,7 @@ def realtime(kit):
     p.rep("""    def _live(self):
         \"\"\"Whether the engine chosen is the realtime one, which follows the scene as it is edited.\"\"\"""",
           """    def _rt_capable(self):
-        \"\"\"Whether the engine chosen can follow the scene in realtime (the private test build): MoonLightIPR, or MoonRay
+        \"\"\"Whether the engine chosen can follow the scene in realtime: MoonLightIPR, or MoonRay
         where XPU2 renders the preview (Preferences > MoonRay > XPU2).\"\"\"
         engine=self.preview_engine.currentData()
         if engine=='moonlightipr':return True
@@ -687,7 +690,7 @@ def realtime(kit):
     p.rep("""        if self._live():
             # A realtime engine is switched on and off, not started and stopped.""", """        self._sync_rt()
         if self.ipr_mode.isChecked():
-            # Realtime is on (the private test build): this button is greyed, and RT Off gives it back.
+            # Realtime is on: this button is greyed, and RT Off gives it back.
             self.start.setChecked(False);self.start.setCheckable(False)
             self.start.setEnabled(False);self.start.setText('Render')
             self.start.setToolTip('Realtime is on. Switch RT off to render once.')
@@ -699,7 +702,7 @@ def realtime(kit):
             self.start.setToolTip('MoonLightIPR renders in realtime: switch RT on.')
             return
         if False:
-            # (The private test build: realtime has its switch, RT, left of the engine; this button renders once.)
+            # (Realtime has its switch, RT, left of the engine; this button renders once.)
             # A realtime engine is switched on and off, not started and stopped.""")
     # A preview that follows the scene with MoonRay is XPU2's realtime: its scene says so.
     p.rep("""        if engine=='moonray':scene=dict(scene,_pixel_samples=int(grid)**2)
@@ -753,7 +756,7 @@ def realtime(kit):
 def denoised_buffer(kit):
     p = Patch(kit / 'python' / 'moonray_modo' / 'scene_settings.py')
     p.rep("""    'denoising': {'engine': 'off', 'preview': True,""",
-          """    # OptiX unless the scene chooses: the graphics card's denoiser, the quickest (the private test build).
+          """    # OptiX unless the scene chooses: the graphics card's denoiser, the quickest.
     'denoising': {'engine': 'optix', 'preview': True,""")
     p.save()
     p = Patch(kit / 'python' / 'moonray_modo' / 'panel.py')
@@ -811,11 +814,11 @@ def engines(kit):
         if self.disposed:return
 """, """        \"\"\"Follow the scene's settings, which are edited in Modo's properties, not here.\"\"\"
         if self.disposed:return
-        # And the engines Preferences > MoonRay > XPU2 allows (the private test build).
+        # And the engines Preferences > MoonRay > XPU2 allows.
         self._sync_engines()
 """)
     p.rep("""    def _rt_capable(self):""", """    def _sync_engines(self):
-        \"\"\"The engines in the list, as Preferences > MoonRay > XPU2 has it (the private test build): with XPU2, MoonRay and
+        \"\"\"The engines in the list, as Preferences > MoonRay > XPU2 has it: with XPU2, MoonRay and
         MoonLightIPR; with XPU, MoonRay LS between them. MoonRay LS chosen as XPU2 comes on becomes MoonRay, an engine
         changed as any other; the list otherwise changes without changing the engine chosen.\"\"\"
         try:
@@ -1043,7 +1046,7 @@ def xpu2_smart_render(kit):
     p = Patch(kit / 'lxserv' / 'moonray_render_settings.py')
     p.rep("""                if entry['key'] in NEEDS_DENOISER:
                     try:return scene_settings.complete(properties.scene_settings())['denoising'].get('engine','off')!='off'""",
-          """                # Smart Render is MoonRay's: greyed while XPU2 renders the preview (the private test build).
+          """                # Smart Render is MoonRay's: greyed while XPU2 renders the preview.
                 if entry['key']=='smart_render':
                     try:
                         from moonray_modo import native
@@ -1054,12 +1057,12 @@ def xpu2_smart_render(kit):
     p.save()
     p = Patch(kit / 'python' / 'moonray_modo' / 'render.py')
     p.rep("""            if level!='off' and not self.active['output'] and not self.active['moonlightipr'] and not self.active.get('linear_preview') and not self.active['snapshot'].get('_ipr'):""",
-          """            # Not while XPU2 renders the preview (the private test build): Smart Render is MoonRay's.
+          """            # Not while XPU2 renders the preview: Smart Render is MoonRay's.
             if level!='off' and not self.active['output'] and not self.active['moonlightipr'] and not self.active.get('linear_preview') and not self.active['snapshot'].get('_ipr') and not native.xpu2():""")
     p.save()
     p = Patch(kit / 'python' / 'moonray_modo' / 'panel.py')
     p.rep("""        menu.addMenu(smart);self._smart_menu=smart""",
-          """        # Smart Render is MoonRay's: greyed while XPU2 renders the preview (the private test build).
+          """        # Smart Render is MoonRay's: greyed while XPU2 renders the preview.
         try:
             from . import native
             if native.xpu2():smart.setEnabled(False);smart.setToolTip("Smart Render is MoonRay's; XPU2 renders the preview.")
@@ -1208,13 +1211,13 @@ def xpu2_sampling_words(kit):
     p = Patch(kit / 'lxserv' / 'moonray_render_settings.py')
     p.rep("""                    try:return bool(scene_settings.complete(properties.scene_settings())['xpu2_generations'].get('on',True))
                     except Exception:return True""", """                    return True""")
-    p.rep("""                # XPU2's sampling generations (the private test build): on, MoonRay's own sampling settings are greyed
+    p.rep("""                # XPU2's sampling generations: on, MoonRay's own sampling settings are greyed
                 # (XPU2 previews use the XPU2 ones; final renders, MoonRay's, still use them).
                 if entry['key'] in ('sampling_mode','samples','min_adaptive_samples','max_adaptive_samples','target_adaptive_error'):
                     try:
                         if scene_settings.complete(properties.scene_settings())['xpu2_generations'].get('on',True):return False
                     except Exception:pass
-""", """                # XPU2 renders the preview (the private test build): its sampling generations are on, their switch is
+""", """                # XPU2 renders the preview: its sampling generations are on, their switch is
                 # greyed, and so are MoonRay's own sampling settings, which show what XPU2 takes (xpu2_sampling), and
                 # what XPU2 does not read at all (cpu_scene.h): MoonRay's buckets and their order, and two sampling
                 # switches of MoonRay's own. Final renders, MoonRay's, still use them all.
@@ -1542,7 +1545,7 @@ def preference_pages(kit):
     pages = (('renderer', 'Renderer', 'MoonRayRendererPage:sheet', 'MoonRayRenderer:sheet', 'Renderer', '80.61'),
              ('xpu', 'XPU', 'MoonRayXPUPage:sheet', 'MoonRayXPU:sheet', 'XPU (graphics card)', '80.62'),
              ('overrides', 'Source Overrides', 'MoonRaySourceOverridesPage:sheet', 'MoonRaySourceOverrides:sheet', 'MoonRay Source Overrides', '80.63'),
-             ('xpu2', 'XPU2', 'MoonRayXPU2Page:sheet', 'MoonRayXPU2:sheet', 'XPU2 (experimental)', '80.64'))
+             ('xpu2', 'XPU2', 'MoonRayXPU2Page:sheet', 'MoonRayXPU2:sheet', 'XPU2', '80.64'))
     for hash_key in ('MoonRayRenderer:sheet', 'MoonRaySourceOverrides:sheet'):
         start = p.text.index('      <list type="Control" val="sub %s">' % hash_key)
         end = p.text.index('      </list>\n', start) + len('      </list>\n')
@@ -2195,7 +2198,7 @@ def build(session, base):
 
     p = Patch(py / 'preferences.py')
     p.rep("""    'auto_xpu': (True, bool),""", """    'auto_xpu': (True, bool),
-    # XPU2, the private test build: what renders on the graphics card, and where its adaptive passes are made.
+    # XPU2: what renders on the graphics card, and where its adaptive passes are made.
     'xpu2/renderer': ('xpu2', str), 'xpu2/adaptive_chain': (False, bool), 'xpu2/devices': ('both', str), 'xpu2/upscale': (True, bool),""")
     p.save()
 
@@ -2211,7 +2214,7 @@ def build(session, base):
     p = Patch(py / 'persistent.py')
     p.rep("""        self.process.setProcessEnvironment(env);self.process.setWorkingDirectory(str(self.root))
         self.process.setProgram(str(request['runtime']/'moonray.exe'))""",
-          """        # XPU2 (the private test build) renders in MoonRay's place where it is chosen, the render's execution mode is
+          """        # XPU2 renders in MoonRay's place where it is chosen, the render's execution mode is
         # XPU or Auto, and XPU2 has not left this scene to MoonRay (@@MODO_XPU2 FALLBACK).
         program=request['runtime']/'moonray.exe'
         self.xpu2_active=bool(native.xpu2() and request['mode'] in ('xpu','auto') and not getattr(self,'xpu2_refused',None))
@@ -2263,7 +2266,7 @@ def build(session, base):
     p = Patch(py / 'render.py')
     p.rep("""        snapshot = dict(request['snapshot'],preview_buffer=self.buffer_key)
 """, """        snapshot = dict(request['snapshot'],preview_buffer=self.buffer_key)
-        # XPU2 (the private test build) renders it where it is chosen, the mode is XPU or Auto and it has not left this
+        # XPU2 renders it where it is chosen, the mode is XPU or Auto and it has not left this
         # session to MoonRay.
         snapshot['_xpu2']=bool(request.get('persistent') and mode in ('xpu','auto') and native.xpu2() and not getattr(self.session,'xpu2_refused',None))
 """)
@@ -2315,7 +2318,7 @@ def build(session, base):
     p = Patch(KIT / 'lxserv' / 'moonray_preferences.py')
     p.rep("""lx.bless(switch('auto_xpu'),'moonray.pref.autoXpu')""",
           """lx.bless(switch('auto_xpu'),'moonray.pref.autoXpu')
-lx.bless(choice('xpu2/renderer',(('xpu','MoonRay XPU'),('xpu2','XPU2 (experimental)'))),'moonray.pref.xpu2')
+lx.bless(choice('xpu2/renderer',(('xpu','MoonRay XPU'),('xpu2','XPU2'))),'moonray.pref.xpu2')
 lx.bless(switch('xpu2/adaptive_chain'),'moonray.pref.xpu2Chain')
 lx.bless(choice('xpu2/devices',(('both','Processor and graphics card'),('gpu','Graphics card only'),('cpu','Processor only'))),'moonray.pref.xpu2Devices')
 lx.bless(switch('xpu2/upscale'),'moonray.pref.xpu2Upscale')""")
@@ -2347,7 +2350,7 @@ lx.bless(switch('xpu2/upscale'),'moonray.pref.xpu2Upscale')""")
     for line in (KIT / 'index.cfg').read_text(encoding='utf-8').splitlines():
         if 'version="' in line:
             version = line.split('version="', 1)[1].split('"', 1)[0]
-    (KIT / 'XPU2-EXPERIMENTAL.txt').write_text(README.format(version=version), encoding='utf-8')
+    (KIT / 'XPU2-README.txt').write_text(README.format(version=version), encoding='utf-8')
     manifest = {'built': time.strftime('%Y-%m-%d %H:%M:%S'), 'base': str(base), 'session': str(session),
                 'runtime_xpu2': json.loads((KIT / 'runtime-xpu2' / 'xpu2-runtime.json').read_text(encoding='utf-8'))}
     (HERE / 'kit-build.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')

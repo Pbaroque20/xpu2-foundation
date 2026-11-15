@@ -101,6 +101,9 @@ struct GridOptions {
     // A uniform frame's progressive order: ranges of 1, 1, 2, then samplesPerChunk samples, and the frontier (false:
     // ranges of samplesPerChunk, handed out as they come).
     bool progressive = true;
+    // A share of a uniform frame (Rhizome, RHIZOME.md: a node's chunk): its sample indices [sampleFirst, sampleFirst +
+    // sampleCount) of the frame's spp, each pixel's samples the ones a whole frame gives it (0: all of them).
+    U32 sampleFirst = 0, sampleCount = 0;
 };
 
 class Grid {
@@ -138,12 +141,16 @@ public:
         cells_ = std::vector<Cell>(cellsX_ * cellsY_);
         if (owners && owners->size() != cells_.size()) owners = nullptr;
         // A uniform frame's sample ranges: growing ones first in the progressive order.
-        if (!empty)
-            for (U32 first = 0; first < spp;) {
-                const U32 size = !options.progressive ? options.samplesPerChunk : first < 2 ? 1u : first < 4 ? 2u : options.samplesPerChunk;
-                ranges_.push_back({first, std::min(size, spp - first)});
+        if (!empty) {
+            const U32 from = options.sampleCount ? options.sampleFirst : 0u,
+                      to = options.sampleCount ? std::min(spp, options.sampleFirst + options.sampleCount) : spp;
+            for (U32 first = from; first < to;) {
+                const U32 done = first - from;
+                const U32 size = !options.progressive ? options.samplesPerChunk : done < 2 ? 1u : done < 4 ? 2u : options.samplesPerChunk;
+                ranges_.push_back({first, std::min(size, to - first)});
                 first += ranges_.back().count;
             }
+        }
         for (U32 cy = 0; cy < cellsY_; ++cy)
             for (U32 cx = 0; cx < cellsX_; ++cx) {
                 Cell& cell = cells_[cy * cellsX_ + cx];

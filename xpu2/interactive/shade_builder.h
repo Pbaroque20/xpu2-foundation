@@ -874,6 +874,7 @@ struct RandomWalkProfile {
     V3 N;
     Color albedo, radius;
     bool resolveSelfIntersections;
+    float creaseAttenuation = 0.0f;
 };
 X2_CALL void addRandomWalk(Builder& me, const RandomWalkProfile& c, float weight, U32 behavior, U32 label) {
     if (!visible(me, weight, behavior) || lobeLimit(me)) return;
@@ -887,6 +888,7 @@ X2_CALL void addRandomWalk(Builder& me, const RandomWalkProfile& c, float weight
         return;
     }
     initRandomWalk(b, c.N, c.albedo, c.radius, c.resolveSelfIntersections);
+    b.creaseAttenuation = c.creaseAttenuation;
     b.label = encodeLabel(me, label);
     b.lightSet = me.lightSet;
     b.fresnel = NoIndex;

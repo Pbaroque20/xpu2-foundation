@@ -63,6 +63,13 @@ struct RenderOptions {
     bool important = true;
     // The GPU's cellular workers: shares of each launch, each in a cell of its own, moving by the cellular rules.
     unsigned gpuWorkers = 32;
+    // A share of the frame (Rhizome, RHIZOME.md: a node's chunk): the pixels of region (min x, min y, max x, max y, half open,
+    // within the sub viewport) and the sample indices [sampleFirst, sampleFirst + sampleCount) of the frame's spp,
+    // uniform whatever the scene's sampling (sampleCount 0: the whole frame, as the scene asks). The samples are those
+    // the whole frame gives each pixel, so the shares of a frame add up to it.
+    bool share = false;
+    int region[4] = {0, 0, 0, 0};
+    U32 sampleFirst = 0, sampleCount = 0;
 };
 
 // What a preview session asks of a frame, on the feeder's thread: whether to stop it (its samples are dropped,
@@ -114,6 +121,12 @@ struct RenderResult {
     // pixel's samples, sums, minima, maxima and the closest as they are; and the seconds each pixel took.
     std::vector<float> aov;
     std::vector<float> heat;
+    // A share of a frame (RenderOptions::share): its rows' pixels [shareFrom, shareTo), and their AOV accumulators as
+    // they stand before resolving (each output's channels, then its closest depths), for the films of a frame's
+    // shares to be merged by each output's filter and resolved once (Rhizome's master).
+    size_t shareFrom = 0, shareTo = 0;
+    std::vector<double> aovRaw;
+    std::vector<float> aovRawDepths;
     // Cryptomatte's fragments, finalized (aov_crypto.h), when an output asks for them.
     std::shared_ptr<aov::CryptoBuffer> crypto;
     // The display filter outputs' pixels by output name (aov_display.h), three floats a pixel, rows from the bottom.
@@ -263,12 +276,26 @@ public:
     // renderer of the session's next scene starts from its predecessor's.
     double deviceRatio() const { return deviceRatio_; }
     void deviceRatio(double r) { deviceRatio_ = r; }
+    // The AOV schema the films accumulate (aov_core.h).
+    const aov::Tables& aovTables() const { return cpuScene_.aovTables; }
+    // A whole frame's AOV accumulators made from its shares' (Rhizome's master: merged by each output's filter, as cards'
+    // films are, mergeAovPixel) resolved as a frame resolves its own: values a pixel, by the counts given.
+    void resolveMerged(const std::vector<double>& raw, const std::vector<float>& depths, const std::vector<U32>& counts, std::vector<float>& out) {
+        band_ = {0, size_t(plan_->width) * plan_->height};
+        resolveAovValues(cpuScene_.aovTables, raw.data(), depths.data(), nullptr, nullptr, counts, false, out);
+    }
 
     RenderResult render(const RenderOptions& o) {
         using Clock = std::chrono::steady_clock;
         RenderResult result;
         const auto config = mixed::config(plan_);
-        const bool adaptive = plan_->adaptive;
+        // A share of a frame is uniform: exactly its samples a pixel.
+        const bool share = o.share && o.sampleCount > 0;
+        const bool adaptive = plan_->adaptive && !share;
+        int shareView[4];
+        if (share)
+            for (int k = 0; k < 4; ++k) shareView[k] = k < 2 ? std::max(o.region[k], plan_->viewport[k]) : std::min(o.region[k], plan_->viewport[k]);
+        const int* frameView = share ? shareView : plan_->viewport;
         // In an adaptive frame with a GPU, the CPU rebuilds the error trees and the
         // GPU takes every sample: the chain of passes, each waiting on the trees,
         // bounds the frame, and a CPU chunk would sit on that chain.
@@ -284,6 +311,7 @@ public:
         cpu::need(!useGpu || gpu_, "GPU lane required");
         GridOptions gridOptions = o.grid;
         gridOptions.mode = useCpu ? (useGpu ? 2 : 0) : 1;
+        if (share) gridOptions.sampleFirst = o.sampleFirst, gridOptions.sampleCount = o.sampleCount;
         // Ownership carried over from earlier frames of the same grid (GRD-03).
         const U32 cells = ((plan_->width + gridOptions.cellSize - 1) / gridOptions.cellSize) *
                           ((plan_->height + gridOptions.cellSize - 1) / gridOptions.cellSize);
@@ -301,13 +329,31 @@ public:
                 result.seedSeconds = seeded.seconds;
             }
         }
-        Grid grid(plan_->width, plan_->height, plan_->spp, gridOptions, owners, adaptive, plan_->viewport);
+        Grid grid(plan_->width, plan_->height, plan_->spp, gridOptions, owners, adaptive, frameView);
         // The indexer's probabilities, kept for the later frames of the same grid.
         if (seeded.gpuProbability.size() == cells) suitability_ = seeded.gpuProbability;
         grid.setSuitability(suitability_);
-        HostFilm film(plan_->width, plan_->height);
-        film.initAovs(cpuScene_.aovTables, plan_->aovs && plan_->aovs->heatMap);
-        film.initCrypto(plan_->aovs.get());
+        // The film's rows the frame writes: a share's region's (its film kept from share to share, only those rows
+        // emptied; the card's film the same, GpuLane::filmRows), else every row.
+        const U32 rowFirst = share ? U32(std::max(0, frameView[1])) : 0u,
+                  rowEnd = share ? U32(std::min<int>(frameView[3], int(plan_->height))) : plan_->height;
+        band_ = {size_t(rowFirst) * plan_->width, size_t(std::max(rowEnd, rowFirst)) * plan_->width};
+        if (gpu_) gpu_->filmRows(share ? rowFirst : 0u, share ? rowEnd : ~0u);
+        std::unique_ptr<HostFilm> ownFilm;
+        if (share) {
+            if (!shareFilm_) {
+                shareFilm_ = std::make_unique<HostFilm>(plan_->width, plan_->height);
+                shareFilm_->initAovs(cpuScene_.aovTables, plan_->aovs && plan_->aovs->heatMap);
+            }
+            shareFilm_->clearRows(rowFirst, rowEnd);
+            // Cryptomatte's fragments anew each share: the last share's went out with its result (moved, as sums).
+            shareFilm_->initCrypto(plan_->aovs.get());
+        } else {
+            ownFilm = std::make_unique<HostFilm>(plan_->width, plan_->height);
+            ownFilm->initAovs(cpuScene_.aovTables, plan_->aovs && plan_->aovs->heatMap);
+            ownFilm->initCrypto(plan_->aovs.get());
+        }
+        HostFilm& film = share ? *shareFilm_ : *ownFilm;
         RetryQueue retries;
         RefineQueue refines;
         const U32 itemsPerChunk = gridOptions.samplesPerChunk * TilePixels;
@@ -836,7 +882,8 @@ public:
         result.rgba.resize(pixels * 4);
         result.counts.resize(pixels);
         const bool aux = plan_->aovs && (plan_->aovs->beautyAux || plan_->aovs->alphaAux);
-        if (adaptive || aux) result.odd.resize(pixels * 4);
+        // A share of an adaptive frame too: whoever adds the shares (Rhizome's master) works out the error from them.
+        if (adaptive || aux || (share && plan_->adaptive)) result.odd.resize(pixels * 4);
         const auto& hs = film.sums();
         const auto& hc = film.counts();
         U64 planned = 0;
@@ -844,8 +891,9 @@ public:
         // camera's texels no face covers) leaves a pixel fewer samples than planned, none at all where it never makes
         // one; pixels outside the sub viewport take none.
         const bool dropsRays = plan_->camera.type == surface::CameraFisheye || plan_->camera.type == surface::CameraBake;
-        const int* view = plan_->viewport;
-        for (size_t i = 0; i < pixels; ++i) {
+        const int* view = frameView;
+        result.shareFrom = band_.first, result.shareTo = band_.second;
+        for (size_t i = band_.first; i < band_.second; ++i) {
             double provisional[4] = {0, 0, 0, 0};
             const U32 left = partial ? film.provisional(i, gpu_->provSums(), gpu_->provCounts(), provisional) : 0u;
             if (left && !drained) {
@@ -856,8 +904,11 @@ public:
             const U32 gc = (useGpu ? gpu_->counts()[i] : 0) + left, count = hc[i] + gc;
             const int px = int(i % plan_->width), py = int(i / plan_->width);
             const bool inView = px >= view[0] && py >= view[1] && px < view[2] && py < view[3];
-            const U32 expected = !inView ? 0u : !adaptive ? (plan_->pixelSamples.empty() ? plan_->spp : plan_->pixelSamples[i])
-                                 : state.chain ? gpu_->chainPlanned()[i] : state.planned[i];
+            const U32 pixelSpp = plan_->pixelSamples.empty() ? plan_->spp : plan_->pixelSamples[i];
+            const U32 shareSpp = !share ? pixelSpp
+                                 : pixelSpp <= o.sampleFirst ? 0u
+                                                             : std::min(o.sampleCount, pixelSpp - o.sampleFirst);
+            const U32 expected = !inView ? 0u : !adaptive ? shareSpp : state.chain ? gpu_->chainPlanned()[i] : state.planned[i];
             result.counts[i] = count;
             planned += expected;
             // A drained frame has what it got: the mean of its samples, black where none landed.
@@ -911,7 +962,7 @@ public:
         result.treeSeconds = state.treeSeconds;
         result.passes = state.trace;
         result.errorSeconds = state.errorSeconds;
-        result.meanSamples = double(planned) / double(pixels);
+        result.meanSamples = double(planned) / double(std::max<size_t>(1, band_.second - band_.first));
         if (!drained) ownership_.finished(grid);
         return result;
     }
@@ -959,20 +1010,31 @@ private:
     }
     // The AOV accumulators (the host's, and the GPU's merged in) resolved as MoonRay's snapshots resolve them.
     void resolveAovValues(const aov::Tables& t, const double* hostAov, const float* hostDepths, const float* gpuAovs,
-                          const float* gpuDepths, const std::vector<U32>& counts, bool adaptive, std::vector<float>& out) const {
+                          const float* gpuDepths, const std::vector<U32>& counts, bool adaptive, std::vector<float>& out,
+                          RenderResult* raw = nullptr) const {
         const size_t pixels = size_t(plan_->width) * plan_->height;
         if (!t.channels) return;
         out.assign(pixels * t.channels, 0.0f);
+        if (raw) {
+            raw->aovRaw.assign((band_.second - band_.first) * t.channels, 0.0);
+            raw->aovRawDepths.assign((band_.second - band_.first) * t.closestCount, 0.0f);
+        }
         const unsigned consistent = adaptive ? std::max(2u, plan_->minSamples) : plan_->spp;
         std::vector<double> merged(t.channels);
         std::vector<float> depths(std::max<U32>(t.closestCount, 1));
-        for (size_t p = 0; p < pixels; ++p) {
+        for (size_t p = band_.first; p < band_.second; ++p) {
             const double* a = hostAov + p * t.channels;
+            const float* d = hostDepths + p * t.closestCount;
             if (gpuAovs) {
                 std::copy(a, a + t.channels, merged.begin());
                 for (U32 k = 0; k < t.closestCount; ++k) depths[k] = hostDepths[p * t.closestCount + k];
                 mergeAovPixel(t, merged.data(), depths.data(), gpuAovs + p * t.channels, gpuDepths ? gpuDepths + p * t.closestCount : depths.data());
                 a = merged.data();
+                d = depths.data();
+            }
+            if (raw) {
+                std::copy(a, a + t.channels, raw->aovRaw.begin() + (p - band_.first) * t.channels);
+                std::copy(d, d + t.closestCount, raw->aovRawDepths.begin() + (p - band_.first) * t.closestCount);
             }
             float* o = out.data() + p * t.channels;
             const double w = double(counts[p]);
@@ -1011,7 +1073,7 @@ private:
             const float* v = f->aovs();
             const float* d = f->aovDepths();
             if (!v) continue;
-            for (size_t p = 0; p < pixels; ++p) {
+            for (size_t p = band_.first; p < std::min(band_.second, pixels); ++p) {
                 for (U32 c = 0; c < t.channels; ++c) acc[c] = values[p * t.channels + c];
                 for (U32 k = 0; k < t.closestCount; ++k) near[k] = depths ? depths[p * t.closestCount + k] : 0.0f;
                 mergeAovPixel(t, acc.data(), near.data(), v + p * t.channels, d ? d + p * t.closestCount : near.data());
@@ -1024,16 +1086,17 @@ private:
         const aov::Tables& t = film.aovTables();
         const size_t pixels = size_t(plan_->width) * plan_->height;
         resolveAovValues(t, film.aovs().data(), film.aovDepths().data(), gpu ? gpu->aovs() : nullptr, gpu ? gpu->aovDepths() : nullptr,
-                         result.counts, adaptive, result.aov);
+                         result.counts, adaptive, result.aov, shareFilm_.get() == &film ? &result : nullptr);
         if (!film.crypto().empty()) {
             if (gpu) const_cast<GpuLane*>(gpu)->mergeCrypto(film.crypto());
             result.crypto = std::make_shared<aov::CryptoBuffer>(std::move(film.crypto()));
-            result.crypto->finalize(result.counts);
+            // A share's fragments stay sums: the shares of a frame are merged (Rhizome's master), then finalized once.
+            if (shareFilm_.get() != &film) result.crypto->finalize(result.counts);
         }
         if (!film.heat().empty()) {
             result.heat.resize(pixels);
             const double* gpuHeat = gpu ? gpu->heat() : nullptr;
-            for (size_t p = 0; p < pixels; ++p) result.heat[p] = float(film.heat()[p] + (gpuHeat ? gpuHeat[p] : 0.0));
+            for (size_t p = band_.first; p < band_.second; ++p) result.heat[p] = float(film.heat()[p] + (gpuHeat ? gpuHeat[p] : 0.0));
         }
     }
     // An adaptive frame's passes (async_adaptive.h). Passes below the minimum sample
@@ -1521,6 +1584,9 @@ private:
     const CpuScene& cpuScene_;
     GpuLane* gpu_;
     Ownership ownership_;
+    // A frame's film rows (pixels [first, second)): a share's region's, else every pixel. And a share's film, kept.
+    std::pair<size_t, size_t> band_{0, 0};
+    std::unique_ptr<HostFilm> shareFilm_;
     std::vector<float> suitability_;  // the indexer's probabilities of the grid's cells (device_suit.h), from its first frame
     double deviceRatio_ = 0;
     std::unique_ptr<CpuLane> cpu_;  // persistent workers (spec §4)

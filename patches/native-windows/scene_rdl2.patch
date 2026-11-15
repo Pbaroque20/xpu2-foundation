@@ -1327,6 +1327,67 @@ index a1979c9..dc78f69 100644
      if (className.empty()) {
          return false;
      }
+diff --git a/lib/scene/rdl2/DsoFinder.cc b/lib/scene/rdl2/DsoFinder.cc
+index badb0dc..2d6fda0 100644
+--- a/lib/scene/rdl2/DsoFinder.cc
++++ b/lib/scene/rdl2/DsoFinder.cc
+@@ -25,6 +25,34 @@ static const std::string sOsPathSep(":");
+ 
+ using util::Args;
+ 
++// Modo: PATH entries that are not folders passed over (tools/port_dso_search.py).
++static bool
++modoDsoSearch()
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_DSO_SEARCH");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++
++// Modo: whether a readable folder holds a file of this whole name, without throwing.
++static bool
++modoFolderHolds(const std::filesystem::path &folder, const std::string &name)
++{
++    std::error_code error;
++    if (!std::filesystem::is_directory(folder, error)) {
++        return false;
++    }
++    std::filesystem::directory_iterator entry(folder, std::filesystem::directory_options::skip_permission_denied, error);
++    for (; !error && entry != std::filesystem::directory_iterator(); entry.increment(error)) {
++        if (entry->path().filename().string() == name) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ std::string
+ DsoFinder::guessDsoPath()
+ {
+@@ -41,7 +69,9 @@ DsoFinder::guessDsoPath()
+     if (found == std::string::npos) { // single path
+         path = std::filesystem::path(pathEnv).make_preferred();
+ 
+-        if (std::filesystem::exists(path)) {
++        if (modoDsoSearch()) {
++            pathFound = modoFolderHolds(path, sRaasRender);
++        } else if (std::filesystem::exists(path)) {
+             for (auto const& dirEntry : std::filesystem::directory_iterator(path)) {
+                 if (dirEntry.path().filename().string() == sRaasRender) {
+                     pathFound = true;
+@@ -53,7 +83,9 @@ DsoFinder::guessDsoPath()
+         int counter = 0;
+         while (found != std::string::npos) {
+             path = std::filesystem::path(pathEnv.substr(counter, found - counter)).make_preferred();
+-            if (std::filesystem::exists(path)) {
++            if (modoDsoSearch()) {
++                pathFound = modoFolderHolds(path, sRaasRender);
++            } else if (std::filesystem::exists(path)) {
+                 for ( const auto & dirEntry : std::filesystem::directory_iterator(path)) {
+                     std::string file = dirEntry.path().stem().string();
+                     if (file == sRaasRender) {
 diff --git a/lib/scene/rdl2/ISPCSupport.h b/lib/scene/rdl2/ISPCSupport.h
 index ba431d1..baf5bc2 100644
 --- a/lib/scene/rdl2/ISPCSupport.h
@@ -1441,10 +1502,18 @@ index 442132d..d1e1ef7 100644
      static AttributeKey<Bool> sAttrCryptomatteOutputP0;
      static AttributeKey<Bool> sAttrCryptomatteOutputNormals;
 diff --git a/lib/scene/rdl2/SceneContext.cc b/lib/scene/rdl2/SceneContext.cc
-index c380cf4..c58f494 100644
+index c380cf4..542d72c 100644
 --- a/lib/scene/rdl2/SceneContext.cc
 +++ b/lib/scene/rdl2/SceneContext.cc
-@@ -790,7 +790,11 @@ SceneContext::loadAllSceneClasses()
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ 
++#include <cstdlib>
+ #include "SceneContext.h"
+ 
+ #include "Camera.h"
+@@ -790,10 +791,22 @@ SceneContext::loadAllSceneClasses()
      std::string remaining(getDsoPath());
      while (!remaining.empty()) {
          // Grab the next path entry.
@@ -1455,7 +1524,19 @@ index c380cf4..c58f494 100644
 +#endif
          std::string directory = remaining.substr(0, colonPos);
          std::filesystem::path p(directory);
-         if (std::filesystem::exists(p)) {
+-        if (std::filesystem::exists(p)) {
++        // Modo: an entry that is not a readable folder passed over (tools/port_dso_search.py).
++        static const bool modoDsoSearch = [] {
++            const char *value = std::getenv("MOONRAY_MODO_DSO_SEARCH");
++            return value && value[0] == '1';
++        }();
++        std::error_code modoError;
++        if (modoDsoSearch && !std::filesystem::is_directory(p, modoError)) {
++            // Nothing to read here.
++        } else if (std::filesystem::exists(p)) {
+             for (auto const& dirEntry : std::filesystem::directory_iterator(p)) {
+                 // If the file is a valid DSO, then create a SceneClass from it.
+                 if (Dso::isValidDso(dirEntry.path().string(), mProxyModeEnabled)) {
 diff --git a/lib/scene/rdl2/SceneObject.cc b/lib/scene/rdl2/SceneObject.cc
 index 4d57b80..1a7c18e 100644
 --- a/lib/scene/rdl2/SceneObject.cc

@@ -534,9 +534,7 @@ inline shade::DwaRecord admitDwa(const rdl::SceneObject& o, const DwaClass& c, M
     if (subsurface) {
         const int model = I(KSubsurface, 0);
         need(model >= 0 && model <= 2, o.getName() + ": invalid subsurface model");
-        // Random walk's crease attenuation needs the surface's principal curvatures (not ported).
-        need(model != 2 || (shade::isZero(F(KCreaseAttenuation, 0)) && !bound(KCreaseAttenuation)),
-             o.getName() + ": random-walk crease attenuation is not shaded yet");
+        // Random walk's crease attenuation is shaded (async_integrator.h randomWalkRadiance, shade::principalCurvatures).
         need(!obj(KSubsurfaceTraceSet), o.getName() + ": subsurface trace sets are not shaded yet");
         // MoonRay's subsurface takes the material's Input Normal at its entry and exit points when this is on
         // (PathIntegratorSubsurface: evalNormalFunc, DwaBase::resolveSubsurfaceNormal); with no normal map there that

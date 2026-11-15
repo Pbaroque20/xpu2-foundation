@@ -40,6 +40,13 @@ X2_HD inline V3& operator*=(V3& a, float b) { a = a * b; return a; }
 #endif
 // A lambda kept out of line: a large block of the path loop, which OptiX and GCC then optimize apart from the rest.
 #define X2_OUT_OF_LINE __attribute__((noinline))
+// A local array kept in memory on the card, not in registers, where it must live across the calls into the program's
+// other modules (direct callables): an empty statement that takes its address and may touch memory. No code on the host.
+#if defined(__CUDA_ARCH__)
+#define X2_IN_MEMORY(array) asm volatile("" : : "l"(&(array)[0]) : "memory")
+#else
+#define X2_IN_MEMORY(array) ((void)0)
+#endif
 namespace xpu2 { namespace interactive { namespace shade {
 using surface::V3;
 using sample::U32;
@@ -243,6 +250,31 @@ X2_HD inline bool computeNormalizedRefractionHalfVector(float iorWo, V3 wo, floa
 X2_HD inline V3 sampleLocalHemisphereCosine(float r1, float r2) {
     const float cosTheta = r1 > 1.0f ? 1.0f : sqrtf(r1), sinTheta = sqrtf(1.0f - r1);
     return localSpherical(cosTheta, sinTheta, r2 * TwoPi);
+}
+// shading/Util.h sampleLocalSphericalEllipticCapCosine: a cosine-weighted cap whose half-widths along x and y are
+// asin(sinThetaMax1) and asin(sinThetaMax2) (pdf cosTheta / (pi sinThetaMax1 sinThetaMax2)).
+X2_HD inline V3 sampleLocalSphericalEllipticCapCosine(float r1, float r2, float sinThetaMax1, float sinThetaMax2) {
+    float sinPhi, cosPhi;
+    sincosf2(r2 * TwoPi, &sinPhi, &cosPhi);
+    const float s = sqrtf(1.0f - r1);
+    V3 v;
+    v.x = s * sinThetaMax1 * cosPhi;
+    v.y = s * sinThetaMax2 * sinPhi;
+    v.z = sqrtf(1.0f - v.x * v.x - v.y * v.y);
+    return v;
+}
+// Intersection::computePrincipalCurvatures: from the first and second fundamental forms of the surface's St partials
+// (M the mean of its two estimates, as MoonRay takes it), the largest and least normal curvatures k1 and k2 and the
+// direction v1 of k1.
+X2_HD inline void principalCurvatures(V3 dPds, V3 dPdt, V3 dNds, V3 dNdt, float& k1, float& k2, V3& v1) {
+    const float E = dot(dPds, dPds), F = dot(dPds, dPdt), G = dot(dPdt, dPdt);
+    const float L = dot(dPds, dNds), M = 0.5f * (dot(dPds, dNdt) + dot(dPdt, dNds)), N = dot(dPdt, dNdt);
+    const float recip = 1.0f / (E * G - F * F);
+    const float K = recip * (L * N - M * M), H = recip * (0.5f * (E * N + G * L) - F * M);
+    const float S = sqrtf(H * H - K);
+    k1 = H + S;
+    k2 = H - S;
+    v1 = normalize(dPds * (N - k1 * G) - dPdt * (M - k1 * F));
 }
 X2_HD inline void localHemisphereCosineDifferentials(float r1, float r2, V3& dDdr1, V3& dDdr2) {
     const float c85 = cosf(deg2rad(85.0f)), minR1 = c85 * c85, maxR1 = 1.0f - minR1;

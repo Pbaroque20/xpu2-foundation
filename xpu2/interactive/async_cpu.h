@@ -1396,6 +1396,24 @@ public:
     const std::vector<double>& aovs() const { return aov_; }
     const std::vector<float>& aovDepths() const { return aovDepth_; }
     const std::vector<double>& heat() const { return heat_; }
+    // A film kept from frame to frame (a share of a frame, Rhizome): rows [first, end) emptied for the next share, the
+    // others left as they are. No worker may be adding.
+    void clearRows(U32 first, U32 end) {
+        end = std::min(end, height_);
+        if (first >= end) return;
+        const size_t a = size_t(first) * width_, e = size_t(end) * width_;
+        std::fill(sums_.begin() + a * 4, sums_.begin() + e * 4, 0.0);
+        std::fill(odd_.begin() + a * 4, odd_.begin() + e * 4, 0.0);
+        std::fill(counts_.begin() + a, counts_.begin() + e, 0u);
+        const U32 C = aovTables_.channels, K = aovTables_.closestCount;
+        if (C)
+            for (size_t p = a; p < e; ++p) initAovPixel(aovTables_, aov_.data() + p * C, aovDepth_.data() + p * K);
+        if (!heat_.empty()) std::fill(heat_.begin() + a, heat_.begin() + e, 0.0);
+        if (!settled_.empty()) {
+            std::fill(settled_.begin() + a * 4, settled_.begin() + e * 4, 0.0);
+            std::fill(settledCounts_.begin() + a, settledCounts_.begin() + e, 0u);
+        }
+    }
 
 private:
     struct Lock { std::atomic_flag flag = ATOMIC_FLAG_INIT; };

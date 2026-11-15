@@ -226,15 +226,43 @@ index c3c63b7..5b1c9cc 100644
  RDL2_DSO_ATTR_END
  
 diff --git a/dso/material/UsdPreviewSurface/UsdPreviewSurface.cc b/dso/material/UsdPreviewSurface/UsdPreviewSurface.cc
-index 598a705..224e4ab 100644
+index 598a705..6026e8b 100644
 --- a/dso/material/UsdPreviewSurface/UsdPreviewSurface.cc
 +++ b/dso/material/UsdPreviewSurface/UsdPreviewSurface.cc
-@@ -208,8 +208,14 @@ UsdPreviewSurface::shade(const scene_rdl2::rdl2::Material* self,
+@@ -9,9 +9,24 @@
+ 
+ #include <moonray/rendering/shading/MaterialApi.h>
+ 
++#include <cstdlib>
++
+ using namespace moonray::shading;
+ 
+ namespace {
++
++// Modo: UsdPreviewSurface's specular workflow reflects its specularColor (tools/port_source_switches.py). True when MoonRay was started with MOONRAY_MODO_USD_SPECULAR=1; read once.
++inline bool modoUsdSpecular()
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_USD_SPECULAR");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++
++// The vector code is told once, as the material's library loads.
++const bool sModoUsdSpecularSet = (ispc::UsdPreviewSurface_setModoSpecular(modoUsdSpecular()), true);
+ void
+ addMirrorDielectricLobe(BsdfBuilder& bsdfBuilder,
+                         const scene_rdl2::math::Vec3f& N,
+@@ -208,8 +223,18 @@ UsdPreviewSurface::shade(const scene_rdl2::rdl2::Material* self,
      const ispc::SpecularWorkflow specularWorkflow =
          static_cast<ispc::SpecularWorkflow>(me->get(attrUseSpecularWorkflow));
      if (specularWorkflow == ispc::SPECULAR_WORKFLOW_SPECULAR) {
 -        // We can't support this until we implement Schlick fresnel so do nothing for now.
 -        // Phase 2: implement Schlick which takes specular color directly
++        // Modo: with MOONRAY_MODO_USD_SPECULAR the specular colour is reflected by Schlick's Fresnel. Off, as
++        // MoonRay's source: we can't support this until we implement Schlick fresnel so do nothing for now.
++        if (modoUsdSpecular()) {
 +        const auto value = evalColor(me, attrSpecularColor, tls, state);
 +        const scene_rdl2::math::Color specular(
 +                scene_rdl2::math::saturate(value.r), scene_rdl2::math::saturate(value.g),
@@ -243,19 +271,38 @@ index 598a705..224e4ab 100644
 +            bsdfBuilder.addSchlickReflection(N, specular, roughness,
 +                                            scene_rdl2::math::isZero(roughness), aovSpecular);
 +        }
++        }
      } else { // SPECULAR_WORKFLOW_METALNESS
          const float metallic = evalFloat(me, attrMetallic, tls, state);
          if (scene_rdl2::math::isZero(metallic)) {
 diff --git a/dso/material/UsdPreviewSurface/UsdPreviewSurface.ispc b/dso/material/UsdPreviewSurface/UsdPreviewSurface.ispc
-index dc8c4c1..2b079bd 100644
+index dc8c4c1..25771c0 100644
 --- a/dso/material/UsdPreviewSurface/UsdPreviewSurface.ispc
 +++ b/dso/material/UsdPreviewSurface/UsdPreviewSurface.ispc
-@@ -182,8 +182,15 @@ shade(const uniform Material * uniform  me,
+@@ -10,6 +10,15 @@
+ 
+ #include <moonray/rendering/shading/ispc/MaterialApi.isph>
+ 
++// Modo: the specular workflow reflects its specularColor (MOONRAY_MODO_USD_SPECULAR, tools/port_source_switches.py).
++uniform bool gModoUsdSpecular = false;
++
++export void
++UsdPreviewSurface_setModoSpecular(uniform bool on)
++{
++    gModoUsdSpecular = on;
++}
++
+ void
+ addMirrorDielectricLobe(varying BsdfBuilder& bsdfBuilder,
+                         const varying Vec3f& N,
+@@ -182,8 +191,18 @@ shade(const uniform Material * uniform  me,
      // Specular
      const uniform SpecularWorkflow specularWorkflow = (SpecularWorkflow)getAttrUseSpecularWorkflow(me);
      if (specularWorkflow == SPECULAR_WORKFLOW_SPECULAR) {
 -        // We can't support this until we implement Schlick fresnel so do nothing for now.
 -        // Phase 2: implement Schlick which takes specular color directly
++        // Modo: off, as MoonRay's source: we can't support this until we implement Schlick fresnel so do nothing.
++        if (gModoUsdSpecular) {
 +        const Color value = evalAttrSpecularColor(me, tls, state);
 +        const Color specular = Color_ctor(saturate(value.r), saturate(value.g), saturate(value.b));
 +        if (!isBlack(specular)) {
@@ -264,6 +311,7 @@ index dc8c4c1..2b079bd 100644
 +            } else {
 +                BsdfBuilder_addSchlickReflection(bsdfBuilder, N, specular, roughness, false, aovSpecular);
 +            }
++        }
 +        }
      } else { // SPECULAR_WORKFLOW_METALNESS
          const float metallic = evalAttrMetallic(me, tls, state);
@@ -702,10 +750,39 @@ index 808dbdd..3814962 100644
      template<typename T> void
      computeVaryingAttributeDerivatives(shading::TypedAttributeKey<T> key,
 diff --git a/lib/rendering/geom/prim/OpenSubdivMesh.cc b/lib/rendering/geom/prim/OpenSubdivMesh.cc
-index 3f7e1a1..d8c6219 100644
+index 3f7e1a1..851de1f 100644
 --- a/lib/rendering/geom/prim/OpenSubdivMesh.cc
 +++ b/lib/rendering/geom/prim/OpenSubdivMesh.cc
-@@ -1541,7 +1541,7 @@ generatePatchCvs(const OpenSubdiv::Far::TopologyRefiner* refiner,
+@@ -5,6 +5,7 @@
+ /// @file OpenSubdivMesh.cc
+ ///
+ 
++#include <cstdlib>
+ #include "OpenSubdivMesh.h"
+ 
+ #include <moonray/rendering/geom/prim/GeomTLState.h>
+@@ -36,6 +37,20 @@
+ #include <limits>
+ #include <numeric>
+ 
++
++namespace {
++// Modo: a mesh its placement mirrors (tools/port_mirrored_meshes.py): its winding is turned over by the mirror, its own
++// normals are not. Only with MOONRAY_MODO_MIRRORED_MESHES=1.
++bool modoMirrored(const moonray::shading::XformSamples& xforms)
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_MIRRORED_MESHES");
++        return value && value[0] == '1';
++    }();
++    return on && !xforms.empty() && xforms[0].l.det() < 0.0f;
++}
++} // namespace
++
+ namespace moonray {
+ namespace geom {
+ namespace internal {
+@@ -1541,7 +1556,7 @@ generatePatchCvs(const OpenSubdiv::Far::TopologyRefiner* refiner,
                   std::vector<PatchCV>& patchCvs,
                   std::vector<TextureCV>& textureCvs,
                   bool requireUniformFix,
@@ -714,7 +791,7 @@ index 3f7e1a1..d8c6219 100644
  {
      // compute the total number of points we need to evaluate patchTable
      // we use local points around extraordinary features.
-@@ -1754,7 +1754,7 @@ evalLimitSurface(const OpenSubdiv::Far::PatchTable* patchTable,
+@@ -1754,7 +1769,7 @@ evalLimitSurface(const OpenSubdiv::Far::PatchTable* patchTable,
                   VertexBuffer<Vec3f, InterleavedTraits>& surfaceDpdt,
                   std::vector<DisplacementFootprint>& displacementFootprints,
                   bool& hasBadDerivatives, bool requireUniformFix,
@@ -723,7 +800,17 @@ index 3f7e1a1..d8c6219 100644
  {
      // allocate tessellated vertex/index buffer to hold the evaluation result
      size_t tessellatedVertexCount = limitSurfaceSamples.size();
-@@ -2905,10 +2905,10 @@ OpenSubdivMesh::bakePosMap(int width,
+@@ -2161,7 +2176,8 @@ OpenSubdivMesh::tessellate(const TessellationParams& tessellationParams,
+                                          {StandardAttributes::sdPdt, Vec3Type::VECTOR}});
+ 
+     // reverse normals reverses orientation and negates normals
+-    if (mIsNormalReversed) {
++    // Modo: so does a mirror, by its own (tools/port_mirrored_meshes.py); the two together cancel.
++    if (mIsNormalReversed != modoMirrored(mControlMeshData->mXforms)) {
+         reverseOrientation(mControlMeshData->mFaceVertexCount,
+                            mControlMeshData->mIndices,
+                            mAttributes);
+@@ -2905,10 +2921,10 @@ OpenSubdivMesh::bakePosMap(int width,
      const int faceVertexCount = 4; // tessellated mesh is always quads
      for (size_t faceId = 0; faceId < getTessellatedMeshFaceCount(); ++faceId) {
          // vertex ids of quad
@@ -738,7 +825,7 @@ index 3f7e1a1..d8c6219 100644
  
          // texture coordinates for this quad
          Vec2f st0, st1, st2, st3;
-@@ -3207,6 +3207,13 @@ OpenSubdivMesh::postIntersect(mcrt_common::ThreadLocalState& tls,
+@@ -3207,6 +3223,13 @@ OpenSubdivMesh::postIntersect(mcrt_common::ThreadLocalState& tls,
          }
      }
  
@@ -752,6 +839,71 @@ index 3f7e1a1..d8c6219 100644
      intersection.setDifferentialGeometry(Ng,
                                           N,
                                           St,
+diff --git a/lib/rendering/geom/prim/PolyMesh.cc b/lib/rendering/geom/prim/PolyMesh.cc
+index f542c19..49a8dbb 100644
+--- a/lib/rendering/geom/prim/PolyMesh.cc
++++ b/lib/rendering/geom/prim/PolyMesh.cc
+@@ -6,6 +6,7 @@
+ /// $Id$
+ ///
+ 
++#include <cstdlib>
+ #include "PolyMesh.h"
+ 
+ #include <moonray/rendering/geom/prim/GeomTLState.h>
+@@ -20,6 +21,20 @@
+ #include <moonray/rendering/geom/BakedAttribute.h>
+ #include <scene_rdl2/common/math/MathUtil.h>
+ 
++
++namespace {
++// Modo: a mesh its placement mirrors (tools/port_mirrored_meshes.py): its winding is turned over by the mirror, its own
++// normals are not. Only with MOONRAY_MODO_MIRRORED_MESHES=1.
++bool modoMirrored(const moonray::shading::XformSamples& xforms)
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_MIRRORED_MESHES");
++        return value && value[0] == '1';
++    }();
++    return on && !xforms.empty() && xforms[0].l.det() < 0.0f;
++}
++} // namespace
++
+ namespace moonray {
+ namespace geom {
+ namespace internal {
+@@ -168,6 +183,8 @@ PolyMesh::tessellate(const TessellationParams& tessellationParams,
+         mIsTessellated = false;
+     }
+ 
++    // Modo: whether the placement mirrors the mesh, asked before initAttributesAndDisplace lets its data go.
++    const bool modoMirror = modoMirrored(mPolyMeshData->mXforms);
+     initAttributesAndDisplace(pRdlLayer,
+                               baseFaceCount,
+                               baseVertexCount,
+@@ -177,7 +194,8 @@ PolyMesh::tessellate(const TessellationParams& tessellationParams,
+                               tessellationParams.mWorld2Render);
+ 
+     // reverse normals reverses orientation and negates normals
+-    if (mIsNormalReversed) {
++    // Modo: so does a mirror, by its own (tools/port_mirrored_meshes.py); the two together cancel.
++    if (mIsNormalReversed != modoMirror) {
+         size_t faceVertexCount = mIsTessellated ?
+                                  sQuadVertexCount :
+                                  baseFaceVertexCount;
+@@ -1015,6 +1033,12 @@ PolyMesh::initAttributesAndDisplace(const scene_rdl2::rdl2::Layer *pRdlLayer,
+         displaceMesh(pRdlLayer, world2render);
+     }
+ 
++    // Modo: smooth normals made from a mirrored mesh's faces turned over with them (its own do not); tessellate then
++    // reverses its orientation (tools/port_mirrored_meshes.py).
++    if (calculateSmoothNormal && modoMirrored(mPolyMeshData->mXforms)) {
++        getAttributes()->negateNormal();
++    }
++
+     // if it's not real time mode, we don't need the smooth normal utility
+     // after shading normal computation is done
+     if (!realtimeMode) {
 diff --git a/lib/rendering/geom/prim/PolyMeshCalcNv.cc b/lib/rendering/geom/prim/PolyMeshCalcNv.cc
 index f729162..a5d8f6f 100644
 --- a/lib/rendering/geom/prim/PolyMeshCalcNv.cc
@@ -1548,10 +1700,18 @@ index 2e41df1..d23180f 100644
  
  #define RAY_STATE_MEMBERS                                                   \
 diff --git a/lib/rendering/pbr/handlers/RayHandlers.cc b/lib/rendering/pbr/handlers/RayHandlers.cc
-index a031d6d..766cf93 100644
+index a031d6d..89e0f0d 100644
 --- a/lib/rendering/pbr/handlers/RayHandlers.cc
 +++ b/lib/rendering/pbr/handlers/RayHandlers.cc
-@@ -14,6 +14,7 @@
+@@ -3,6 +3,7 @@
+ 
+ //
+ //
++#include <cstdlib>
+ #include "RayHandlerUtils.h"
+ #include "RayHandlers.h"
+ 
+@@ -14,6 +15,7 @@
  #include <moonray/rendering/mcrt_common/ThreadLocalState.h>
  #include <moonray/rendering/pbr/core/PathVisualizer.h>
  #include <moonray/rendering/pbr/core/PbrTLState.h>
@@ -1559,7 +1719,7 @@ index a031d6d..766cf93 100644
  #include <moonray/rendering/pbr/core/RayState.h>
  #include <moonray/rendering/pbr/core/Scene.h>
  #include <moonray/rendering/pbr/integrator/PathIntegrator.h>
-@@ -367,6 +368,13 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
+@@ -367,6 +369,13 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
          rs.mVolTalpha = vt.mTransmittanceAlpha;
          rs.mVolTm = vt.mTransmittanceMin;
          rs.mVolumeSurfaceT = volumeSurfaceT;
@@ -1573,7 +1733,7 @@ index a031d6d..766cf93 100644
      }
  
      CHECK_CANCELLATION(pbrTls, return);
-@@ -481,7 +489,8 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
+@@ -481,7 +490,8 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
                      // We will add the radiance from the volume to the radiance
                      // queue and set the alpha based on the volume alpha.
                      const float alpha = ray.getDepth() == 0 ?
@@ -1583,7 +1743,23 @@ index a031d6d..766cf93 100644
                      BundledRadiance rad;
                      rad.mRadiance = RenderColor(rs.mVolRad.r, rs.mVolRad.g, rs.mVolRad.b, alpha);
                      rad.mPathPixelWeight = rs.mPathVertex.pathPixelWeight;
-@@ -605,6 +614,12 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
+@@ -554,6 +564,7 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
+                 // primary rays intersected any lights, so we can include their contribution if visible.
+ 
+                 const Light *hitLight = nullptr;
++                const Light *modoCameraLight = nullptr; // Modo: the light seen (tools/port_camera_light_lpe.py)
+                 if (rs->mRay.getDepth() == 0) {
+ 
+                     LightIntersection hitLightIsect;
+@@ -566,6 +577,7 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
+                     IntegratorSample1D lightChoiceSamples(sid);
+                     hitLight = fs.mScene->intersectVisibleLight(rs->mRay,
+                         sInfiniteLightDistance, lightChoiceSamples, hitLightIsect, numHits);
++                    modoCameraLight = hitLight;
+ 
+                     if (hitLight) {
+                         // Evaluate the radiance on the selected light in camera.
+@@ -605,6 +617,12 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
                      }
                  }
  
@@ -1596,6 +1772,21 @@ index a031d6d..766cf93 100644
                  // add in any volume radiance
                  radiance += rs->mVolRad;
  
+@@ -673,6 +691,14 @@ rayBundleHandler(mcrt_common::ThreadLocalState *tls, unsigned numEntries,
+                         // transition already computed in PathIntegratorBundled
+                         lpeStateId = rs->mPathVertex.lpeStateIdLight;
+                     }
++                    // Modo: what the two branches above lose as they end.
++                    static const bool modoCameraLightOn = [] {
++                        const char *value = std::getenv("MOONRAY_MODO_CAMERA_LIGHT_LPE");
++                        return value && value[0] == '1';
++                    }();
++                    if (modoCameraLightOn && modoCameraLight && rs->mPathVertex.lpeStateId >= 0) {
++                        lpeStateId = lightAovs.lightEventTransition(pbrTls, rs->mPathVertex.lpeStateId, modoCameraLight);
++                    }
+ 
+                     if (lpeStateId >= 0) {
+                         // accumulate results. As this has to do with directly hitting a light, we don't have
 diff --git a/lib/rendering/pbr/handlers/ShadeBundleHandler.cc b/lib/rendering/pbr/handlers/ShadeBundleHandler.cc
 index 0b0687c..a9ed134 100644
 --- a/lib/rendering/pbr/handlers/ShadeBundleHandler.cc
@@ -1665,10 +1856,18 @@ index 0b0687c..a9ed134 100644
                          // update cryptomatte info for current ray
                          cryptomatteData->mPresenceDepth = rs->mPathVertex.presenceDepth;
 diff --git a/lib/rendering/pbr/handlers/XPURayHandlers.cc b/lib/rendering/pbr/handlers/XPURayHandlers.cc
-index 1cc70f8..1b192c7 100644
+index 1cc70f8..8a090ad 100644
 --- a/lib/rendering/pbr/handlers/XPURayHandlers.cc
 +++ b/lib/rendering/pbr/handlers/XPURayHandlers.cc
-@@ -13,6 +13,7 @@
+@@ -1,6 +1,7 @@
+ // Copyright 2023-2024 DreamWorks Animation LLC
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <cstdlib>
+ #include "XPURayHandlers.h"
+ 
+ #include "RayHandlerUtils.h"
+@@ -13,6 +14,7 @@
  #include <moonray/rendering/mcrt_common/ProfileAccumulatorHandles.h>
  #include <moonray/rendering/mcrt_common/ThreadLocalState.h>
  #include <moonray/rendering/pbr/core/PbrTLState.h>
@@ -1676,7 +1875,7 @@ index 1cc70f8..1b192c7 100644
  #include <moonray/rendering/pbr/core/RayState.h>
  #include <moonray/rendering/pbr/integrator/PathIntegrator.h>
  #include <moonray/rendering/pbr/integrator/PathIntegratorUtil.h>
-@@ -365,6 +366,13 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
+@@ -365,6 +367,13 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
          rs.mVolTalpha = vt.mTransmittanceAlpha;
          rs.mVolTm = vt.mTransmittanceMin;
          rs.mVolumeSurfaceT = volumeSurfaceT;
@@ -1690,7 +1889,7 @@ index 1cc70f8..1b192c7 100644
      }
  
      CHECK_CANCELLATION(pbrTls, return);
-@@ -464,7 +472,8 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
+@@ -464,7 +473,8 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
                      // We will add the radiance from the volume to the radiance
                      // queue and set the alpha based on the volume alpha.
                      const float alpha = ray.getDepth() == 0 ?
@@ -1700,7 +1899,23 @@ index 1cc70f8..1b192c7 100644
                      BundledRadiance rad;
                      rad.mRadiance = RenderColor(rs.mVolRad.r, rs.mVolRad.g, rs.mVolRad.b, alpha);
                      rad.mPathPixelWeight = rs.mPathVertex.pathPixelWeight;
-@@ -588,6 +597,12 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
+@@ -537,6 +547,7 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
+                 // primary rays intersected any lights, so we can include their contribution if visible.
+ 
+                 const Light *hitLight = nullptr;
++                const Light *modoCameraLight = nullptr; // Modo: the light seen (tools/port_camera_light_lpe.py)
+                 if (rs->mRay.getDepth() == 0) {
+ 
+                     LightIntersection hitLightIsect;
+@@ -549,6 +560,7 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
+                     IntegratorSample1D lightChoiceSamples(sid);
+                     hitLight = fs.mScene->intersectVisibleLight(rs->mRay,
+                         sInfiniteLightDistance, lightChoiceSamples, hitLightIsect, numHits);
++                    modoCameraLight = hitLight;
+ 
+                     if (hitLight) {
+                         // Evaluate the radiance on the selected light in camera.
+@@ -588,6 +600,12 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
                      }
                  }
  
@@ -1713,6 +1928,21 @@ index 1cc70f8..1b192c7 100644
                  // add in any volume radiance
                  radiance += rs->mVolRad;
  
+@@ -656,6 +674,14 @@ xpuRayBundleHandler(mcrt_common::ThreadLocalState *tls,
+                         // transition already computed in PathIntegratorBundled
+                         lpeStateId = rs->mPathVertex.lpeStateIdLight;
+                     }
++                    // Modo: what the two branches above lose as they end.
++                    static const bool modoCameraLightOn = [] {
++                        const char *value = std::getenv("MOONRAY_MODO_CAMERA_LIGHT_LPE");
++                        return value && value[0] == '1';
++                    }();
++                    if (modoCameraLightOn && modoCameraLight && rs->mPathVertex.lpeStateId >= 0) {
++                        lpeStateId = lightAovs.lightEventTransition(pbrTls, rs->mPathVertex.lpeStateId, modoCameraLight);
++                    }
+ 
+                     if (lpeStateId >= 0) {
+                         // accumulate results. As this has to do with directly hitting a light, we don't have
 diff --git a/lib/rendering/pbr/integrator/PathIntegrator.cc b/lib/rendering/pbr/integrator/PathIntegrator.cc
 index 227c68e..8a2f078 100644
 --- a/lib/rendering/pbr/integrator/PathIntegrator.cc
@@ -2821,7 +3051,7 @@ index f88d871..6d33635 100644
  
      // Non-copyable
 diff --git a/lib/rendering/rndr/RenderContext.cc b/lib/rendering/rndr/RenderContext.cc
-index 0a864ad..7142b0e 100644
+index 0a864ad..7153b98 100644
 --- a/lib/rendering/rndr/RenderContext.cc
 +++ b/lib/rendering/rndr/RenderContext.cc
 @@ -1,3 +1,4 @@
@@ -2920,7 +3150,7 @@ index 0a864ad..7142b0e 100644
      // Determine if to render this frame in scalar, vectorized, or xpu mode.
      mExecutionMode = ExecutionMode::XPU;
      ExecutionMode desiredExecutionMode = mOptions.getDesiredExecutionMode();
-@@ -875,16 +902,10 @@ RenderContext::startFrame(const bool simulationMode)
+@@ -875,16 +902,28 @@ RenderContext::startFrame(const bool simulationMode)
              executionModeString += ".";
              mExecutionMode = ExecutionMode::SCALAR;
          } else {
@@ -2934,14 +3164,32 @@ index 0a864ad..7142b0e 100644
 -            // AUTO mode starts with vector mode
 -            executionModeString = "Executing a vectorized render since execution mode was set to auto.";
 -            mExecutionMode = ExecutionMode::VECTORIZED;
-+            // MoonRayForModo: Auto prioritizes feature support, then XPU > Vector > Scalar.
-+            executionModeString = "Executing an XPU render since execution mode was set to auto.";
-+            allowUnsupportedXPUFeatures = false;
-+            mExecutionMode = ExecutionMode::XPU;
++            // Modo: with MOONRAY_MODO_AUTO_XPU, Auto starts with XPU (upstream's own commented branch), falling back
++            // where the scene has what XPU does not support: XPU > Vector > Scalar. Off, as MoonRay's source.
++            static const bool modoAutoXpu = [] {
++                const char *value = std::getenv("MOONRAY_MODO_AUTO_XPU");
++                return value && value[0] == '1';
++            }();
++            if (modoAutoXpu) {
++                executionModeString = "Executing an XPU render since execution mode was set to auto.";
++                allowUnsupportedXPUFeatures = false; // want to fall back if unsupported
++                mExecutionMode = ExecutionMode::XPU;
++            } else {
++                // Uncomment the following to have AUTO mode start with XPU:
++                //   executionModeString = "Executing an XPU render since execution mode was set to auto.";
++                //   allowUnsupportedXPUFeatures = false; // want to fall back if unsupported
++                //   mExecutionMode = ExecutionMode::XPU;
++                // If there is an error setting up the GPU, we will fall back to vector mode
++                // in GeometryManager::updateGPUAccelerator().
++
++                // AUTO mode starts with vector mode
++                executionModeString = "Executing a vectorized render since execution mode was set to auto.";
++                mExecutionMode = ExecutionMode::VECTORIZED;
++            }
          }    
      }
  
-@@ -1227,6 +1248,14 @@ RenderContext::requestStopRenderAtPassBoundary()
+@@ -1227,6 +1266,14 @@ RenderContext::requestStopRenderAtPassBoundary()
      }
  }
  
@@ -2956,7 +3204,7 @@ index 0a864ad..7142b0e 100644
  int
  RenderContext::getCurrentFrame() const
  {
-@@ -2104,6 +2133,7 @@ RenderContext::loadScene(std::stringstream &initMessages)
+@@ -2104,6 +2151,7 @@ RenderContext::loadScene(std::stringstream &initMessages)
      // Load each scene file in order.
      const auto& sceneFiles = mOptions.getSceneFiles();
      for (const auto& sceneFile : sceneFiles) {
@@ -2964,7 +3212,7 @@ index 0a864ad..7142b0e 100644
          if (!sceneFile.empty()) {
              mRenderStats->logLoadingScene(initMessages, sceneFile);
              // Grab the file extension and convert it to lower case.
-@@ -2534,7 +2564,7 @@ RenderContext::loadGeometries(const rt::ChangeFlag flag)
+@@ -2534,7 +2582,7 @@ RenderContext::loadGeometries(const rt::ChangeFlag flag)
  
      timer.stop();
  
@@ -2973,7 +3221,7 @@ index 0a864ad..7142b0e 100644
      // return unused memory from malloc() arena to OS so process memory usage
      // stats are accurate
      malloc_trim(0);
-@@ -3006,7 +3036,7 @@ RenderContext::buildFrameState(FrameState *fs, double frameStartTime, const bool
+@@ -3006,7 +3054,7 @@ RenderContext::buildFrameState(FrameState *fs, double frameStartTime, const bool
      switch (getRenderMode())
      {
      case RenderMode::BATCH:
@@ -3681,16 +3929,40 @@ index 01d5ef8..ee71322 100644
  
      int numDevices = 0;
 diff --git a/lib/rendering/shading/BasicTexture.cc b/lib/rendering/shading/BasicTexture.cc
-index 31c070c..ace62fc 100644
+index 31c070c..7d53286 100644
 --- a/lib/rendering/shading/BasicTexture.cc
 +++ b/lib/rendering/shading/BasicTexture.cc
-@@ -185,6 +185,9 @@ public:
+@@ -23,6 +23,20 @@
+ 
+ #include <OpenImageIO/texture.h>
+ 
++#include <cstdlib>
++
++namespace {
++// Modo: an image with no alpha channel reads as opaque (tools/port_source_switches.py). True when MoonRay was started with MOONRAY_MODO_OPAQUE_ALPHA=1; read once.
++inline bool modoOpaqueAlpha()
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_OPAQUE_ALPHA");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++}
++
+ #include <memory>
+ #include <mutex>
+ 
+@@ -185,6 +199,12 @@ public:
              mTextureOpt[i].swrap = getOIIOWrap(wrapS);
              mTextureOpt[i].twrap = getOIIOWrap(wrapT);
              mTextureOpt[i].subimagename.clear();
-+            // TextureSampler expands grayscale to RGB; a missing fourth channel
-+            // must be opaque, matching ImageMap's documented alpha-only behavior.
-+            mTextureOpt[i].fill = 1.0f;
++            // Modo: with MOONRAY_MODO_OPAQUE_ALPHA, a missing fourth channel is opaque, matching ImageMap's
++            // documented alpha-only behaviour (TextureSampler expands grayscale to RGB). Off, as MoonRay's source:
++            // OpenImageIO's fill, 0.
++            if (modoOpaqueAlpha()) {
++                mTextureOpt[i].fill = 1.0f;
++            }
          }
  
          MNRY_ASSERT(mTextureHandles[0]);
@@ -3874,10 +4146,30 @@ index 26d6e7b..2be3ae0 100644
  
      moonray::util::InclusiveExclusiveAverage<int64> mShaderCallStat;
 diff --git a/lib/rendering/shading/UdimTexture.cc b/lib/rendering/shading/UdimTexture.cc
-index 9af3ab0..396db2f 100644
+index 9af3ab0..3436db1 100644
 --- a/lib/rendering/shading/UdimTexture.cc
 +++ b/lib/rendering/shading/UdimTexture.cc
-@@ -28,7 +28,12 @@
+@@ -22,13 +22,32 @@
+ #endif
+ #include <OpenImageIO/texture.h>
+ 
++#include <cstdlib>
++
++namespace {
++// Modo: an image with no alpha channel reads as opaque (tools/port_source_switches.py). True when MoonRay was started with MOONRAY_MODO_OPAQUE_ALPHA=1; read once.
++inline bool modoOpaqueAlpha()
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_OPAQUE_ALPHA");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++}
++
+ #include <tbb/blocked_range.h>
+ #include <tbb/parallel_for.h>
+ #include <tbb/mutex.h>
  
  #include <algorithm>
  #include <dirent.h>
@@ -3890,7 +4182,7 @@ index 9af3ab0..396db2f 100644
  #include <memory>
  #include <vector>
  
-@@ -97,6 +102,20 @@ getUdimFilenames(const std::string& filename,
+@@ -97,6 +116,20 @@ getUdimFilenames(const std::string& filename,
      size_t udimPos = filename.find("<UDIM>");
      const std::string pattern = filename.substr(0, udimPos) + "*";
  
@@ -3911,7 +4203,7 @@ index 9af3ab0..396db2f 100644
      glob_t glob_result;
      memset(&glob_result, 0, sizeof(glob_result));
  
-@@ -111,6 +130,7 @@ getUdimFilenames(const std::string& filename,
+@@ -111,6 +144,7 @@ getUdimFilenames(const std::string& filename,
      }
  
      globfree(&glob_result);
@@ -3919,6 +4211,18 @@ index 9af3ab0..396db2f 100644
  
      return true;
  }
+@@ -273,6 +307,11 @@ public:
+             mTextureOpt[i].swrap = getOIIOWrap(wrapS);
+             mTextureOpt[i].twrap = getOIIOWrap(wrapT);
+             mTextureOpt[i].subimagename.clear();
++            // Modo: with MOONRAY_MODO_OPAQUE_ALPHA, a tile with no fourth channel is opaque, as BasicTexture's images
++            // are. Off, as MoonRay's source: OpenImageIO's fill, 0.
++            if (modoOpaqueAlpha()) {
++                mTextureOpt[i].fill = 1.0f;
++            }
+         }
+         mIspc.mApplyGamma = applyGamma;
+         mIspc.mIs8bit = mIs8bit;
 diff --git a/lib/rendering/shading/bsdf/npr/BsdfToon.cc b/lib/rendering/shading/bsdf/npr/BsdfToon.cc
 index e5a2d65..b7447b8 100644
 --- a/lib/rendering/shading/bsdf/npr/BsdfToon.cc
@@ -4703,3 +5007,72 @@ new file mode 100644
 +
 +} // namespace shading
 +} // namespace moonray
+diff --git a/lib/rendering/geom/prim/VdbVolume.cc b/lib/rendering/geom/prim/VdbVolume.cc
+index 011b580..e98109c 100644
+--- a/lib/rendering/geom/prim/VdbVolume.cc
++++ b/lib/rendering/geom/prim/VdbVolume.cc
+@@ -17,6 +17,7 @@
+ #include <scene_rdl2/render/util/stdmemory.h>
+ #include <scene_rdl2/scene/rdl2/VisibilityFlags.h>
+ 
++#include <cstdlib>
+ #include <openvdb/openvdb.h>
+ #include <openvdb/Grid.h>
+ #include <openvdb/io/Stream.h>
+@@ -33,6 +34,35 @@
+ 
+ using scene_rdl2::logging::Logger;
+ 
++
++namespace {
++// Modo: a single-value emission grid glows grey (tools/port_scalar_emission.py). Only with MOONRAY_MODO_SCALAR_EMISSION=1.
++bool modoScalarEmission()
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_SCALAR_EMISSION");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++
++// The float grid as an RGB grid of the same shape, each value v as (v, v, v); XPU2's xpu2_geom.cc makes it the same way.
++openvdb::VectorGrid::Ptr modoGreyGrid(const openvdb::FloatGrid& scalar)
++{
++    const float background = scalar.background();
++    openvdb::VectorGrid::Ptr grey = openvdb::VectorGrid::create(openvdb::Vec3f(background, background, background));
++    grey->setTransform(scalar.transform().copy());
++    grey->setName(scalar.getName());
++    grey->tree().topologyUnion(scalar.tree());
++    const openvdb::FloatGrid::ConstAccessor values = scalar.getConstAccessor();
++    for (auto it = grey->beginValueAll(); it; ++it) {
++        const float v = values.getValue(it.getCoord());
++        it.setValue(openvdb::Vec3f(v, v, v));
++    }
++    return grey;
++}
++} // namespace
++
+ namespace moonray {
+ namespace geom {
+ namespace internal {
+@@ -1461,7 +1491,9 @@ VdbVolume::initEmissionSampler(openvdb::io::File& file,
+ 
+     // check that it is a valid grid. If not, throw error.
+     if (emissionGrid) {
+-        if (!emissionGrid->isType<openvdb::VectorGrid>()) {
++        // Modo: a single-value grid glows grey (tools/port_scalar_emission.py).
++        const bool modoGrey = emissionGrid->isType<openvdb::FloatGrid>() && modoScalarEmission();
++        if (!emissionGrid->isType<openvdb::VectorGrid>() && !modoGrey) {
+             rdlGeometry.error("Emission grid: \"", emissionGridName, "\" is not an RGB grid.");
+             return false;
+         }
+@@ -1473,7 +1505,8 @@ VdbVolume::initEmissionSampler(openvdb::io::File& file,
+             return false;
+         }
+ 
+-        mEmissionGrid = openvdb::gridPtrCast<openvdb::VectorGrid>(emissionGrid);
++        mEmissionGrid = modoGrey ? modoGreyGrid(*openvdb::gridPtrCast<openvdb::FloatGrid>(emissionGrid))
++                                 : openvdb::gridPtrCast<openvdb::VectorGrid>(emissionGrid);
+     } else {
+         rdlGeometry.error("Emission grid: \"", emissionGridName, "\" does not exist.");
+         return false;

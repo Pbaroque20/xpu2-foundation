@@ -9,6 +9,7 @@
 //       cached for every session after. A mark of it is left (shaderMark) for this driver and these programs.
 //   moonray_xpu2 --shaders-compiled
 //   moonray_xpu2 --list-devices   (the processor groups and graphics cards, one a line, for Device Management)
+//   moonray_xpu2 rhizome node | master | id | trust | approve | revoke | status   (a frame across machines: rhizome_session.inc, RHIZOME.md)
 //       Exits 0 when the mark is there for every kind of card in the machine, 4 when it is out of date (other
 //       programs, another driver, or a kind of card it was not compiled for), 3 when there is none.
 //
@@ -18,6 +19,11 @@
 // the work as @@MODO_TILES, the work grid's cells being rendered (its cellular rules move the CPU's workers from cell
 // to cell), @@MODO_WORKERS: each CPU worker's 8-pixel tile, and @@MODO_GPU_WORKERS: the cells the GPU's queued
 // launches hold (the private kit draws them in a colour of their own).
+// Winsock before windows.h (Rhizome, rhizome_session.inc).
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#undef near  // windows.h's, which the integrator's names would meet
+#undef far
 #include <OpenImageDenoise/oidn.h>  // types only: the library is loaded at run time (CpuDenoiser)
 #include "async_render.h"
 #include "../../native-port/modo_protocol_line.h"
@@ -305,6 +311,9 @@ ShaderStamp shaderStamp(const Programs& p) {
     char name[32];
     std::snprintf(name, sizeof(name), "%016llx.compiled", (unsigned long long)h);
     stamp.mark = fs::u8path(local ? local : ".") / "MoonRayForModo" / "xpu2-shaders" / name;
+    // XPU2_SHADER_MARKS: the marks kept in that folder instead (a test of a machine with none compiled, OptiX's own cache
+    // left as it is).
+    if (const char* marks = std::getenv("XPU2_SHADER_MARKS"); marks && *marks) stamp.mark = fs::u8path(marks) / name;
     return stamp;
 }
 fs::path shaderMark(const Programs& p) { return shaderStamp(p).mark; }
@@ -347,6 +356,7 @@ std::vector<std::pair<int, std::string>> uncompiledCards(const fs::path& mark, b
     std::vector<std::pair<int, std::string>> out;
     std::set<std::string> listed;
     for (int card : multi::cardOrdinals(gpu::cardCount(), every)) {
+        if (!gpu::supported(card)) continue;  // older than XPU2's programs can run on: never compiled for
         const std::string kind = cardKind(card);
         if (!held.count(kind) && listed.insert(kind).second) out.emplace_back(card, kind);
     }
@@ -422,9 +432,24 @@ private:
     double floor_ = 2.0;
 };
 
+// The machine's cards, each named, that are too old for XPU2's programs (gpu::supported); empty where none is.
+std::string olderCards() {
+    std::string names;
+    for (int card = 0; card < gpu::cardCount(); ++card)
+        if (!gpu::supported(card)) names += (names.empty() ? "" : ", ") + cardKind(card);
+    return names;
+}
+
 int compileShaders(const fs::path& folder) {
     const auto began = Clock::now();
     auto seconds = [&] { return std::chrono::duration<double>(Clock::now() - began).count(); };
+    // Cards, but none XPU2's programs run on (a GTX 1080 Ti): nothing to compile, and the processor renders.
+    if (gpu::cardCount() > 0 && !gpu::anySupported()) {
+        std::cout << "MoonRay XPU2 shaders: not needed: " << olderCards()
+                  << " is older than XPU2's GPU programs run on (an RTX 20 series card or newer); XPU2 renders on the processor"
+                  << std::endl;
+        return 0;
+    }
     try {
         const Programs p = programs(folder);
         std::cout << "MoonRay XPU2 shaders: compiling (about an hour the first time; at once when OptiX's cache has them)"
@@ -499,6 +524,10 @@ int listDevices() {
 }
 
 int shadersCompiled(const fs::path& folder) {
+    if (gpu::cardCount() > 0 && !gpu::anySupported()) {
+        std::cout << "MoonRay XPU2 shaders: not needed: " << olderCards() << " is too old for them; the processor renders" << std::endl;
+        return 0;
+    }
     try {
         const ShaderStamp stamp = shaderStamp(programs(folder));
         if (fs::exists(stamp.mark)) {
@@ -1768,7 +1797,17 @@ int session(const Args& args, const fs::path& directory) {
     const bool useShared = std::getenv("MOONRAY_MODO_SHARED") != nullptr;
     // The investigation switches: CPU only or GPU only (0 or 1, else both), the adaptive pass chain on the GPU
     // (the fastest, its tiles unknown to the host) and the progressive pictures' interval.
-    const int mode = std::getenv("XPU2_SESSION_MODE") ? std::atoi(std::getenv("XPU2_SESSION_MODE")) : 2;
+    int mode = std::getenv("XPU2_SESSION_MODE") ? std::atoi(std::getenv("XPU2_SESSION_MODE")) : 2;
+    // Cards, but none XPU2's programs run on (gpu::supported): both becomes the processor alone; the cards alone cannot be.
+    if (mode != 0 && gpu::cardCount() > 0 && !gpu::anySupported()) {
+        if (mode == 1) {
+            fallback("XPU2 cannot use " + olderCards() + ": it needs an RTX 20 series card or newer. Choose the processor in "
+                     "System > Preferences > MoonRay > XPU2 > Device Management");
+            return 0;
+        }
+        std::printf("MoonRay XPU2: %s is older than XPU2's GPU programs run on; the processor renders\n", olderCards().c_str());
+        mode = 0;
+    }
     const bool deviceChain = envOn("XPU2_SESSION_CHAIN", false);
     // Partial shading (texture misses finished a level up, rendered again in full later; off: they wait for the tile).
     const bool partial = envOn("XPU2_SESSION_PARTIAL", true);
@@ -1892,6 +1931,7 @@ int session(const Args& args, const fs::path& directory) {
                         const std::set<std::string> held = compiledKinds(shaderMark(p));
                         std::string left;
                         for (int card : multi::cardOrdinals(gpu::cardCount())) {
+                            if (!gpu::supported(card)) continue;  // too old for XPU2's programs: left out
                             if (held.count(cardKind(card))) cards.push_back(card);
                             else left += (left.empty() ? "" : ", ") + cardKind(card);
                         }
@@ -2661,8 +2701,25 @@ int standaloneRender(int argc, char** argv, const fs::path& folder) {
 
 }  // namespace
 
+#include "rhizome_session.inc"
+
 int main(int argc, char** argv) {
     const fs::path folder = executableFolder();
+    if (argc >= 2 && (std::string(argv[1]) == "rhizome" || std::string(argv[1]) == "--rhizome-master" || std::string(argv[1]) == "--rhizome-node")) {
+        // A node or master renders: its memory ceiling and the texture watch, as a session's. The identity verbs print
+        // their answer alone (a script reads the hash rhizome id prints).
+        const std::string verb = argc >= 3 ? argv[2] : "";
+        if (std::string(argv[1]) != "rhizome" || verb == "node" || verb == "master") {
+            memoryCeiling();
+            texture::watchPressure(ceilingBytes);
+        }
+        try {
+            return rhizomesession::run(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "MoonRay XPU2 Rhizome: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc >= 2 && std::string(argv[1]) == "render") return standaloneRender(argc, argv, folder);
     if (argc == 2 && std::string(argv[1]) == "--compile-shaders") return compileShaders(folder);
     if (argc == 2 && std::string(argv[1]) == "--shaders-compiled") return shadersCompiled(folder);

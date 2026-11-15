@@ -689,6 +689,7 @@ port share one folder today; this map says which layer each file belongs to.
 | `xpu2_session.cc` (2.0k), `xpu2_scene.cc`, `xpu2_cpu.cc` | `moonray_xpu2.exe`: protocol, fallback, outlines, checkpoints, realtime denoiser |
 | `session_harness.py` | Drives a session as the kit does, without Modo |
 | `native-port/persistent_session.inc`, `native-port/modo_*.h` | The kit's preview protocol, shared with MoonRay's session |
+| `native-port/maps/ModoProcedural/modo_patterns.h` | Modo's procedural patterns, shared with MoonRay's ModoProceduralMap and MoonLightIPR's kernel (`build_async.py` holds it among the GPU programs' sources) |
 | `kit/MoonRayForModo/python/moonray_modo/` | XPU2 in the kit: `native.py` (renderer, devices, runtime folder), `preferences.py`, `persistent.py`, `xpu2_sampling.py`; `kit/MoonRayForModo/lxserv/moonray_xpu2.py` |
 | `tools/package_development_release.py`, `tools/check_release_package.py` | The release, with `runtime-xpu2` beside `runtime`, and its check |
 | `xpu2/tools/kit/` | `check_xpu2_session_qt.py` and other checks; `build_xpu2_kit.py` and `install_xpu2.py` are retired, kept as a record |

@@ -65,6 +65,24 @@ inline int cardCount(){HMODULE library=nullptr;wchar_t path[MAX_PATH];auto n=Get
  std::wstring file(path);file+=L"\\nvcuda.dll";library=LoadLibraryW(file.c_str());if(!library)return 0;
  auto init=reinterpret_cast<decltype(&cuInit)>(GetProcAddress(library,"cuInit"));auto count=reinterpret_cast<decltype(&cuDeviceGetCount)>(GetProcAddress(library,"cuDeviceGetCount"));
  int cards=0;if(!init||!count||init(0)!=CUDA_SUCCESS||count(&cards)!=CUDA_SUCCESS)cards=0;FreeLibrary(library);return cards;}
+// Whether a graphics card can run XPU2's GPU programs: compiled for sm_75, they need a Turing card (RTX 20 series) or
+// newer. A GTX 1080 Ti (Pascal, 6.1) cannot take them: OptiX's compile for it failed, and the tester's machine stayed "not
+// compiled"; such a card is left out, and a machine with none newer renders on its processor. XPU2_SIMULATE_CARDS: all are.
+constexpr int CardNeeds = 75;
+inline bool supported(int ordinal){
+ // XPU2_SIMULATE_OLD_CARDS=1: every card taken for one too old, to try a machine like the tester's on any other.
+ if(std::getenv("XPU2_SIMULATE_OLD_CARDS"))return false;
+ if(std::getenv("XPU2_SIMULATE_CARDS"))return true;
+ HMODULE library=nullptr;wchar_t path[MAX_PATH];auto n=GetSystemDirectoryW(path,MAX_PATH);if(!n||n>=MAX_PATH-12)return false;
+ std::wstring file(path);file+=L"\\nvcuda.dll";library=LoadLibraryW(file.c_str());if(!library)return false;
+ auto init=reinterpret_cast<decltype(&cuInit)>(GetProcAddress(library,"cuInit"));auto get=reinterpret_cast<decltype(&cuDeviceGet)>(GetProcAddress(library,"cuDeviceGet"));
+ auto attribute=reinterpret_cast<decltype(&cuDeviceGetAttribute)>(GetProcAddress(library,"cuDeviceGetAttribute"));
+ int major=0,minor=0;CUdevice dev{};
+ const bool read=init&&get&&attribute&&init(0)==CUDA_SUCCESS&&get(&dev,ordinal)==CUDA_SUCCESS&&
+  attribute(&major,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,dev)==CUDA_SUCCESS&&attribute(&minor,CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,dev)==CUDA_SUCCESS;
+ FreeLibrary(library);return read&&major*10+minor>=CardNeeds;}
+// Whether the machine has a card XPU2 can use (supported); with cards but none of them: only older ones.
+inline bool anySupported(){const int cards=cardCount();for(int k=0;k<cards;++k)if(supported(k))return true;return false;}
 // The graphics cards CUDA finds, for --list-devices: each one's name, memory and UUID (none without a driver).
 struct CardInfo {std::string name,uuid;size_t bytes=0;};
 inline std::vector<CardInfo> cardInfos(){std::vector<CardInfo> out;HMODULE library=nullptr;wchar_t path[MAX_PATH];auto n=GetSystemDirectoryW(path,MAX_PATH);if(!n||n>=MAX_PATH-12)return out;

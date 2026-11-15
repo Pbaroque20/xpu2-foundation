@@ -1330,6 +1330,25 @@ public:
     }
     std::vector<std::pair<const char*, double>> prepareLaps_;
 
+    // The film's rows a frame writes (a share of a frame, Rhizome: its region's rows): cleared as it begins and downloaded
+    // as it ends, the rest left as they are (the next frames' shares clear their own). Unset: every row.
+    void filmRows(U32 first, U32 end) {
+        if (!followers_.empty()) forwardOrDrop([&](GpuLane& f) { f.filmRows(first, end); });
+        rowFirst_ = first, rowEnd_ = end;
+    }
+    // A band of the film: its first pixel and its pixels.
+    size_t bandStart() const { return size_t(std::min<U32>(rowFirst_, plan_->height)) * plan_->width; }
+    size_t bandPixels() const {
+        const U32 a = std::min<U32>(rowFirst_, plan_->height), e = std::min<U32>(rowEnd_, plan_->height);
+        return e > a ? size_t(e - a) * plan_->width : 0;
+    }
+    void copyBand(const std::shared_ptr<gpu::Buffer>& h, const std::shared_ptr<gpu::Buffer>& d, size_t bytesPerPixel) {
+        const size_t at = bandStart() * bytesPerPixel;
+        gpu::Driver::check(driver.cuMemcpyDtoHAsync_v2_p(static_cast<char*>(h->host()) + at, d->pointer + at, bandPixels() * bytesPerPixel, stream_));
+    }
+    void clearBand(const std::shared_ptr<gpu::Buffer>& d, size_t wordsPerPixel) { memset32(d->pointer + bandStart() * wordsPerPixel * 4, 0, bandPixels() * wordsPerPixel); }
+    U32 rowFirst_ = 0, rowEnd_ = ~0u;
+
     // Starts a frame: an empty film and empty queues. partial: texture misses finish from a coarser level as
     // provisional samples (never in the pass chain, which runs on the device alone).
     void begin(U32 samplesPerChunk, bool adaptive = false, bool partial = false) {
@@ -1352,13 +1371,12 @@ public:
         adaptive_ = adaptive;
         sizeParked(partial);
         program_->fitStack(!plan_->volumes.empty(), plan_->subsurface);
-        const size_t pixels = size_t(plan_->width) * plan_->height;
-        memset32(scene_.sums->pointer, 0, pixels * 8);
-        memset32(scene_.odd->pointer, 0, pixels * 8);
+        clearBand(scene_.sums, 8);
+        clearBand(scene_.odd, 8);
         std::fill(passDone_.begin(), passDone_.end(), 0u);
-        memset32(scene_.counts->pointer, 0, pixels);
-        memset32(scene_.provSums->pointer, 0, pixels * 8);
-        memset32(scene_.provCounts->pointer, 0, pixels);
+        clearBand(scene_.counts, 1);
+        clearBand(scene_.provSums, 8);
+        clearBand(scene_.provCounts, 1);
         partial_ = partial;
         std::fill(profile_, profile_ + ProfileStages, 0ull);
         refineHead_ = 0;
@@ -1533,14 +1551,14 @@ public:
         filmAdded_ = false;
         cpu::need(inFlight_.empty(), "Film download before the last launch was collected");
         const size_t pixels = size_t(plan_->width) * plan_->height;
-        copyOut(scene_.hostSums, scene_.sums, pixels * 4 * sizeof(double));
-        copyOut(scene_.hostCounts, scene_.counts, pixels * sizeof(U32));
-        copyOut(scene_.hostProvSums, scene_.provSums, pixels * 4 * sizeof(double));
-        copyOut(scene_.hostProvCounts, scene_.provCounts, pixels * sizeof(U32));
-        if (adaptive_) copyOut(scene_.hostOdd, scene_.odd, pixels * 4 * sizeof(double));
-        if (aovChannels_) copyOut(scene_.hostAovs, scene_.aovs, pixels * aovChannels_ * sizeof(float));
+        copyBand(scene_.hostSums, scene_.sums, 4 * sizeof(double));
+        copyBand(scene_.hostCounts, scene_.counts, sizeof(U32));
+        copyBand(scene_.hostProvSums, scene_.provSums, 4 * sizeof(double));
+        copyBand(scene_.hostProvCounts, scene_.provCounts, sizeof(U32));
+        if (adaptive_) copyBand(scene_.hostOdd, scene_.odd, 4 * sizeof(double));
+        if (aovChannels_) copyBand(scene_.hostAovs, scene_.aovs, aovChannels_ * sizeof(float));
         downloadClosest();
-        if (scene_.heat) copyOut(scene_.hostHeat, scene_.heat, pixels * sizeof(double));
+        if (scene_.heat) copyBand(scene_.hostHeat, scene_.heat, sizeof(double));
         if (chainsLaunched_) copyOut(chain_.hostPlanned, chain_.planned, pixels * sizeof(U32));
         gpu::Driver::check(driver.cuEventRecord_p(scene_.filmDone->value, stream_));
     }
@@ -1592,23 +1610,24 @@ public:
     // (adaptive) and the render times. Their AOVs are merged by the renderer, which holds the outputs' filters
     // (async_render.h, addCardAovs).
     void addFollowers(bool whole) {
-        const size_t pixels = size_t(plan_->width) * plan_->height;
+        // The film's band (filmRows): the rows the frame wrote, the others as they were.
+        const size_t from = bandStart(), pixels = from + bandPixels();
         double* sums = static_cast<double*>(scene_.hostSums->host());
         U32* counts = static_cast<U32*>(scene_.hostCounts->host());
         for (const auto& f : followers_) {
             const double* s = f->sums();
             const U32* c = f->counts();
-            for (size_t i = 0; i < pixels * 4; ++i) sums[i] += s[i];
-            for (size_t i = 0; i < pixels; ++i) counts[i] += c[i];
+            for (size_t i = from * 4; i < pixels * 4; ++i) sums[i] += s[i];
+            for (size_t i = from; i < pixels; ++i) counts[i] += c[i];
             if (whole && adaptive_ && scene_.hostOdd && f->scene_.hostOdd) {
                 double* odd = static_cast<double*>(scene_.hostOdd->host());
                 const double* o = f->odd();
-                for (size_t i = 0; i < pixels * 4; ++i) odd[i] += o[i];
+                for (size_t i = from * 4; i < pixels * 4; ++i) odd[i] += o[i];
             }
             if (whole && scene_.hostHeat && f->scene_.hostHeat) {
                 double* heat = static_cast<double*>(scene_.hostHeat->host());
                 const double* h = f->heat();
-                for (size_t i = 0; i < pixels; ++i) heat[i] += h[i];
+                for (size_t i = from; i < pixels; ++i) heat[i] += h[i];
             }
         }
     }
@@ -1616,14 +1635,13 @@ public:
     // next read (landClosest): a word's high half the depth's ordered bits (mergeAovs), its low half the value's.
     void downloadClosest() {
         if (!aovClosestChannels_) return;
-        const size_t pixels = size_t(plan_->width) * plan_->height;
-        copyOut(scene_.hostAovClosest, scene_.aovClosest, pixels * aovClosestChannels_ * sizeof(U64L));
+        copyBand(scene_.hostAovClosest, scene_.aovClosest, aovClosestChannels_ * sizeof(U64L));
         closestLanded_ = false;
     }
     void landClosest() const {
         if (closestLanded_ || !aovClosestChannels_) return;
         closestLanded_ = true;
-        const size_t pixels = size_t(plan_->width) * plan_->height;
+        const size_t pixels = bandStart() + bandPixels();
         const U64L* words = static_cast<const U64L*>(scene_.hostAovClosest->host());
         float* values = static_cast<float*>(scene_.hostAovs->host());
         float* depths = static_cast<float*>(scene_.hostAovDepths->host());
@@ -1632,7 +1650,7 @@ public:
             std::memcpy(&v, &w, sizeof v);
             return v;
         };
-        for (size_t p = 0; p < pixels; ++p) {
+        for (size_t p = bandStart(); p < pixels; ++p) {
             const U64L* k = words + p * aovClosestChannels_;
             U32 at = 0;
             for (const aov::Entry& e : aovEntries_) {

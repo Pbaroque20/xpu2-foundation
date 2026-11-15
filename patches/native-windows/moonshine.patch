@@ -1,28 +1,590 @@
+diff --git a/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.cc b/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.cc
+index aaded81..c50f2a3 100644
+--- a/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.cc
++++ b/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.cc
+@@ -47,6 +47,12 @@ ToonDisplayFilter::ToonDisplayFilter(
+     mIspc.mInkNormalThreshold = 0.f;
+     mIspc.mInkNormalScale = 0.f;
+     mIspc.mEdgeDetector = 0;
++    mIspc.mOutputMode = 0;
++    mIspc.mCloseLineGaps = 0;
++    mIspc.mSmoothLines = 0;
++    mIspc.mInkColor.r = 0.f;
++    mIspc.mInkColor.g = 0.f;
++    mIspc.mInkColor.b = 0.f;
+ }
+ 
+ void
+@@ -85,6 +91,17 @@ ToonDisplayFilter::update()
+     mIspc.mInkNormalThreshold = get(attrInkNormalThreshold);
+     mIspc.mInkNormalScale = get(attrInkNormalScale);
+     mIspc.mEdgeDetector = get(attrEdgeDetector);
++    // MoonRay for Modo: the lines apart from the shading, for compositing.
++    mIspc.mOutputMode = get(attrOutputMode);
++    // MoonRay for Modo: lines without a gap down their middle.
++    mIspc.mCloseLineGaps = get(attrCloseLineGaps) ? 1 : 0;
++    // MoonRay for Modo: lines without the pixel grid's steps.
++    mIspc.mSmoothLines = get(attrSmoothLines) ? 1 : 0;
++    // MoonRay for Modo: the colour the lines are drawn in, over the shading.
++    const Color inkColor = get(attrInkColor);
++    mIspc.mInkColor.r = inkColor.r;
++    mIspc.mInkColor.g = inkColor.g;
++    mIspc.mInkColor.b = inkColor.b;
+ }
+ 
+ void
+@@ -101,18 +118,21 @@ ToonDisplayFilter::getInputData(const displayfilter::InitializeData& initData,
+     inputData.mWindowWidths.push_back(1);
+     inputData.mWindowWidths.push_back(1);
+     const int edgeDetector = get(attrEdgeDetector);
++    // MoonRay for Modo: closing a line's gaps also asks the pixels around this one.
++    // Smoothing a line reads it three pixels around this one.
++    const int wider = get(attrSmoothLines) ? 6 : get(attrCloseLineGaps) ? 2 : 0;
+     switch(edgeDetector) {
+     case 1:
+-        inputData.mWindowWidths.push_back(3);
+-        inputData.mWindowWidths.push_back(3);
++        inputData.mWindowWidths.push_back(3 + wider);
++        inputData.mWindowWidths.push_back(3 + wider);
+         break;
+     case 2:
+-        inputData.mWindowWidths.push_back(5);
+-        inputData.mWindowWidths.push_back(5);
++        inputData.mWindowWidths.push_back(5 + wider);
++        inputData.mWindowWidths.push_back(5 + wider);
+         break;
+     case 3:
+-        inputData.mWindowWidths.push_back(9);
+-        inputData.mWindowWidths.push_back(9);
++        inputData.mWindowWidths.push_back(9 + wider);
++        inputData.mWindowWidths.push_back(9 + wider);
+         break;
+     default:
+         inputData.mWindowWidths.push_back(1);
+diff --git a/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.ispc b/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.ispc
+index 633f044..aa8b433 100644
+--- a/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.ispc
++++ b/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.ispc
+@@ -14,6 +14,10 @@ struct ToonDisplayFilter
+     float mInkNormalThreshold;
+     float mInkNormalScale;
+     int mEdgeDetector;
++    int mOutputMode;    // MoonRay for Modo: 0 shading and lines, 1 lines only (white on black), 2 shading only
++    int mCloseLineGaps; // MoonRay for Modo: a pixel without ink between two with ink is part of the line
++    Color mInkColor;    // MoonRay for Modo: the colour of the lines over the shading (black: MoonRay's own)
++    int mSmoothLines;   // MoonRay for Modo: lines blended along their direction, without the pixel grid's steps
+ };
+ 
+ export const uniform ToonDisplayFilter * uniform
+@@ -70,97 +74,45 @@ convolveNormal(const uniform float * uniform kernel,
+     return result;
+ }
+ 
+-static void
+-filter(const uniform DisplayFilter * uniform me,
+-       const uniform InputBuffer * const uniform * const uniform inputBuffers,
+-       const varying DisplayFilterState * const uniform state,
+-       varying Color * uniform output)
++static const uniform float laplacian5[25] = {
++    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
++    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
++    -1.0f, -1.0f, 24.0f, -1.0f, -1.0f,
++    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
++    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
++
++static const uniform float laplacianOfGaussian[81] = {
++     0.0f,   1.0f,   1.0f,   2.0f,   2.0f,   2.0f,   1.0f,   1.0f,   0.0f,
++     1.0f,   2.0f,   4.0f,   5.0f,   5.0f,   5.0f,   4.0f,   2.0f,   1.0f,
++     1.0f,   4.0f,   5.0f,   3.0f,   0.0f,   3.0f,   5.0f,   4.0f,   1.0f,
++     2.0f,   5.0f,   3.0f, -12.0f, -24.0f, -12.0f,   3.0f,   5.0f,   2.0f,
++     2.0f,   5.0f,   0.0f, -24.0f, -40.0f, -24.0f,   0.0f,   5.0f,   2.0f,
++     2.0f,   5.0f,   3.0f, -12.0f, -24.0f, -12.0f,   3.0f,   5.0f,   2.0f,
++     1.0f,   4.0f,   5.0f,   3.0f,   0.0f,   3.0f,   5.0f,   4.0f,   1.0f,
++     1.0f,   2.0f,   4.0f,   5.0f,   5.0f,   5.0f,   4.0f,   2.0f,   1.0f,
++     0.0f,   1.0f,   1.0f,   2.0f,   2.0f,   2.0f,   1.0f,   1.0f,   0.0f};
++
++static const uniform float sobelH[9] = {
++    -1.0f,  0.0f,  1.0f,
++    -2.0f,  0.0f,  2.0f,
++    -1.0f,  0.0f,  1.0f};
++
++static const uniform float sobelV[9] = {
++     1.0f,  2.0f,  1.0f,
++     0.0f,  0.0f,  0.0f,
++    -1.0f, -2.0f, -1.0f};
++
++// The ink at a pixel: 1 none, 0 a whole line.
++static varying float
++inkAt(const uniform ToonDisplayFilter * uniform self,
++      const uniform InputBuffer const * uniform inDepthBuffer,
++      const uniform InputBuffer const * uniform inNormalBuffer,
++      const varying unsigned int x, const varying unsigned int y)
+ {
+-    const uniform ToonDisplayFilter * uniform self = ToonDisplayFilter_get(me);
+-
+-    // input buffers given to us are in the same order as the
+-    // inputs SceneObjects we returned from getInputData();
+-    const uniform InputBuffer const * uniform inDiffuseBuffer = inputBuffers[0];
+-    const uniform InputBuffer const * uniform inGlossyBuffer = inputBuffers[1];
+-    const uniform InputBuffer const * uniform inAlbedoBuffer = inputBuffers[2];
+-    const uniform InputBuffer const * uniform inDepthBuffer = inputBuffers[3];
+-    const uniform InputBuffer const * uniform inNormalBuffer = inputBuffers[4];
+-
+-    static uniform float laplacian5[25] = {
+-        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+-        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+-        -1.0f, -1.0f, 24.0f, -1.0f, -1.0f,
+-        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+-        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+-
+-    static uniform float laplacianOfGaussian[81] = {
+-         0.0f,   1.0f,   1.0f,   2.0f,   2.0f,   2.0f,   1.0f,   1.0f,   0.0f,
+-         1.0f,   2.0f,   4.0f,   5.0f,   5.0f,   5.0f,   4.0f,   2.0f,   1.0f,
+-         1.0f,   4.0f,   5.0f,   3.0f,   0.0f,   3.0f,   5.0f,   4.0f,   1.0f,
+-         2.0f,   5.0f,   3.0f, -12.0f, -24.0f, -12.0f,   3.0f,   5.0f,   2.0f,
+-         2.0f,   5.0f,   0.0f, -24.0f, -40.0f, -24.0f,   0.0f,   5.0f,   2.0f,
+-         2.0f,   5.0f,   3.0f, -12.0f, -24.0f, -12.0f,   3.0f,   5.0f,   2.0f,
+-         1.0f,   4.0f,   5.0f,   3.0f,   0.0f,   3.0f,   5.0f,   4.0f,   1.0f,
+-         1.0f,   2.0f,   4.0f,   5.0f,   5.0f,   5.0f,   4.0f,   2.0f,   1.0f,
+-         0.0f,   1.0f,   1.0f,   2.0f,   2.0f,   2.0f,   1.0f,   1.0f,   0.0f};
+-
+-    static uniform float sobelH[9] = {
+-        -1.0f,  0.0f,  1.0f,
+-        -2.0f,  0.0f,  2.0f,
+-        -1.0f,  0.0f,  1.0f};
+-
+-    static uniform float sobelV[9] = {
+-         1.0f,  2.0f,  1.0f,
+-         0.0f,  0.0f,  0.0f,
+-        -1.0f, -2.0f, -1.0f};
+-
+-    const varying Vec3f diffuse = InputBuffer_getFloat3Pixel(inDiffuseBuffer,
+-                                                             state->mOutputPixelX,
+-                                                             state->mOutputPixelY);
+-    const varying Vec3f glossy = InputBuffer_getFloat3Pixel(inGlossyBuffer,
+-                                                            state->mOutputPixelX,
+-                                                            state->mOutputPixelY);
+-    const varying Vec3f albedo = InputBuffer_getFloat3Pixel(inAlbedoBuffer,
+-                                                            state->mOutputPixelX,
+-                                                            state->mOutputPixelY);
+-
+-    // remove 'local' surface color
+-    Vec3f result = Vec3f_ctor(diffuse.x, diffuse.y, diffuse.z);
+-    result.x /= (isZero(albedo.x) ? 1.0f : albedo.x);
+-    result.y /= (isZero(albedo.y) ? 1.0f : albedo.y);
+-    result.z /= (isZero(albedo.z) ? 1.0f : albedo.z);
+-
+-    // find max component, we'll use this to compute a discretized
+-    // value.
+-    const float maxComp = max(result.x, max(result.y, result.z));
+-    float cel = discretize(maxComp, self->mNumCels);
+-
+-    // We then compute a scale factor to be applied to
+-    // all three channels to preserve hue and saturation
+-    const float scale = isZero(maxComp) ? 0.f : (cel/maxComp);
+-
+-    // scale all channels equally to maintain the lights' hue/sat while
+-    // creating cel-shading effect via value
+-    result.x *= scale;
+-    result.y *= scale;
+-    result.z *= scale;
+-
+-    // add "ambient" light
+-    const uniform Color ambient = self->mAmbient;
+-    result.x += ambient.r;
+-    result.y += ambient.g;
+-    result.z += ambient.b;
+-
+-    // restore "local" surface color
+-    result = result * albedo;
+-
+-    // add glossy term - do nothing to it for now
+-    result = result + glossy;
+-
+     // depth-based edge detection
+     const varying float depth = InputBuffer_getFloatPixel(inDepthBuffer,
+-                                                          state->mOutputPixelX,
+-                                                          state->mOutputPixelY);
++                                                          x,
++                                                          y);
+     const float depthDenom = 1.0f / (isZero(depth) ? 1.0f : depth);
+     float edgeD = 0.0f;
+     switch(self->mEdgeDetector) {
+@@ -168,12 +120,12 @@ filter(const uniform DisplayFilter * uniform me,
+         {
+             // Sobel edge detector
+             const float Gx = convolveDepth(sobelH, 3,
+-                                           state->mOutputPixelX, state->mOutputPixelY,
++                                           x, y,
+                                            inDepthBuffer,
+                                            depthDenom);
+ 
+             const float Gy = convolveDepth(sobelV, 3,
+-                                           state->mOutputPixelX, state->mOutputPixelY,
++                                           x, y,
+                                            inDepthBuffer,
+                                            depthDenom);
+ 
+@@ -184,7 +136,7 @@ filter(const uniform DisplayFilter * uniform me,
+         {
+             // Laplacian edge detector
+             edgeD = convolveDepth(laplacian5, 5,
+-                                  state->mOutputPixelX, state->mOutputPixelY,
++                                  x, y,
+                                   inDepthBuffer,
+                                   depthDenom);
+             break;
+@@ -193,7 +145,7 @@ filter(const uniform DisplayFilter * uniform me,
+         {
+             // Laplacian of Gaussian edge detector
+             edgeD = convolveDepth(laplacianOfGaussian, 9,
+-                                  state->mOutputPixelX, state->mOutputPixelY,
++                                  x, y,
+                                   inDepthBuffer,
+                                   depthDenom);
+             break;
+@@ -204,8 +156,8 @@ filter(const uniform DisplayFilter * uniform me,
+     }
+ 
+     const varying Vec3f normal = InputBuffer_getFloat3Pixel(inNormalBuffer,
+-                                                            state->mOutputPixelX,
+-                                                            state->mOutputPixelY);
++                                                            x,
++                                                            y);
+     float edgeN = 0.0f;
+     if (!isZero(normal.x) && !isZero(normal.y) && !isZero(normal.z)) {
+         switch (self->mEdgeDetector) {
+@@ -213,11 +165,11 @@ filter(const uniform DisplayFilter * uniform me,
+             {
+                 // Sobel edge detector
+                 const float Gx = convolveNormal(sobelH, 3,
+-                                                state->mOutputPixelX, state->mOutputPixelY,
++                                                x, y,
+                                                 inNormalBuffer, normal);
+ 
+                 const float Gy = convolveNormal(sobelV, 3,
+-                                                state->mOutputPixelX, state->mOutputPixelY,
++                                                x, y,
+                                                 inNormalBuffer, normal);
+ 
+                 edgeN = sqrt(Gx*Gx + Gy*Gy);
+@@ -227,7 +179,7 @@ filter(const uniform DisplayFilter * uniform me,
+             {
+                 // Laplacian edge detector
+                 edgeN = convolveNormal(laplacian5, 5,
+-                                       state->mOutputPixelX, state->mOutputPixelY,
++                                       x, y,
+                                        inNormalBuffer, normal);
+                 break;
+             }
+@@ -235,7 +187,7 @@ filter(const uniform DisplayFilter * uniform me,
+             {
+                 // Laplacian of Gaussian edge detector
+                 edgeN = convolveNormal(laplacianOfGaussian, 9,
+-                                       state->mOutputPixelX, state->mOutputPixelY,
++                                       x, y,
+                                        inNormalBuffer, normal);
+                 break;
+             }
+@@ -251,7 +203,187 @@ filter(const uniform DisplayFilter * uniform me,
+     edgeN = edgeN - self->mInkNormalThreshold;
+     const float inkN = 1.0f - saturate(edgeN * self->mInkNormalScale);
+ 
+-    result = result * min(inkD, inkN);
++    return min(inkD, inkN);
++}
++
++static void
++filter(const uniform DisplayFilter * uniform me,
++       const uniform InputBuffer * const uniform * const uniform inputBuffers,
++       const varying DisplayFilterState * const uniform state,
++       varying Color * uniform output)
++{
++    const uniform ToonDisplayFilter * uniform self = ToonDisplayFilter_get(me);
++
++    // input buffers given to us are in the same order as the
++    // inputs SceneObjects we returned from getInputData();
++    const uniform InputBuffer const * uniform inDiffuseBuffer = inputBuffers[0];
++    const uniform InputBuffer const * uniform inGlossyBuffer = inputBuffers[1];
++    const uniform InputBuffer const * uniform inAlbedoBuffer = inputBuffers[2];
++    const uniform InputBuffer const * uniform inDepthBuffer = inputBuffers[3];
++    const uniform InputBuffer const * uniform inNormalBuffer = inputBuffers[4];
++
++    const varying Vec3f diffuse = InputBuffer_getFloat3Pixel(inDiffuseBuffer,
++                                                             state->mOutputPixelX,
++                                                             state->mOutputPixelY);
++    const varying Vec3f glossy = InputBuffer_getFloat3Pixel(inGlossyBuffer,
++                                                            state->mOutputPixelX,
++                                                            state->mOutputPixelY);
++    const varying Vec3f albedo = InputBuffer_getFloat3Pixel(inAlbedoBuffer,
++                                                            state->mOutputPixelX,
++                                                            state->mOutputPixelY);
++
++    // remove 'local' surface color
++    Vec3f result = Vec3f_ctor(diffuse.x, diffuse.y, diffuse.z);
++    result.x /= (isZero(albedo.x) ? 1.0f : albedo.x);
++    result.y /= (isZero(albedo.y) ? 1.0f : albedo.y);
++    result.z /= (isZero(albedo.z) ? 1.0f : albedo.z);
++
++    // find max component, we'll use this to compute a discretized
++    // value.
++    const float maxComp = max(result.x, max(result.y, result.z));
++    float cel = discretize(maxComp, self->mNumCels);
++
++    // We then compute a scale factor to be applied to
++    // all three channels to preserve hue and saturation
++    const float scale = isZero(maxComp) ? 0.f : (cel/maxComp);
++
++    // scale all channels equally to maintain the lights' hue/sat while
++    // creating cel-shading effect via value
++    result.x *= scale;
++    result.y *= scale;
++    result.z *= scale;
++
++    // add "ambient" light
++    const uniform Color ambient = self->mAmbient;
++    result.x += ambient.r;
++    result.y += ambient.g;
++    result.z += ambient.b;
++
++    // restore "local" surface color
++    result = result * albedo;
++
++    // add glossy term - do nothing to it for now
++    result = result + glossy;
++
++    float ink = inkAt(self, inDepthBuffer, inNormalBuffer, state->mOutputPixelX, state->mOutputPixelY);
++
++    // MoonRay for Modo: an edge detector answers on either side of a crease and next to nothing at its middle, so a line
++    // comes out as two with the surface showing between them, a pixel wide and broken up by the pixels' staircase. A pixel
++    // without ink between two with ink is taken as part of the line. Only asked near an edge: where the nine pixels around
++    // this one lie on one surface, none of it is a crease.
++    if (self->mCloseLineGaps && self->mEdgeDetector != 0) {
++        const unsigned int x = state->mOutputPixelX, y = state->mOutputPixelY;
++        const float here = InputBuffer_getFloatPixel(inDepthBuffer, x, y);
++        const Vec3f facing = InputBuffer_getFloat3Pixel(inNormalBuffer, x, y);
++        bool near = false;
++        for (uniform int dy = -1; dy <= 1; ++dy) {
++            for (uniform int dx = -1; dx <= 1; ++dx) {
++                const float depth = InputBuffer_getFloatPixel(inDepthBuffer, x + dx, y + dy);
++                const Vec3f normal = InputBuffer_getFloat3Pixel(inNormalBuffer, x + dx, y + dy);
++                if (abs(depth - here) > 1e-4f * abs(here) || dot(normal, facing) < 0.999f * dot(facing, facing)) {
++                    near = true;
++                }
++            }
++        }
++        if (near && ink > 0.f) {
++            static const uniform int across[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
++            float line = 1.f - ink;
++            for (uniform int axis = 0; axis < 4; ++axis) {
++                const uniform int dx = across[axis][0], dy = across[axis][1];
++                const float one = 1.f - inkAt(self, inDepthBuffer, inNormalBuffer, x + dx, y + dy);
++                const float other = 1.f - inkAt(self, inDepthBuffer, inNormalBuffer, x - dx, y - dy);
++                line = max(line, min(one, other));
++            }
++            ink = 1.f - line;
++        }
++    }
++
++    // MoonRay for Modo: an outline comes from depth, whose jump across a silhouette is far over any threshold, so each
++    // pixel is all ink or none and the outline steps with the pixel grid. Near an edge, the line is worked out over
++    // the 7 x 7 pixels around this one and blended along its own direction, as FXAA does a picture's edges: a step
++    // becomes as much ink as the line covers there, while a line's inside and its straight runs stay as they were.
++    if (self->mSmoothLines && self->mEdgeDetector != 0) {
++        const unsigned int x = state->mOutputPixelX, y = state->mOutputPixelY;
++        // Only where the line changes within the nine pixels around this one: elsewhere it is all ink or none.
++        float raw[49];
++        float least3 = 1.f, most3 = 0.f;
++        for (uniform int j = 2; j < 5; ++j) {
++            for (uniform int i = 2; i < 5; ++i) {
++                const float l = 1.f - inkAt(self, inDepthBuffer, inNormalBuffer, x + i - 3, y + j - 3);
++                raw[j * 7 + i] = l;
++                least3 = min(least3, l);
++                most3 = max(most3, l);
++            }
++        }
++        if (most3 - least3 > 1e-3f) {
++            // The line (1 - ink) at each of the 7 x 7 pixels, then at the middle 5 x 5 with its gaps closed.
++            for (uniform int j = 0; j < 7; ++j) {
++                for (uniform int i = 0; i < 7; ++i) {
++                    if (j < 2 || j > 4 || i < 2 || i > 4) {
++                        raw[j * 7 + i] = 1.f - inkAt(self, inDepthBuffer, inNormalBuffer, x + i - 3, y + j - 3);
++                    }
++                }
++            }
++            float line[25];
++            static const uniform int across[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
++            for (uniform int j = 1; j < 6; ++j) {
++                for (uniform int i = 1; i < 6; ++i) {
++                    float l = raw[j * 7 + i];
++                    if (self->mCloseLineGaps) {
++                        for (uniform int axis = 0; axis < 4; ++axis) {
++                            const uniform int ax = across[axis][0], ay = across[axis][1];
++                            l = max(l, min(raw[(j + ay) * 7 + i + ax], raw[(j - ay) * 7 + i - ax]));
++                        }
++                    }
++                    line[(j - 1) * 5 + (i - 1)] = l;
++                }
++            }
++            const float m = line[12], nw = line[6], ne = line[8], sw = line[16], se = line[18];
++            // Along the line: at right angles to the way it changes.
++            float dirX = -((nw + ne) - (sw + se));
++            float dirY = (nw + sw) - (ne + se);
++            const float reduce = max((nw + ne + sw + se) * (0.25f / 8.f), 1.f / 128.f);
++            const float scale = 1.f / (min(abs(dirX), abs(dirY)) + reduce);
++            // Up to four pixels along it: a long shallow step needs the reach.
++            dirX = clamp(dirX * scale, -4.f, 4.f);
++            dirY = clamp(dirY * scale, -4.f, 4.f);
++            // The line read between pixels (bilinear), an offset of at most two pixels from this one.
++            float taps[4];
++            static const uniform float along[4] = {1.f / 3.f - 0.5f, 2.f / 3.f - 0.5f, -0.5f, 0.5f};
++            for (uniform int t = 0; t < 4; ++t) {
++                const float px = 2.f + dirX * along[t], py = 2.f + dirY * along[t];
++                const int ix = clamp((int)floor(px), 0, 3), iy = clamp((int)floor(py), 0, 3);
++                const float fx = px - ix, fy = py - iy;
++                float a = 0.f, b = 0.f, c = 0.f, d = 0.f;
++                // Read through uniform loops: a varying index into a varying array.
++                for (uniform int k = 0; k < 25; ++k) {
++                    const uniform int ki = k % 5, kj = k / 5;
++                    if (ki == ix && kj == iy) a = line[k];
++                    if (ki == ix + 1 && kj == iy) b = line[k];
++                    if (ki == ix && kj == iy + 1) c = line[k];
++                    if (ki == ix + 1 && kj == iy + 1) d = line[k];
++                }
++                taps[t] = (a * (1.f - fx) + b * fx) * (1.f - fy) + (c * (1.f - fx) + d * fx) * fy;
++            }
++            const float twoTap = 0.5f * (taps[0] + taps[1]);
++            const float fourTap = 0.5f * twoTap + 0.25f * (taps[2] + taps[3]);
++            const float least = min(m, min(min(nw, ne), min(sw, se)));
++            const float most = max(m, max(max(nw, ne), max(sw, se)));
++            const float smoothed = (fourTap < least || fourTap > most) ? twoTap : fourTap;
++            ink = 1.f - saturate(smoothed);
++        }
++    }
++
++    if (self->mOutputMode == 1) {
++        // The lines alone: as much white as there is ink, on black.
++        result = Vec3f_ctor(1.0f - ink, 1.0f - ink, 1.0f - ink);
++    } else if (self->mOutputMode != 2) {
++        // The shading where there is no ink, the ink's colour where there is (MoonRay's own: result * ink, black ink).
++        const uniform Color inkColor = self->mInkColor;
++        result.x = result.x * ink + inkColor.r * (1.0f - ink);
++        result.y = result.y * ink + inkColor.g * (1.0f - ink);
++        result.z = result.z * ink + inkColor.b * (1.0f - ink);
++    }
+ 
+     *output = Color_ctor(result.x, result.y, result.z);
+ }
+diff --git a/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.json b/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.json
+index b08f827..cb4ec3d 100644
+--- a/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.json
++++ b/dso/displayfilter/ToonDisplayFilter/ToonDisplayFilter.json
+@@ -84,6 +84,40 @@
+             },
+             "default": "0",
+             "comment": "Type of edge detector to use"
++        },
++        "attrCloseLineGaps": {
++        "name": "close_line_gaps",
++        "label": "close line gaps",
++        "type": "Bool",
++        "default": "false",
++        "comment": "MoonRay for Modo: a pixel without ink between two with ink is taken as part of the line, so that a line does not come out as two with the surface showing between them"
++    },
++    "attrOutputMode": {
++            "name": "output_mode",
++            "label": "output mode",
++            "type": "Int",
++            "flags": "FLAGS_ENUMERABLE",
++            "enum": {
++                "Shading and lines": "0",
++                "Lines only": "1",
++                "Shading only": "2"
++            },
++            "default": "0",
++            "comment": "MoonRay for Modo: the cel shading with its ink lines, the ink lines alone (white on black, a matte to composite with), or the cel shading without them"
++        },
++        "attrSmoothLines": {
++            "name": "smooth_lines",
++            "label": "smooth lines",
++            "type": "Bool",
++            "default": "false",
++            "comment": "MoonRay for Modo: near an edge, the lines are blended along their own direction, so that an outline does not step with the pixel grid"
++        },
++        "attrInkColor": {
++            "name": "ink_color",
++            "label": "ink color",
++            "type": "Rgb",
++            "default": "Rgb(0.0, 0.0, 0.0)",
++            "comment": "MoonRay for Modo: the colour the ink lines are drawn in over the cel shading (black, as MoonRay draws them, by default). The lines alone stay white on black: a matte, the lines' alpha"
+         }
+     }
+ }
 diff --git a/lib/material/dwabase/DwaBaseLayerable.cc b/lib/material/dwabase/DwaBaseLayerable.cc
-index 9787e02..c0181d7 100644
+index 9787e02..99dbda4 100644
 --- a/lib/material/dwabase/DwaBaseLayerable.cc
 +++ b/lib/material/dwabase/DwaBaseLayerable.cc
-@@ -449,7 +449,8 @@ DwaBaseLayerable::createLobes(const DwaBaseLayerable * const dwaBaseLayerable,
+@@ -17,6 +17,19 @@
+ 
+ namespace {
+ 
++// Modo: DwaBase's independent transmission roughness kept under a mirror smooth surface (tools/port_source_switches.py). True when MoonRay was started with MOONRAY_MODO_TRANSMISSION_ROUGHNESS=1; read once.
++inline bool modoTransmissionRoughness()
++{
++    static const bool on = [] {
++        const char *value = std::getenv("MOONRAY_MODO_TRANSMISSION_ROUGHNESS");
++        return value && value[0] == '1';
++    }();
++    return on;
++}
++
++// The vector code is told once, as the library loads.
++const bool sModoTransmissionRoughnessSet = (ispc::DwaBaseLayerable_setModoTransmissionRoughness(modoTransmissionRoughness()), true);
++
+ // This is a construct to access the ISPC Data Struct from Inside the Scalar Material object.
+ // Note we are not using MATERIAL_GET_ISPC_CPTR to retrieve the ispc structure from the Material
+ // class as in other materials since that macro assumes a certain data layout we do not adhere to in
+@@ -449,7 +462,11 @@ DwaBaseLayerable::createLobes(const DwaBaseLayerable * const dwaBaseLayerable,
              transmissionRoughnessClamped = scene_rdl2::math::max(transmissionRoughness, minRoughness);
          }
  
 -        if (roughnessClamped < scene_rdl2::math::sEpsilon) {
++        // Modo: with MOONRAY_MODO_TRANSMISSION_ROUGHNESS, a rough transmission keeps its roughness under a mirror smooth
++        // surface. Off, as MoonRay's source: the surface's roughness alone decides, and the transmission is mirror sharp.
 +        if (roughnessClamped < scene_rdl2::math::sEpsilon &&
-+            (scene_rdl2::math::isZero(transmissionWeight) || transmissionRoughnessClamped < scene_rdl2::math::sEpsilon)) {
++            (!modoTransmissionRoughness() ||
++             scene_rdl2::math::isZero(transmissionWeight) || transmissionRoughnessClamped < scene_rdl2::math::sEpsilon)) {
              const moonray::shading::MirrorBSDF dielectricBSDF(
                      N,
                      reflIor,
 diff --git a/lib/material/dwabase/ispc/DwaBaseLayerable.ispc b/lib/material/dwabase/ispc/DwaBaseLayerable.ispc
-index 253aaf4..76cd001 100644
+index 253aaf4..6858ed0 100644
 --- a/lib/material/dwabase/ispc/DwaBaseLayerable.ispc
 +++ b/lib/material/dwabase/ispc/DwaBaseLayerable.ispc
-@@ -1007,7 +1007,8 @@ DWABASE_createLobes(const uniform Material * uniform me,
+@@ -4,6 +4,16 @@
+ /// @file DwaBaseLayerable.ispc
+ 
+ #include "DwaBaseLayerable.isph"
++
++// Modo: DwaBase's transmission roughness kept under a mirror smooth surface (MOONRAY_MODO_TRANSMISSION_ROUGHNESS,
++// tools/port_source_switches.py).
++uniform bool gModoTransmissionRoughness = false;
++
++export void
++DwaBaseLayerable_setModoTransmissionRoughness(uniform bool on)
++{
++    gModoTransmissionRoughness = on;
++}
+ #include <moonray/rendering/shading/ispc/ColorCorrect.isph>
+ #include <moonray/rendering/shading/ispc/Shading.isph>
+ 
+@@ -1007,7 +1017,8 @@ DWABASE_createLobes(const uniform Material * uniform me,
          }
  
          
 -        if (roughnessClamped < sEpsilon) {
 +        if (roughnessClamped < sEpsilon &&
-+            (isZero(transmissionWeight) || transmissionRoughnessClamped < sEpsilon)) {
++            (!gModoTransmissionRoughness || isZero(transmissionWeight) || transmissionRoughnessClamped < sEpsilon)) {
              MirrorBSDF dielectricBSDF;
              MirrorBSDF_init(dielectricBSDF,
                              N,

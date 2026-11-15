@@ -195,7 +195,9 @@ ProjectCameraMap_v2 from a perspective or orthographic camera), UVTransformMap, 
 _v3, GradientMap, RampMap, the colour corrects (ColorCorrect, Contrast, GainOffset, Gamma, Hsv, HueShift, Saturation,
 TMI and Legacy), BlendMap, ClampMap, RemapMap, OpMap, the conversions, Switch maps, TwoSidedMap and LODMap; the normal
 maps ImageNormalMap, ProjectPlanarNormalMap, ProjectTriplanarNormalMap_v2, ProjectCameraNormalMap, CombineNormalMap,
-SwitchNormalMap and RgbToNormalMap; and the kit's ModoTextureMap and ModoNormalMap. Projections read P and N
+SwitchNormalMap and RgbToNormalMap; and the kit's ModoTextureMap, ModoNormalMap and ModoProceduralMap (Modo's procedural textures
+through the object, by `native-port/maps/ModoProcedural/modo_patterns.h`, which MoonRay's map and MoonLightIPR's kernel share;
+world and texture spaces, the object space refused, which the kit does not write). Projections read P and N
 (reference space, ref_P and ref_N, is refused); textures must be complete stored mip pyramids.
 
 Texture lookups follow XPU's: MoonRay's vector shading reads textures through `CPP_oiioTexture` and

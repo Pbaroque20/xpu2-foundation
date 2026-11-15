@@ -356,7 +356,8 @@ inline rdl::Mat4d affine(const rdl::SceneObject& obj){
 // rndr::readPixelBuffer into a float buffer w x h: the file's first channel, or the luminance of its first three
 // (channel_sum .2126 .7152 .0722), resized to the frame by OIIO's default filter, its rows from the bottom.
 inline std::vector<float> readPixelSampleMap(const std::string& file,unsigned w,unsigned h){
- auto in=OIIO::ImageInput::open(file);need(in!=nullptr,"Pixel sample map \""+file+"\" cannot be opened");
+ std::unique_ptr<xpu2::remote::Proxy> proxy;auto in=xpu2::remote::open(file,proxy);  // remote_files.h: from its source when it has one
+ need(in!=nullptr,"Pixel sample map \""+file+"\" cannot be opened");
  const OIIO::ImageSpec spec=in->spec();
  std::vector<unsigned char> raw(size_t(spec.width)*size_t(spec.height)*size_t(spec.nchannels)*spec.format.size());
  need(in->read_image(0,0,0,spec.nchannels,spec.format,raw.data()),"Pixel sample map \""+file+"\" cannot be read");in->close();
@@ -980,8 +981,8 @@ inline MotionParams motionParams(const rdl::SceneVariables& sv,const rdl::SceneO
 inline bool meshHasMotion(const rdl::SceneObject& o){
  namespace sm=scene_rdl2::math;
  if(!sm::isEqual(sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN)),sm::toFloat(o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END))))return true;
- // Asked of any geometry: a VdbGeometry has none of these lists, and asking one it does not have throws.
- // A second step the same as the first is no motion: a host may write one for meshes that do not deform.
+ // Asked of any geometry: ModoFurGeometry has none of these lists, and asking one it does not have throws.
+ // A second step the same as the first is no motion: the kit writes one for meshes that do not deform (Hydra's).
  for(const char* name:{"vertex_list_1","velocity_list_0","velocity_list_1","accleration_list"})
   for(auto i=o.getSceneClass().beginAttributes();i!=o.getSceneClass().endAttributes();++i)
    if((*i)->getName()==name&&!o.get<rdl::Vec3fVector>(name).empty()&&
@@ -3979,7 +3980,8 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
     auto data=std::make_shared<Plan::CameraMapData>();
     bool haveNormalMap=false;const int normalSpace=get<rdl::Int>(*camera,"normal_map_space");
     {const std::string file=get<rdl::String>(*camera,"normal_map");
-     if(mode!=0&&!file.empty())if(auto in=OIIO::ImageInput::open(file)){
+     std::unique_ptr<xpu2::remote::Proxy> proxy;  // remote_files.h: from its source when it has one
+     if(mode!=0&&!file.empty())if(auto in=xpu2::remote::open(file,proxy)){
       const OIIO::ImageSpec spec=in->spec();std::vector<float> texels(size_t(spec.width)*spec.height*std::max(1,spec.nchannels));
       if(spec.width>0&&spec.height>0&&in->read_image(0,0,0,-1,OIIO::TypeDesc::FLOAT,texels.data())){
        data->normalMap.assign(size_t(spec.width)*spec.height*3,0.0f);const int nc=spec.nchannels;

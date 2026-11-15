@@ -96,7 +96,7 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
             kernels, kernel_flags = bc6h_kernels(source, out / 'bc6h')
             exe, report['native_build'] = build_units(source, [HERE / 'xpu2_session.cc', HERE / 'xpu2_scene.cc', HERE / 'xpu2_cpu.cc', HERE / 'xpu2_meshopt.cc', HERE / 'xpu2_bc6h.cc'], out / 'native',
                                                       [runtime / 'libembree4.dll', runtime / 'librendering_lpe.dll',
-                                                       runtime / 'librendering_displayfilter.dll', *kernels, '-lcfgmgr32', '-lwinmm'],
+                                                       runtime / 'librendering_displayfilter.dll', *kernels, '-lcfgmgr32', '-lwinmm', '-lbcrypt', '-lws2_32', '-liphlpapi'],
                                                       ['-I' + str(v) for v in include] + ['-I' + str(source / 'upstream/meshoptimizer/src'), '-DXPU2_SPLIT_UNITS'] + kernel_flags)
         finally:
             geom_thread.join()
@@ -124,6 +124,8 @@ def build_session(source, runtime, async_build, out, cpu_test=False):
         objdump = source / 'toolchain/msys64/ucrt64/bin/objdump.exe'
         # The scene classes are read through their proxies (proxy mode): every one, and what they load.
         proxies = sorted(runtime.glob('*.so.proxy'))
+        # And the kit's own class the reference is older than: without its proxy a scene holding one did not load at all.
+        proxies.append(source / 'build/native-renderer-avx/bin/ModoProceduralMap.so.proxy')
         for p in proxies:
             shutil.copyfile(p, rt / p.name)
         # The display filters run as MoonRay's own, from their DSOs (aov_display.h).

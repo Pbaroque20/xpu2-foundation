@@ -23,6 +23,7 @@
 #include "surface_core.h"
 #include "texture_core.h"
 #include "multi_device.h"
+#include "remote_files.h"
 #include <vector>
 // ISPC Texture Compressor's BC6H encoder (xpu2_bc6h.cc), weak: a program built without it just does not compress.
 extern "C" {
@@ -227,7 +228,9 @@ struct Pyramid {
  // keeps every file in floats, as MoonRay reads them.
  bool rounds=false;
  Pyramid(const Pyramid&)=delete;
- explicit Pyramid(const std::string& name,bool alpha=false):file(name),alphaOnly(alpha){auto in=OIIO::ImageInput::open(name);need(bool(in),"Pyramid read");pages.reserve(tex::MaxLevels);
+ explicit Pyramid(const std::string& name,bool alpha=false):file(name),alphaOnly(alpha){
+  // A file from elsewhere (remote_files.h: a Rhizome node's texture from the swarm's memory) read through its source.
+  std::unique_ptr<remote::Proxy> proxy;auto in=remote::open(name,proxy);need(bool(in),"Pyramid read");pages.reserve(tex::MaxLevels);
   // Whether it is to be compressed, by a small level's values.
   if(overflowCompress().load()&&compressorThere()){compressed=true;
    for(int l=0;in->seek_subimage(0,l);++l){const auto small=in->spec();if(std::max(small.width,small.height)>64)continue;
@@ -249,6 +252,7 @@ struct Pyramid {
    rounds=sourceFormat==2&&(format==3||format==6);
    if(!image.count&&lazyTextures()&&spec.tile_width>0){
     // The finest level read when first used (loadTile): its pages empty for now.
+    remote::addToCache(*lazyCache(),name);
     pages.emplace_back(size_t(nx)*ny,nullptr);
     image.levels[image.count]={w,h,pages.back().data(),0,format,&Pyramid::loadTile,this};++image.count;continue;}
    std::vector<float> decoded(size_t(w)*h*spec.nchannels);
@@ -395,13 +399,16 @@ struct File {
  bool alpha=false;  // its alpha as its colour (ImageMap's alpha_only), a texture of its own beside the file's colour
  File(const std::filesystem::path& path,const std::filesystem::path& root,std::shared_ptr<OIIO::TextureSystem> s,bool alphaOnly=false):system(std::move(s)),name(path.string()),alpha(alphaOnly){
   admittedPath(path,root);
+  // A file from elsewhere (remote_files.h) is its source's, which does not change: no lease, its size the source's.
+  const auto source=remote::find(path.string());
   // Retain a read lease: no writer or delete can change the file under OIIO's cache.
-  lock=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
-  need(lock!=INVALID_HANDLE_VALUE,"Cannot lease immutable texture");
+  if(!source){lock=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+   need(lock!=INVALID_HANDLE_VALUE,"Cannot lease immutable texture");}
   // Any size of file: it is read a tile at a time as the render reads it (a file of more than 1 GB was refused, and the
   // whole scene went to MoonRay XPU: a 16K float .tx is 2.2 GB).
-  try{LARGE_INTEGER bytes{};need(GetFileSizeEx(lock,&bytes)&&bytes.QuadPart>0,"Texture file unreadable");
-   auto in=OIIO::ImageInput::open(path.string());need(bool(in),"TX open failed");
+  try{LARGE_INTEGER bytes{};if(source)bytes.QuadPart=(long long)source->size();
+   need((source||GetFileSizeEx(lock,&bytes))&&bytes.QuadPart>0,"Texture file unreadable");
+   std::unique_ptr<remote::Proxy> proxy;auto in=remote::open(path.string(),proxy);need(bool(in),"TX open failed");
    int w=0,h=0;for(int level=0;level<32;++level){if(!in->seek_subimage(0,level))break;const auto& spec=in->spec();
     need(spec.depth==1&&spec.x==0&&spec.y==0&&spec.z==0&&spec.full_x==0&&spec.full_y==0&&spec.full_width==spec.width&&spec.full_height==spec.height&&spec.width>0&&spec.height>0&&spec.tile_width>0&&spec.tile_height>0&&spec.nchannels>=1&&spec.nchannels<=4&&spec.channelformats.empty()&&!spec.deep,"Unsupported TX layout");
     if(level==0){eightBit=spec.format==OIIO::TypeDesc::UINT8;need(eightBit||spec.format==OIIO::TypeDesc::HALF||spec.format==OIIO::TypeDesc::FLOAT,"Unsupported TX format");}
@@ -410,8 +417,9 @@ struct File {
     if(const unsigned side=overflowSide().load();!side||unsigned(std::max(w,h))<=side)decodedBytes+=overflowCompress().load()?uint64_t(w)*h:uint64_t(w)*h*spec.nchannels*4;
     need(decodedBytes<=fileTextureBudget(),"Decoded texture budget");++levels;
    }need(levels>0&&w==1&&h==1,"Complete stored mip pyramid required");need(!in->seek_subimage(1,0),"Multipart texture unsupported");
+   remote::addToCache(*system->imagecache(),name.string());
    OIIO::ImageSpec spec;need(system->get_imagespec(name,spec),"OIIO texture admission failed");
-  }catch(...){CloseHandle(lock);lock=INVALID_HANDLE_VALUE;throw;}
+  }catch(...){if(lock!=INVALID_HANDLE_VALUE)CloseHandle(lock);lock=INVALID_HANDLE_VALUE;throw;}
  }
  ~File(){if(lock!=INVALID_HANDLE_VALUE)CloseHandle(lock);}File(const File&)=delete;
 };
