@@ -229,6 +229,15 @@ struct LaunchParams {
     U64L cryptoOffset;
     U32 cryptoEvents, cryptoCategories, cryptoMultiPresence, cryptoExtras, cryptoNodeWords, cryptoNodeCapacity;
 
+    // Deep output (aov_deep.h): a list of hard surface segments a pixel (deepHeads, ~0u: empty), merged without locks,
+    // the nodes (aov::DeepWords words each) from a pool (deepNodes, deepNodeCapacity of them; run dry, an error); the
+    // subpixel resolution, the curvature tolerance's cosine and the z tolerance.
+    U32* deepHeads;
+    U32* deepNodes;
+    U32* deepNodeCount;
+    U32 deepNodeCapacity, deepRes;
+    float deepCos, deepZ;
+
     // Partial shading (on: partial): each launch thread's mark that its sample read a coarser level, the missing tile's
     // id (~0u: none known; lowFlags), the provisional film (provSums, rgb and alpha a pixel; provCounts), the ring of
     // provisional samples in pinned host memory (refines), and those this launch renders again in full first

@@ -19,6 +19,7 @@
 #include "volume_core.h"
 #include "aov_material.h"
 #include "aov_crypto.h"
+#include "aov_deep.h"
 #include "aov_state.h"
 #include "camera_core.h"
 
@@ -44,6 +45,8 @@ struct Radiance {
     // Cryptomatte's events (aov_crypto.h): room for cryptoCapacity, cryptoCount made.
     aov::CryptoEvent* crypto = nullptr;
     U32 cryptoCapacity = 0, cryptoCount = 0;
+    // Deep output (aov_deep.h): the camera ray's first surface, where the AOV tables ask for deep output.
+    aov::DeepHit deep;
 };
 
 // Backend: trace(ray) -> resume::Hit (geom == ~0u on a miss),
@@ -2042,6 +2045,7 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
     // as the next path is taken up; paths pushed meanwhile take their parent's role.
     const bool cryptoOn = at.crypto && out.crypto && out.cryptoCapacity;
     out.cryptoCount = 0;
+    out.deep.hit = 0;
     stack[0].crypto = cryptoOn ? aov::CryptoCamera : aov::CryptoNone;
     int cryptoOwner = aov::CryptoNone;
     U32 cryptoBase = 0;
@@ -2230,6 +2234,20 @@ X2_HD inline SampleStatus integratePaths(const mixed::Config& c, U32 pixel, U32 
         const U32 status = backend.shade(hit, ray, st, bsdf, presence);
         if (status == tex::Miss) return SampleStatus::Miss;
         if (status != tex::Ready) return SampleStatus::Error;
+        // Deep output: the camera ray's first surface (PathIntegrator's deep primary ray, its hard surface): the distance
+        // and the ray's z in render space, the geometric normal, the deep IDs and the sample's place in its pixel.
+        if (at.deep && pv.depth == 0 && !out.deep.hit) {
+            const V3 rd = aov::renderVectorOf(c.worldToRender, ray.direction);
+            const float len = sqrtf(rd.x * rd.x + rd.y * rd.y + rd.z * rd.z);
+            out.deep.hit = 1;
+            out.deep.t = hit.t * len;
+            out.deep.rayZ = len > 0.0f ? rd.z / len : 0.0f;
+            out.deep.normal = aov::renderVectorOf(c.worldToRender, st.Ng);
+            // The IDs as MoonRay has them at a hit: provided only where a Cryptomatte output asks for its attributes, else 0.
+            for (U32 i = 0; i < at.deepIdCount; ++i) out.deep.ids[i] = at.crypto ? aov::cryptoFloat(st, at.deepIdKeys[i]) : 0.0f;
+            out.deep.sx = sample::draw(root, 0, c.sampling);
+            out.deep.sy = sample::draw(root, 1, c.sampling);
+        }
         // A hit without an attribute its shading requires (ShadeBundleHandler's hasAllRequiredAttributes): the fatal
         // colour and the path's pixel weight, and nothing else; no AOV, no light path expression, no Cryptomatte.
         if (bsdf.fatal) {

@@ -2422,6 +2422,19 @@ inline scene_rdl2::math::Xform3f instanceXformAt(const RenderItem& item,const Mo
 inline rdl::Mat4d instanceMatrix(const RenderItem& item){
  const auto& x=item.sample[0];
  return rdl::Mat4d(x.l.vx.x,x.l.vx.y,x.l.vx.z,0,x.l.vy.x,x.l.vy.y,x.l.vy.z,0,x.l.vz.x,x.l.vz.y,x.l.vz.z,0,x.p.x,x.p.y,x.p.z,1);}
+// MoonRay renders an instance of a deforming mesh as the mesh at the shutter's close, its deformation not blurred
+// (only the instance's own motion is): an instancer's shared primitive is not given the reference's time steps. XPU2
+// follows (a test scene: an identity instance of a bending grid as MoonRay's at its close, coverage within 0.1%);
+// XPU2_SESSION_INSTANCE_DEFORMATION_BLUR=1 blurs it as the mesh itself is blurred.
+inline bool instanceDeformationBlur(){const char* v=std::getenv("XPU2_SESSION_INSTANCE_DEFORMATION_BLUR");return v&&v[0]=='1';}
+// A tessellated prototype's shape at its last time step alone (positions, normals, derivatives), for its instances.
+inline void frozenAtClose(MeshData& m){
+ if(m.steps.empty()||instanceDeformationBlur())return;
+ m.positions=m.steps.back();
+ if(!m.stepNormals.empty())m.normals=m.stepNormals.back();else if(!m.normals1.empty())m.normals=m.normals1;
+ if(!m.stepDpds.empty())m.dpds=m.stepDpds.back();
+ if(!m.stepDpdt.empty())m.dpdt=m.stepDpdt.back();
+ m.steps.clear();m.stepNormals.clear();m.stepDpds.clear();m.stepDpdt.clear();m.normals1.clear();m.subdSteps=false;}
 // A moving instance's vertices over the shutter: the reference's own time steps in its space (meshMotionSteps with no
 // transform), each moved by the instance's transform at its time; a turning instance is baked at 17 steps.
 inline std::vector<std::vector<V3>> instanceMotionSteps(const rdl::SceneObject& o,const MotionParams& mp,const RenderItem& item,
@@ -2431,7 +2444,9 @@ inline std::vector<std::vector<V3>> instanceMotionSteps(const rdl::SceneObject& 
  namespace sm=scene_rdl2::math;
  const rdl::Mat4d one(sm::one);
  std::vector<std::vector<float>> lw;
- const auto local=meshMotionSteps(o,mp,one,one,staticTakesSecond,nullptr,w0,w1,widths?&lw:nullptr);
+ auto local=meshMotionSteps(o,mp,one,one,staticTakesSecond,nullptr,w0,w1,widths?&lw:nullptr);
+ // The reference's deformation as MoonRay's instances take it: its shape at the close (instanceDeformationBlur).
+ if(local.size()>1&&!instanceDeformationBlur()){local.erase(local.begin(),local.end()-1);if(lw.size()>1)lw.erase(lw.begin(),lw.end()-1);}
  sm::XformComponent3f c0,c1;sm::decompose(item.sample[0],c0);sm::decompose(item.sample[1],c1);
  const bool turns=item.moves&&!(c0.r==c1.r||c0.r==-c1.r);
  const size_t n=std::max<size_t>(local.size(),item.moves?(turns?17:2):1);
@@ -3084,7 +3099,7 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
   "progressive_tile_order","checkpoint_tile_order","batch_tile_order","texture_cache_size","fps","motion_steps","max_geometry_resolution",
   // The windows (rezed: the resolution divisor), the pixels rendered and the texture blur (the path tracer's camera).
   "res","aperture_window","region_window","sub_viewport","debug_pixel","texture_blur",
-  // What only deep outputs read, which are refused.
+  // What only deep outputs read (aov_plan.h reads them for deep output).
   "deep_id_attribute_names","deep_format","deep_curvature_tolerance","deep_z_tolerance","deep_vol_compression_res","deep_max_layers","deep_layer_bias"});
  // The frame: the rezed region window (SceneVariables::getRezedWidth and getRezedHeight).
  const float resolution=get<rdl::Float>(sv,"res");need(std::isfinite(resolution)&&resolution>0,"Invalid resolution divisor");
@@ -3686,7 +3701,6 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
   else attributes(o,{"vertex_list_0","face_vertex_count","vertices_by_index","is_subd","node_xform","smooth_normal"});
   const bool meshMotion=paths&&o.getSceneClass().getName()=="RdlMeshGeometry"&&(meshHasMotion(o)||item.moves);
   need(paths||!item.instancer||!displacementShader||!get<rdl::Bool>(sv,"enable_displacement"),o.getName()+": a displaced instance is not rendered yet");
-  need(!item.instancer||!polyGeometry||!meshHasMotion(o),o.getName()+": an instanced displaced polygon mesh of its own motion is not rendered yet");
   need(!meshMotion||&o!=bakeGeometry,o.getName()+": a baked mesh in motion is not rendered yet");
   // A displaced mesh MoonRay is about to tessellate uniformly (subdivision or PolyMesh): its size told from its faces and
   // mesh resolution first (about r x r times its triangles, 18 bytes a triangle with its share of vertices), so one the
@@ -3726,6 +3740,7 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
      subdDisplacement.check(o);}
     auto m=subdivisionMesh(*surface,faceMask,meshName,std::move(sig),rdl::Mat4d(scene_rdl2::math::one),polys);
     m->steps=surface->steps;m->stepNormals=surface->stepNormals;m->stepDpds=surface->stepDpds;m->stepDpdt=surface->stepDpdt;
+    frozenAtClose(*m);  // as MoonRay's instances take a deforming reference
     if(shareInstance)m->instanced=true;  // in its own space, placed by each instance (placeInstance)
     else{instanceSurface(*m,item,plan->motion);instanceAttributes(*item.instancer,item.instance,item.count,*m);}
     data=std::move(m);++plan->preparedMeshes;
@@ -3792,13 +3807,22 @@ X2_SPLIT_INLINE PlanView prepare(const rdl::SceneContext& context,const Canonica
     data=std::make_shared<MeshData>();launched=job;++plan->preparedMeshes;
    }else{
    auto& surface=item.instancer?polyRefCache[&o]:polyCache[&o];
-   if(!surface&&item.instancer){surface=tessellatePolygons(o,layer,*plan,rdl::Mat4d(scene_rdl2::math::one),nullptr,displaceCall,true);polyDisplacement.check(o);}
+   // An instance's prototype: tessellated and displaced once in its own space; one that deforms over the shutter at its
+   // time steps in its own space, on one topology, each instance then taking its shape at its own samples (instanceSurface).
+   if(!surface&&item.instancer){const rdl::Mat4d one(scene_rdl2::math::one);std::vector<std::vector<V3>> steps;
+    if(meshMotion&&meshHasMotion(o))steps=meshMotionSteps(o,plan->motion,one,one);
+    surface=tessellatePolygons(o,layer,*plan,one,steps.size()>1?&steps:nullptr,displaceCall,true);polyDisplacement.check(o);
+    need(steps.size()<2||surface->steps.size()+1==steps.size(),o.getName()+": MoonRay's polygon tessellation gave "+std::to_string(surface->steps.size()+1)+" time steps of "+std::to_string(steps.size()));}
    if(!surface){std::vector<std::vector<V3>> steps;
     if(meshMotion)steps=meshMotionSteps(o,plan->motion,o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_BEGIN),o.get<rdl::Mat4d>("node_xform",rdl::TIMESTEP_END));
     surface=tessellatePolygons(o,layer,*plan,transform,steps.empty()?nullptr:&steps,displaceCall);polyDisplacement.check(o);}
    if(item.instancer){
     // An instance: the prototype tessellated and displaced once in its own space, moved by the instance's transform.
     auto m=polygonMesh(*surface,faceMask,meshName,std::move(sig),rdl::Mat4d(scene_rdl2::math::one),polys);
+    // A deforming prototype's vertex normals at its last step (normals1) as a later step's, for instanceSurface to turn
+    // with each instance; its own end normals are then the instance's steps'.
+    if(!m->steps.empty()&&!m->normals1.empty()){if(m->steps.size()==1)m->stepNormals={m->normals1};m->normals1.clear();}
+    frozenAtClose(*m);  // as MoonRay's instances take a deforming reference
     if(shareInstance)m->instanced=true;  // in its own space, placed by each instance (placeInstance)
     else{instanceSurface(*m,item,plan->motion);instanceAttributes(*item.instancer,item.instance,item.count,*m);}
     data=std::move(m);}

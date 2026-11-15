@@ -32,7 +32,11 @@ inline bool sparseStart(const cpu::Plan& p) {
     return on && p.realtime;
 }
 
+struct ResumeState;  // below
+
 struct RenderOptions {
+    // A frame taken up from a resumable checkpoint's state (null: from its start).
+    std::shared_ptr<const ResumeState> resumeFrom;
     unsigned threads = 12;  // CPU lane workers
     int mode = 2;           // 0 CPU only, 1 GPU only, 2 both
     GridOptions grid{};
@@ -88,6 +92,10 @@ struct Watch {
     // checkpointSeconds (0 or no checkpoint: none).
     double checkpointSeconds = 0;
     std::function<void(struct RenderResult&& sofar)> checkpoint;
+    // Resumable checkpoints (a frame by sampling generations): every resumableSeconds, at the next boundary between
+    // generations, its state (ResumeState) and the frame so far as its end would make it. In place of checkpoint.
+    double resumableSeconds = 0;
+    std::function<void(std::shared_ptr<ResumeState>, struct RenderResult&& sofar)> resumable;
     // Each sampling generation as it goes out (the MoonRay Terminal): its number, its samples, the tiles still
     // sampling and all the image's tiles, the samples a pixel on average once it is done, and the seconds into the frame.
     std::function<void(unsigned generation, unsigned long long samples, size_t liveTiles, size_t tiles, double perPixel, double seconds)> generationLog;
@@ -113,6 +121,26 @@ struct PassTrace {
     double generated = -1, launched = -1, completed = -1, asked = -1, errors = -1, trees = -1;
 };
 
+// A frame by sampling generations as a resumable checkpoint holds it (Watch::resumable): saved between generations, when
+// every generation sent out has completed and been evaluated and nothing is in flight, so the films hold exactly each
+// pixel's first planned samples. The films merged (the beauty's sums, odd-index sums and counts; the AOVs' accumulators
+// and closest depths; Cryptomatte's fragments as sums), and where the generations stand: those made, the samples spent
+// and planned, the passes' samples and times, uniform's time, the time the frame had run, whether it had converged,
+// and the cellular tiles' state. A frame taken up from it (RenderOptions::resumeFrom) goes on with the next generation.
+struct ResumeState {
+    std::vector<double> sums, odd, aovRaw;
+    std::vector<U32> counts, planned;
+    std::vector<float> aovDepths;
+    std::shared_ptr<aov::CryptoBuffer> crypto;
+    U32 generated = 0;
+    double spent = 0, budgetSeconds = 0, elapsed = 0;
+    bool stop = false;
+    std::vector<U64> expected;
+    std::vector<PassTrace> trace;
+    std::vector<char> cells;
+};
+
+
 struct RenderResult {
     std::vector<float> rgba;
     std::vector<U32> counts;  // samples each pixel received
@@ -129,6 +157,8 @@ struct RenderResult {
     std::vector<float> aovRawDepths;
     // Cryptomatte's fragments, finalized (aov_crypto.h), when an output asks for them.
     std::shared_ptr<aov::CryptoBuffer> crypto;
+    // Deep output's segments (aov_deep.h), both lanes', when an output is deep.
+    std::shared_ptr<aov::DeepFilm> deep;
     // The display filter outputs' pixels by output name (aov_display.h), three floats a pixel, rows from the bottom.
     std::map<std::string, std::vector<float>> displayFilters;
     U64 cpuSamples = 0, gpuSamples = 0, parkedRun = 0, launches = 0, cardLaunches = 0 /* the other graphics cards' (multi_device.h) */, cpuSteals = 0, cpuMoves = 0,
@@ -352,6 +382,7 @@ public:
             ownFilm = std::make_unique<HostFilm>(plan_->width, plan_->height);
             ownFilm->initAovs(cpuScene_.aovTables, plan_->aovs && plan_->aovs->heatMap);
             ownFilm->initCrypto(plan_->aovs.get());
+            ownFilm->initDeep(plan_->aovs.get(), aov::deepFrameSpp(plan_->adaptive, plan_->maxSamples, plan_->spp, plan_->pixelSamples));
         }
         HostFilm& film = share ? *shareFilm_ : *ownFilm;
         RetryQueue retries;
@@ -380,6 +411,21 @@ public:
             const unsigned trees = o.treeThreads != ~0u ? o.treeThreads : std::max(1u, std::min(o.threads, 16u) - 1);
             if (!pool_ || pool_->size() != trees) pool_ = std::make_unique<Pool>(trees);
             state.start = Clock::now();
+            // Taken up from a resumable checkpoint: the films begin with its samples (the card's, where a card renders, so
+            // its passes' sample indices go on from them; else the host's), the AOVs and Cryptomatte in the host's, and
+            // the generations go on from where they stood.
+            if (o.resumeFrom && !chainFrame && state.cellular) {
+                const ResumeState& s = *o.resumeFrom;
+                if (!state.restore(s)) {
+                    result.failed = true;
+                    result.error = "the saved render is of another frame (its size or sampling differ)";
+                    return result;
+                }
+                if (useGpu) gpu_->seedFilm(s.sums, s.odd, s.counts);
+                else film.seedBeauty(s.sums, s.odd, s.counts);
+                film.seedAovs(s.aovRaw, s.aovDepths);
+                if (s.crypto) film.seedCrypto(*s.crypto);
+            }
             if (chainFrame) state.startChain(*gpu_, tileOrder(gridOptions.cellSize));
             else state.generateReady(grid, useGpu ? gpu_ : nullptr);
         }
@@ -579,6 +625,50 @@ public:
                 if (card.lane->inFlight() || card.lane->parkedOutstanding()) return false;
             return true;
         };
+        // Resumable checkpoints (Watch::resumable), in a frame by sampling generations: when the next is due, and the save.
+        const bool resumable = adaptive && state.cellular && watch && watch->resumable && watch->resumableSeconds > 0;
+        double nextResumable = resumable ? watch->resumableSeconds : -1;
+        bool drainAfterSave = false;  // a drain asked for: the save first, at the next boundary
+        auto saveResumable = [&](Adaptive& s) {
+            auto keep = std::make_shared<ResumeState>();
+            if (useGpu) {
+                gpu_->downloadFilm();
+                while (!gpu_->filmReady()) std::this_thread::yield();
+                addCardAovs(film);
+            }
+            std::vector<double> heat;
+            film.snapshot(keep->sums, keep->counts, keep->odd, keep->aovRaw, keep->aovDepths, heat);
+            const aov::Tables& t = film.aovTables();
+            const size_t pixels = size_t(plan_->width) * plan_->height;
+            if (useGpu)
+                for (size_t p = 0; p < pixels; ++p) {
+                    keep->counts[p] += gpu_->counts()[p];
+                    for (int c = 0; c < 4; ++c) {
+                        keep->sums[p * 4 + c] += gpu_->sums()[p * 4 + c];
+                        if (gpu_->odd()) keep->odd[p * 4 + c] += gpu_->odd()[p * 4 + c];
+                    }
+                    if (t.channels && gpu_->aovs())
+                        mergeAovPixel(t, keep->aovRaw.data() + p * t.channels, keep->aovDepths.data() + p * t.closestCount,
+                                      gpu_->aovs() + p * t.channels, gpu_->aovDepths() ? gpu_->aovDepths() + p * t.closestCount : keep->aovDepths.data() + p * t.closestCount);
+                }
+            if (!film.crypto().empty()) {
+                keep->crypto = std::make_shared<aov::CryptoBuffer>();
+                film.snapshotCrypto(*keep->crypto);
+                if (useGpu) gpu_->mergeCrypto(*keep->crypto);
+            }
+            keep->generated = s.generated;
+            keep->spent = s.spent;
+            keep->budgetSeconds = s.budgetSeconds;
+            keep->elapsed = s.at();
+            keep->stop = s.stop;
+            keep->planned = s.planned;
+            keep->expected = s.expected;
+            keep->trace = s.trace;
+            keep->cells = s.cells.save();
+            RenderResult sofar;
+            snapshotResult(film, sofar, adaptive, useGpu ? gpu_ : nullptr, true);
+            watch->resumable(std::move(keep), std::move(sofar));
+        };
         // Partial shading: the provisional samples a launch renders again, and a guard against a cache too small for
         // them (the queue no lower over many launches that took them whether or not their tiles had landed).
         std::vector<Refine> refineBatch(partial ? GpuLane::RefineInCapacity : 0);
@@ -592,13 +682,19 @@ public:
                     cancelled = true;
                     break;
                 }
-                if (!draining && watch->drain && watch->drain()) {
-                    if (!partial) {
+                // With resumable checkpoints, a drain first finishes the generations out and saves there (below), so that the
+                // render can be taken up from where it was stopped; then it drains.
+                if (!draining && !drainAfterSave && watch->drain && watch->drain()) {
+                    if (resumable && !state.chain && !state.finished(useGpu ? gpu_ : nullptr)) {
+                        drainAfterSave = true;
+                        state.hold = true;
+                    } else if (!partial) {
                         drained = true;
                         break;
+                    } else {
+                        draining = true;
+                        grid.close();
                     }
-                    draining = true;
-                    grid.close();
                 }
             }
             preview();
@@ -819,6 +915,23 @@ public:
                 if (state.chain && gpu_->launchCount() > before) {  // the pass chain went out: one flight
                     if (result.timeline.firstLaunch < 0) result.timeline.firstLaunch = at();
                     result.launchTrace.push_back({at(), -1, 0, 0, 0, 0, 0, 0});
+                }
+            }
+            // A resumable checkpoint: once one is due no new generation goes out; when every one out has completed and been
+            // evaluated and nothing is in flight, the films are saved as they stand with where the generations stood.
+            if (resumable && !draining && !state.chain) {
+                if (!state.hold && at() >= nextResumable) state.hold = true;
+                if (state.hold && previewState == PreviewIdle && grid.empty() && state.atBoundary() &&
+                    cpuLane.idle() == cpuLane.threads() && !retries.size() && !refines.size() &&
+                    (!useGpu || (gpu_->inFlight() == 0 && gpu_->parkedOutstanding() == 0 && cardsQuiet()))) {
+                    const bool finishing = state.finished(useGpu ? gpu_ : nullptr);
+                    if (!finishing) saveResumable(state);
+                    if (drainAfterSave && !finishing) {  // a stop: saved where it stands, the frame ends with what it has
+                        drained = true;
+                        break;
+                    }
+                    state.hold = false;
+                    nextResumable = at() + watch->resumableSeconds;
                 }
             }
             const bool empty = grid.empty() && (draining || !adaptive || state.finished(useGpu ? gpu_ : nullptr));
@@ -1093,6 +1206,10 @@ private:
             // A share's fragments stay sums: the shares of a frame are merged (Rhizome's master), then finalized once.
             if (shareFilm_.get() != &film) result.crypto->finalize(result.counts);
         }
+        if (!film.deep().empty()) {
+            if (gpu) const_cast<GpuLane*>(gpu)->mergeDeep(film.deep());
+            result.deep = std::make_shared<aov::DeepFilm>(std::move(film.deep()));
+        }
         if (!film.heat().empty()) {
             result.heat.resize(pixels);
             const double* gpuHeat = gpu ? gpu->heat() : nullptr;
@@ -1129,6 +1246,26 @@ private:
         bool asked = false;  // errors asked of the GPU for every pass generated
         U64 askedLaunch = 0;  // the GPU's launch count when they were
         bool stop = false;   // the trees have converged: no more adaptive passes
+        bool hold = false;   // a resumable checkpoint is due: no new pass goes out
+        // Between generations: every pass sent out completed, and evaluated where the next one needs it.
+        bool atBoundary() const {
+            return retired == generated && (stop || generated >= passes.size() || uniformStage(generated) || evaluated == generated);
+        }
+        // Where a saved frame's generations stood (ResumeState), the frame's clock set back by the time it had run.
+        bool restore(const ResumeState& s) {
+            if (!cellular || s.planned.size() != planned.size() || s.generated > passes.size() || s.expected.size() != s.generated ||
+                s.trace.size() != s.generated || !cells.load(s.cells))
+                return false;
+            generated = retired = evaluated = s.generated;
+            expected = s.expected;
+            trace = s.trace;
+            spent = s.spent;
+            budgetSeconds = s.budgetSeconds;
+            stop = s.stop;
+            planned = s.planned;
+            start -= std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(s.elapsed));
+            return true;
+        }
         double spent = 0;    // a frame by sampling generations: the samples of the passes generated
         double budgetSeconds = 0;  // and the time it has: uniform's, priced at the seed's rate (0: the seed not done)
         bool cpuSamples = false;  // the CPU lane renders samples beside the GPU: its samples join the GPU's errors
@@ -1215,6 +1352,7 @@ private:
         // Whether pass j may go out: a free table slot, and either the uniform stage
         // or trees that have seen every pass before it.
         bool ready(U32 j) const {
+            if (hold) return false;  // a resumable checkpoint waits for the generations out to finish
             // Realtime: the seed's passes one at a time, each over the whole picture before the next (gone out together,
             // a GPU worker finished its cell's four passes while the next cells waited).
             if (plan.realtime && uniformStage(j) && j > retired) return false;

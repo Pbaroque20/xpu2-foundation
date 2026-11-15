@@ -324,6 +324,7 @@ struct Output {
     bool cryptoExtra[8] = {false, false, false, false, false, false, false, false};
     bool cryptoReflected = false, cryptoRefracted = false;
     // Its exr_header_attributes (a Metadata object), copied: the scene it came from does not outlive the frame.
+    bool deep = false;  // output_type "deep": written to a deep file (DeepBuffer::write)
     bool metadata = false;
     std::string metadataName;
     std::vector<std::string> metadataNames, metadataTypes, metadataValues;
@@ -383,6 +384,12 @@ struct Plan {
     // Cryptomatte's attributes: the first of deep_id_attribute_names, crypto_uv_attribute_name (none: st), its
     // categories (one, or three when deep_id_attribute_names names three: the film's buffers) and multi presence.
     std::string cryptoIdAttribute, cryptoUvAttribute;
+    // Deep output's settings (deep_format: 0 OpenEXR 2.0, 1 OpenDCX 2.0 with subpixel masks; the merge's tolerances) and
+    // its deep ID attributes; deepRefused: why XPU2 leaves the scene's deep outputs to MoonRay ("" when it renders them).
+    int deepFormat = 0;
+    float deepCurvature = 45.0f, deepZ = 2.0f;
+    std::vector<std::string> deepIds;
+    std::string deepRefused;
     U32 cryptoCategories = 1;
     bool cryptoMultiPresence = false;
     std::vector<const rdl::SceneObject*> displayFilters;
@@ -443,6 +450,9 @@ struct Plan {
         t.crypto = cryptomatte ? 1u : 0u;
         t.cryptoIdKey = cryptoIdAttribute.empty() ? 0u : shade::primKey(cryptoIdAttribute.c_str(), shade::PrimFloat);
         t.cryptoUvKey = cryptoUvAttribute.empty() ? 0u : shade::primKey(cryptoUvAttribute.c_str(), shade::PrimVec2f);
+        t.deep = deep && deepRefused.empty() ? 1u : 0u;
+        t.deepIdCount = U32(std::min<size_t>(deepIds.size(), 3));
+        for (U32 i = 0; i < t.deepIdCount; ++i) t.deepIdKeys[i] = shade::primKey(deepIds[i].c_str(), shade::PrimFloat);
         return t;
     }
 
@@ -864,6 +874,10 @@ inline std::shared_ptr<Plan> buildPlan(const rdl::SceneContext& context) {
     p.resumable = p.resume || attribute<rdl::Bool>(sv, "resumable_output", false);
     {
         const auto deepIds = attribute<rdl::StringVector>(sv, "deep_id_attribute_names", rdl::StringVector{});
+        p.deepIds.assign(deepIds.begin(), deepIds.end());
+        p.deepFormat = attribute<rdl::Int>(sv, "deep_format", 0) == 1 ? 1 : 0;
+        p.deepCurvature = attribute<rdl::Float>(sv, "deep_curvature_tolerance", 45.0f);
+        p.deepZ = attribute<rdl::Float>(sv, "deep_z_tolerance", 2.0f);
         p.cryptoIdAttribute = deepIds.empty() ? std::string() : deepIds[0];
         p.cryptoCategories = U32(std::max<size_t>(1, std::min<size_t>(deepIds.size(), 3)));
         p.cryptoUvAttribute = attribute<rdl::String>(sv, "crypto_uv_attribute_name", "");
@@ -978,7 +992,12 @@ inline std::shared_ptr<Plan> buildPlan(const rdl::SceneContext& context) {
             const rdl::SceneObject* df = attribute<rdl::SceneObject*>(*ro, "display_filter", nullptr);
             if (!df) continue;
         }
-        if (attribute<rdl::String>(*ro, "output_type", "flat") == "deep") p.deep = true;
+        if (attribute<rdl::String>(*ro, "output_type", "flat") == "deep") {
+            p.deep = out.deep = true;
+            // The beauty and alpha alone, as XPU2 keeps them a segment; a deep AOV is left to MoonRay.
+            if (out.result != ResultBeauty && out.result != ResultAlpha && p.deepRefused.empty())
+                p.deepRefused = out.name + ": a deep output of other than the beauty or alpha";
+        }
         out.schema = schema;
         out.lpePrefixFlags = prefixFlags;
         out.stateAov = stateAov;

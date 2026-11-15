@@ -182,6 +182,13 @@ inline std::string writeOutputs(const Plan& plan, const async::RenderResult& r, 
     static const char* const compressions[] = {"none", "zip", "rle", "zips", "piz", "pxr24", "b44", "b44a", "dwaa", "dwab"};
     for (const File& planned : plan.files) {
         if (checkpoint && planned.checkpoint.empty()) continue;
+        // A deep file is written apart (aov_deep_write.h).
+        {
+            bool deep = false;
+            for (const Image& i : planned.images)
+                for (const Output& o : i.outputs) deep |= o.deep;
+            if (deep) continue;
+        }
         File file = planned;
         if (checkpoint) file.name = planned.checkpoint;
         std::vector<OIIO::ImageSpec> specs;

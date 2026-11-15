@@ -96,7 +96,7 @@ Test conditions are in the [kit history](/xpu2/interactive/KIT_ROADMAP.md) and t
 
 ## Limits
 
-Windows only. The graphics card needs to be an NVIDIA RTX 20 series or newer; older cards, or none, render on the processor. Still on the processor: volumes whose maps read image textures, light filters, shadow linking and lobe light sets. Still handed to MoonRay XPU: an instanced displaced polygon mesh that deforms, and a scene past its memory ceiling. Not done yet: resuming from a checkpoint and deep output. The whole list is in [section 21 of the manual](/xpu2/manual/README.md#21-not-done-yet).
+Windows only. The graphics card needs to be an NVIDIA RTX 20 series or newer; older cards, or none, render on the processor. Still on the processor: volumes whose maps read image textures, light filters, shadow linking and lobe light sets. Still handed to MoonRay XPU: a scene past its memory ceiling. Deep output covers surfaces, with the beauty and alpha; not yet volumes' segments, other deep outputs, or deep files from Rhizome. The whole list is in [section 21 of the manual](/xpu2/manual/README.md#21-not-done-yet).
 
 ## Textures in XPU2 and MoonLightIPR
 
