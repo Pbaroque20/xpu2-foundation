@@ -5,10 +5,11 @@
 // Two launches stay queued so the GPU never waits for the host, and the host
 // never waits for the GPU: it polls events (ARC-01).
 //
-// Texture residency follows the memory rule: host RAM holds every level of
-// every texture; VRAM holds each texture's mip levels from 1 up, and a bounded
-// cache of fine-detail (level-0) tiles loaded on demand from host RAM and
-// evicted least recently used. A sample that needs a tile that is not resident
+// Texture residency follows the memory rule: VRAM holds each texture's
+// coarsest levels (those no larger than host_texture.h's residentSide()) for
+// the session, and a bounded cache of the tiles of every larger level, the
+// finest included, loaded on demand from host RAM (which reads them from their
+// files as first sampled) and evicted least recently used. A sample that needs a tile that is not resident
 // parks in the GPU's bounded queue, its tile is requested once, and a later
 // launch runs it again on the GPU after the tile has landed (MEM-04, MEM-05).
 // With partial shading such a sample is finished from the texture's next level
@@ -2077,7 +2078,7 @@ public:
         size_t freeBytes = 0, totalBytes = 0;
         return any || (memoryInfo(freeBytes, totalBytes) && freeBytes < cardReserve(totalBytes) / 2);
     }
-    // The fine-detail cache's VRAM: what the scene's level-0 tiles need, up to what the card has free less a reserve
+    // The fine-detail cache's VRAM: what the scene's tiles on demand need, up to what the card has free less a reserve
     // for the rest of the frame and for Modo's own viewport (a fifth of the card, a gigabyte and a half at least), and
     // never below 256 MB. Measured at each scene's preparation, so it follows what else holds the card meanwhile.
     // XPU2_SESSION_FINE_BUDGET_MB, or GpuOptions::fineBudget, fixes it.
@@ -2119,9 +2120,9 @@ public:
             std::snprintf(one, sizeof one, "%s%zu in %u slots of %zu KB made, of %u", sizes.empty() ? "" : ", ", in, c.made, c.slotBytes >> 10, c.slots);
             sizes += one;
         }
-        char text[420];
-        std::snprintf(text, sizeof text, "coarser levels %.0f MB, fine-detail cache %.0f MB (%zu tiles in it: %s; %zu sent, %zu let go; %zu flat tiles as one value each, %zu tiles past half floats' range in floats)",
-                      double(scene_.mipBytes) / (1 << 20), double(fine_.slabBytes) / (1 << 20), held, sizes.c_str(), fine_.loaded, fine_.evicted, fine_.flat, fine_.wide.size());
+        char text[512];
+        std::snprintf(text, sizeof text, "coarser levels %.0f MB, fine-detail cache %.0f MB (%zu tiles in it: %s; %zu sent (%zu of them ahead, by the textures' needs), %zu let go; %zu flat tiles as one value each, %zu tiles past half floats' range in floats)",
+                      double(scene_.mipBytes) / (1 << 20), double(fine_.slabBytes) / (1 << 20), held, sizes.c_str(), fine_.loaded, fine_.prefetched, fine_.evicted, fine_.flat, fine_.wide.size());
         return text;
     }
     size_t residentMipBytes() const { return scene_.mipBytes; }
@@ -2699,14 +2700,15 @@ private:
         std::shared_ptr<gpu::Event> filmDone, errorsDone, previewDone, aovInitDone;
         size_t mipBytes = 0;
     };
-    // The fine-detail cache: every level-0 tile of the scene's textures has an
+    // The fine-detail cache: every tile of the scene's textures' levels on demand (the finest, and each larger than
+    // host_texture.h's residentSide()) has an
     // id; resident ones occupy a slot of the slab.
     struct Fine {
         U32 tiles = 0, slots = 0, requestCapacity = 0;
         U64 requestHead = 0;
         size_t loaded = 0, evicted = 0;
         B tileState, requests, touched, pageEntry, slab;
-        // A level-0 tile's host level, its page there and its size: its texels decoded on the host when first sent up
+        // A tile's host level, its page there and its size: its texels decoded on the host when first sent up
         // (tex::Mip::load) where the level is read on demand.
         struct Source { const tex::Mip* mip; U32 page; U32 bytes; U32 kind; };
         std::vector<Source> sources;      // host texels of each tile id
@@ -2731,6 +2733,10 @@ private:
         std::vector<U32> slotTile, tileSlot;
         std::vector<U64> lastUse;
         std::vector<U32> pending;
+        // The first frames' tiles, loaded ahead of their asking (prefetchTiles): each texture's level its meshes show
+        // and the next coarser, by the kit's texture needs. Fed to pending a part at a time, into free slots only.
+        std::vector<U32> prefetch;
+        size_t prefetchAt = 0, prefetched = 0;
         size_t requestBytes() const { return size_t(requestCapacity) * sizeof(U32); }
     };
 
@@ -2826,7 +2832,7 @@ private:
     }
     // A flat tile's tileSlot: resident, in no slot (its value in the flat pool).
     static constexpr U32 FlatSlot = NoSlot - 1;
-    // The slot kind of a level-0 tile of this format, made as first met: its whole tile's bytes, at 16-byte steps.
+    // The slot kind of a tile on demand of this format, made as first met: its whole tile's bytes, at 16-byte steps.
     U32 kindOf(unsigned format) {
         const size_t bytes = (size_t(format == 2 ? tex::tileBytes(2, 0) : tex::Tile * tex::Tile * tex::texelBytes(format)) + 15) / 16 * 16;
         for (size_t k = 0; k < fine_.classes.size(); ++k)
@@ -2845,7 +2851,8 @@ private:
         fine_.sources.push_back({nullptr, 0, 0, 0});  // id 0 is untracked
         singleLevel_ = false;
         std::vector<std::pair<std::shared_ptr<texture::File>, B>> images;
-        std::vector<std::pair<B, std::vector<U32>>> levelZeroPages;  // per file: page array and its tile ids
+        std::vector<std::pair<B, std::vector<U32>>> demandPages;  // per level on demand: page array and its tile ids
+        std::vector<U32> prefetchCoarse, prefetchFine;  // prefetchTiles: the next coarser levels' tiles first, then the finer
         size_t cardFree = 0, cardTotal = 0, mipBytes = 0;
         const bool cardKnown = memoryInfo(cardFree, cardTotal);
         for (auto& file : files) {
@@ -2855,11 +2862,16 @@ private:
             tex::Image descriptor{};
             descriptor.count = host.count;
             if (host.count < 2) singleLevel_ = true;  // no level up for partial shading (sizeParked)
-            // Levels 1 and up are resident for the whole session, in their format (tex::Mip::format), each tile at a
+            // Which levels load on demand: the finest, and every one the host reads a tile at a time (host_texture.h's
+            // residentSide()). A texture seen from afar reads only its coarser levels' tiles, one not seen none; levels 1 and
+            // up were all sent at load, and a scene of large textures went to texture overflow mode for what it never read.
+            const auto onDemand = [&](unsigned level) { return level == 0 || host.levels[level].load != nullptr; };
+            // The others, the coarsest, resident for the whole session, in their format (tex::Mip::format), each tile at a
             // 16-byte boundary so that a float level's texels are aligned whatever came before.
             std::vector<unsigned char> packed;
             std::vector<std::vector<size_t>> offsets(host.count);
             for (unsigned level = 1; level < host.count; ++level) {
+                if (onDemand(level)) continue;
                 const auto m = host.levels[level];
                 const unsigned nx = (m.width + tex::Tile - 1) / tex::Tile, ny = (m.height + tex::Tile - 1) / tex::Tile;
                 for (unsigned i = 0; i < nx * ny; ++i) {
@@ -2872,7 +2884,7 @@ private:
                     packed.insert(packed.end(), from, from + tex::tileBytes(m.format, U32(count)));
                 }
             }
-            // Levels 1 and up that would not fit, the rest of the frame besides (the session's texture overflow mode).
+            // Resident levels that would not fit, the rest of the frame besides (the session's texture overflow mode).
             mipBytes += packed.size();
             if (cardKnown && mipBytes + std::max<size_t>(cardTotal / 20, 256ull << 20) > cardFree)
                 throw std::runtime_error("the textures do not fit on the card (texture overflow)");
@@ -2880,6 +2892,7 @@ private:
             B pixels = packed.empty() ? B() : upload(packed.data(), packed.size());
             scene_.mipBytes += packed.size();
             for (unsigned level = 1; level < host.count; ++level) {
+                if (onDemand(level)) continue;
                 std::vector<const surface::V3*> pages;
                 for (size_t o : offsets[level]) pages.push_back(reinterpret_cast<const surface::V3*>(pixels->pointer + o));
                 auto table = upload(pages.data(), pages.size() * sizeof(pages[0]));
@@ -2887,23 +2900,47 @@ private:
                                             reinterpret_cast<const surface::V3* const*>(table->pointer), 0, host.levels[level].format};
                 scene_.keep.push_back(table);
             }
-            // Level 0 starts empty; its tiles are numbered for the cache.
-            const auto m = host.levels[0];
-            const unsigned nx = (m.width + tex::Tile - 1) / tex::Tile, ny = (m.height + tex::Tile - 1) / tex::Tile;
-            std::vector<const surface::V3*> none(size_t(nx) * ny, nullptr);
-            auto table = upload(none.data(), none.size() * sizeof(none[0]));
-            const U32 base = U32(fine_.sources.size());
-            std::vector<U32> ids;
-            for (unsigned i = 0; i < nx * ny; ++i) {
-                const unsigned tx = i % nx, ty = i / nx;
-                const U32 count = std::min(tex::Tile, m.width - tx * tex::Tile) * std::min(tex::Tile, m.height - ty * tex::Tile);
-                fine_.sources.push_back({&host.levels[0], i, tex::tileBytes(m.format, count), kindOf(m.format)});
-                ++fine_.classes[fine_.sources.back().kind].tiles;
-                ids.push_back(base + i);
+            // The levels on demand start empty; their tiles are numbered for the cache.
+            for (unsigned level = 0; level < host.count; ++level) {
+                if (!onDemand(level)) continue;
+                const auto m = host.levels[level];
+                const unsigned nx = (m.width + tex::Tile - 1) / tex::Tile, ny = (m.height + tex::Tile - 1) / tex::Tile;
+                std::vector<const surface::V3*> none(size_t(nx) * ny, nullptr);
+                auto table = upload(none.data(), none.size() * sizeof(none[0]));
+                const U32 base = U32(fine_.sources.size());
+                std::vector<U32> ids;
+                for (unsigned i = 0; i < nx * ny; ++i) {
+                    const unsigned tx = i % nx, ty = i / nx;
+                    const U32 count = std::min(tex::Tile, m.width - tx * tex::Tile) * std::min(tex::Tile, m.height - ty * tex::Tile);
+                    fine_.sources.push_back({&host.levels[level], i, tex::tileBytes(m.format, count), kindOf(m.format)});
+                    ++fine_.classes[fine_.sources.back().kind].tiles;
+                    ids.push_back(base + i);
+                }
+                descriptor.levels[level] = {m.width, m.height, reinterpret_cast<const surface::V3* const*>(table->pointer), base, m.format};
+                demandPages.push_back({table, ids});
+                scene_.keep.push_back(table);
             }
-            descriptor.levels[0] = {m.width, m.height, reinterpret_cast<const surface::V3* const*>(table->pointer), base, m.format};
-            levelZeroPages.push_back({table, ids});
-            scene_.keep.push_back(table);
+            // The first frame's tiles of this texture, ahead of it (prefetchTiles). The kit's need (texture_density.py:
+            // the texels across its nearest mesh can show, times its margin of two; the most over an animation's frames)
+            // names the finest level a frame reads: the finest at least half the need a side. That and every coarser
+            // level on demand down to the resident ones (a third more than it alone at most): a mesh's far parts, a slant
+            // and the kit's margin read coarser levels, and a need taken over a whole animation or from the mesh's
+            // nearest point is often larger than a frame reads. Not for realtime, whose frames may pop (and the kit
+            // names it none).
+            if (!plan.realtime && prefetchOn())
+                if (const unsigned need = texture::needed(file->name.string())) {
+                    const unsigned shown = std::max(1u, need / 2);
+                    unsigned finest = 0;
+                    for (unsigned level = 0; level < host.count; ++level)
+                        if (std::max(host.levels[level].width, host.levels[level].height) >= shown) finest = level;
+                    for (unsigned level = finest; level < host.count; ++level) {
+                        if (!onDemand(level)) continue;
+                        const U32 base = descriptor.levels[level].tileBase;
+                        const unsigned nx = (host.levels[level].width + tex::Tile - 1) / tex::Tile, ny = (host.levels[level].height + tex::Tile - 1) / tex::Tile;
+                        auto& to = level == finest ? prefetchFine : prefetchCoarse;
+                        for (unsigned i = 0; i < nx * ny; ++i) to.push_back(base + i);
+                    }
+                }
             if (pixels) scene_.keep.push_back(pixels);
             images.push_back({file, upload(&descriptor, sizeof(descriptor))});
         }
@@ -2924,6 +2961,20 @@ private:
             fine_.slots += c.slots;
             fine_.limitBytes += size_t(c.slots) * c.slotBytes;
         }
+        // What is prefetched takes at most the cache's budget (and only free slots: prefetchTiles), the finest levels
+        // first, as a close view reads them most (Grass: 254,000 finest tiles and six coarser).
+        {
+            size_t bytes = 0;
+            for (auto* list : {&prefetchFine, &prefetchCoarse})
+                for (U32 tile : *list) {
+                    if (bytes + fine_.classes[fine_.sources[tile].kind].slotBytes > fine_.limitBytes) break;
+                    bytes += fine_.classes[fine_.sources[tile].kind].slotBytes;
+                    fine_.prefetch.push_back(tile);
+                }
+            if (!fine_.prefetch.empty())
+                std::printf("XPU2: %zu texture tiles to be loaded ahead of the first frame, by the textures' needs (%.0f MB at most; %zu wanted)\n",
+                            fine_.prefetch.size(), double(bytes) / (1 << 20), prefetchCoarse.size() + prefetchFine.size());
+        }
         if (fine_.tiles)
             std::printf("XPU2: fine-detail texture cache up to %.0f MB of the %.0f MB its tiles would take, made as tiles are read (%s)\n",
                         double(fine_.limitBytes) / (1 << 20), double(need) / (1 << 20), fineBudgetWhy_.c_str());
@@ -2935,7 +2986,7 @@ private:
         memset32(fine_.tileState->pointer, 0, fine_.tiles + 1);
         gpu::Driver::check(driver.cuMemsetD8Async_p(fine_.touched->pointer, 0, fine_.tiles + 1, stream_));
         std::vector<U64L> entries(fine_.tiles + 1, 0);
-        for (auto& [table, ids] : levelZeroPages)
+        for (auto& [table, ids] : demandPages)
             for (size_t i = 0; i < ids.size(); ++i) entries[ids[i]] = table->pointer + i * sizeof(void*);
         fine_.pageEntry = upload(entries.data(), entries.size() * sizeof(U64L));
         fine_.slotTile.assign(fine_.slots, 0);
@@ -2979,7 +3030,54 @@ private:
     // Loads every requested tile from host RAM into a slot of its kind, evicting that kind's least recently used where its
     // slots are full, and queues the page-table updates ahead of the next launch on the same stream. A flat tile (all its
     // texels one value, tex::flatPage) takes no slot: its value goes to its place in the flat pool, for good.
+    // XPU2_SESSION_PREFETCH_TEXTURES=1: tiles loaded ahead of the first frame by the kit's texture needs. Off by default:
+    // measured 2026-11-14 it made the first picture later and the frame longer on both scenes tried (Grass: first picture
+    // 12.2 -> 17.9 s, done 46.7 -> 59.6 s; six 8K planes: 1.3 -> 1.5 s), as a need names whole levels, unseen parts
+    // included, and their decoding comes before the launches, where on demand it overlaps them and reads only what is seen.
+    static bool prefetchOn() {
+        static const bool on = [] {
+            const char* v = std::getenv("XPU2_SESSION_PREFETCH_TEXTURES");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+    // Moves up to a part of the prefetch list into pending: tiles neither resident nor already asked for, each into a free
+    // (or still to be made) slot of its kind, so that loading ahead never evicts a tile a frame has read.
+    void prefetchTiles() {
+        if (fine_.prefetchAt >= fine_.prefetch.size()) return;
+        constexpr size_t Part = 16384;
+        std::vector<size_t> room(fine_.classes.size(), 0);
+        for (size_t k = 0; k < fine_.classes.size(); ++k) {
+            const auto& c = fine_.classes[k];
+            room[k] = c.freeSlots.size() + (c.slots - c.made);
+        }
+        std::vector<char> queued(fine_.tiles + 1, 0);
+        for (U32 tile : fine_.pending) {
+            queued[tile] = 1;
+            auto& r = room[fine_.sources[tile].kind];
+            if (r) --r;
+        }
+        size_t added = 0;
+        while (fine_.prefetchAt < fine_.prefetch.size() && added < Part) {
+            const U32 tile = fine_.prefetch[fine_.prefetchAt++];
+            if (queued[tile] || fine_.tileSlot[tile] != NoSlot) continue;
+            auto& r = room[fine_.sources[tile].kind];
+            if (!r) continue;
+            --r;
+            queued[tile] = 1;
+            fine_.pending.push_back(tile);
+            ++added;
+            ++fine_.prefetched;
+        }
+        if (fine_.prefetchAt >= fine_.prefetch.size()) std::vector<U32>().swap(fine_.prefetch), fine_.prefetchAt = 0;
+    }
     void commitTiles() {
+        prefetchTiles();
+        if (fine_.pending.empty()) return;
+        // A tile asked for that is resident meanwhile (loaded ahead while a launch already in flight asked for it) is not
+        // loaded twice.
+        fine_.pending.erase(std::remove_if(fine_.pending.begin(), fine_.pending.end(), [&](U32 tile) { return fine_.tileSlot[tile] != NoSlot; }),
+                            fine_.pending.end());
         if (fine_.pending.empty()) return;
         std::vector<TileUpdate> updates;
         // Tiles not yet decoded on the host (a level read on demand) decoded first, on several threads at once.

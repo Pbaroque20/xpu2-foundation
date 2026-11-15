@@ -319,16 +319,25 @@ differ: presence shadows, shadow linking, volumes, a minimum shadow distance and
 
 ## 10. Memory tiers and partial shading
 
-- **Host RAM** holds every texture's coarser mip levels and the level-0 tiles read so far (`host_texture.h`); the texture
-  files on disk are the system of record. The CPU lane reads RAM
+- **Host RAM** holds every texture's coarsest mip levels and the tiles of the larger levels read so far
+  (`host_texture.h`); the texture files on disk are the system of record. The CPU lane reads RAM
   directly. Since 2026-10-26 the finest level (level 0) is decoded tile by tile the first time it is read
-  (`Pyramid::loadTile`, through an OpenImageIO ImageCache), the coarser levels as the scene is prepared;
-  `XPU2_SESSION_EAGER_TEXTURES=1` decodes them all at once. Texels are kept small (`tex::Mip::format`, `texture_core.h`):
+  (`Pyramid::loadTile`, through an OpenImageIO ImageCache), and since 2026-11-14 every level larger than 128 pixels
+  a side as well (`residentSide`, `XPU2_SESSION_RESIDENT_TEXTURE_SIDE`); only the levels of 128 or less are decoded as
+  the scene is prepared, and only those count toward the decoded-texture budgets, so a scene of large textures seen
+  from afar no longer goes to texture overflow mode. `XPU2_SESSION_EAGER_TEXTURES=1` decodes them all at once. Texels are kept small (`tex::Mip::format`, `texture_core.h`):
   8-bit files as bytes, float files in half floats (each value rounded to the nearest; a tile with a value past their
   range, such as a sun, stays in floats), grey files in one channel, and a tile of one value as that value alone. A
   scene's textures take about a third of the memory they did as floats.
-- **VRAM** holds every texture's levels 1 and up for the whole session, plus a cache of level-0 (fine-detail) tiles,
-  loaded on demand and evicted least recently used. The cache gives each tile size the scene's formats have slots of
+- **VRAM** holds every texture's levels of 128 pixels a side or less for the whole session, plus a cache of the tiles
+  of every larger level (fine-detail tiles, the finest level's and the coarser ones'), loaded on demand as frames
+  sample them and evicted least recently used when the cache is full: a texture seen from afar sends up only its
+  coarser levels' tiles, one not seen none. Until 2026-11-14 levels 1 and up were all sent as the scene was prepared.
+  A lookup that lacks tiles asks for all of them at once. Final frames and Render Animation frames do not finish
+  before the tiles they asked for have landed and their samples were rendered again in full, so the picture equals the
+  render with every texture whole; realtime frames may show a coarser texture until its tiles land. Realtime keeps
+  its textures to 1024 pixels a side (`XPU2_SESSION_RT_TEXTURE_SIDE`; 0 reads every level on demand, close-up normal and
+  bump detail included, at the cost of a slower first frame and more of the card). The cache gives each tile size the scene's formats have slots of
   their own, and grows as tiles are read, up to its budget, rather than taking the budget at once.
   `XPU2_SESSION_LOG_ALLOCATIONS=N` logs each allocation of N MB or more (256 by default, 0 off).
 - **Under memory pressure** the oldest decoded level-0 tiles are let go, and a scene that still does not load has its
@@ -339,7 +348,7 @@ differ: presence shadows, shadow linking, volumes, a minimum shadow distance and
   old blocks once no reader holds them, and lets go only what no node has room for. The coarse levels are not copied
   per node (`interactive/MULTI_DEVICE.md`).
 - **A tile that cannot be read** fails the frame with its file and reason, and the scene goes to the reference renderer.
-- **The cache's budget** (`GpuLane::fineBudget`) is measured at each preparation, and again as a frame starts if the card has filled up (`fineCacheTooBig`): what the scene's level-0 tiles need,
+- **The cache's budget** (`GpuLane::fineBudget`) is measured at each preparation, and again as a frame starts if the card has filled up (`fineCacheTooBig`): what the scene's tiles on demand need,
   up to the card's free memory minus a fifth of the card (at least 1.5 GB left for the frame and the host's own use),
   and never below 256 MB. `XPU2_SESSION_FINE_BUDGET_MB` fixes it.
 - **Filtering** is shared by both devices (`texture_core.h`, adapted from OpenImageIO). A miss names the tile it needs
@@ -646,7 +655,9 @@ Environment variables read by the session or the renderer. The defaults are the 
 | `XPU2_SESSION_EMBREE_COMPACT=0` | The CPU lane's Embree scenes without the compact flag (added 2026-10-26) |
 | `XPU2_SESSION_FLOAT_TEXTURES=1` | 8-bit textures kept as floats (added 2026-10-26) |
 | `XPU2_SESSION_EAGER_TEXTURES=1` | Every texture level decoded as the scene is prepared (added 2026-10-26) |
-| `XPU2_SESSION_RT_TEXTURE_SIDE` | Realtime's largest texture side (default 1280; 0: whole) (added 2026-10-27) |
+| `XPU2_SESSION_RT_TEXTURE_SIDE` | Realtime's largest texture side (default 1024; 0: whole, read on demand) (added 2026-10-27) |
+| `XPU2_SESSION_PREFETCH_TEXTURES=1` | A final render's first frame loads ahead, into free cache slots, each texture's level its meshes need (the kit's texture needs) and the coarser ones; off by default, as it was slower on the scenes tried (added 2026-11-14) |
+| `XPU2_SESSION_RESIDENT_TEXTURE_SIDE` | The largest texture level decoded whole and held on the card for the session; larger ones load on demand (default 128; 65536: every level but the finest whole, as before 2026-11-14) |
 | `XPU2_SESSION_CANONICAL_FILE=1` | The canonical replica also written as an RDLB file, to inspect (added 2026-10-26) |
 | `XPU2_SESSION_RT_DENOISE=0`, `_RT_GUIDES`, `_RT_SHOW`, `_RT_DEBUG`, `_RT_PRIORITY=0` | Diagnostics of the session's realtime denoiser, unused by the 0.5 kit (`INDEXER.md` section 13) |
 | `XPU2_SESSION_DEBUG_FAILURES` | Names the CPU lane's first failed shadings and texture lookups |

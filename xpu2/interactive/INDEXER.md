@@ -141,8 +141,9 @@ rest was black, and the whole frame was seen only once a quarter of its samples 
 
 ## 8. Partial shading
 
-A GPU sample that needs a fine-detail tile not yet resident is finished from the texture's next level up (levels 1
-and up are always resident: the half-resolution picture and smaller, as MoonLightIPR halves textures), its tile
+A GPU sample that needs a fine-detail tile not yet resident is finished from the texture's nearest level up that is
+on the card (the levels of 128 pixels a side or less always are; since 2026-11-14 the larger ones load on demand too,
+and before then levels 1 and up were always resident), its tile
 asked for as before. It is provisional: its value goes to the GPU's provisional film, not the film, and a record of
 it (pixel, index, pass, missing tile, value) to the host. Either lane renders it again in full: the CPU lane at once
 (it has every level in RAM), or the GPU once the tile has landed; its provisional value then leaves the provisional
