@@ -313,6 +313,10 @@ public:
         if (thread_.joinable()) thread_.join();
     }
     const cpu::Plan& plan() const { return *scene_.plan; }
+    // What it renders on (noteDevices), set when the scene is made and when a frame's changes leave it to the CPU.
+    std::string devices() {
+        return call([&] { return devices_; });
+    }
     // A frame's changes (plan 13): its delta files read on top of the scene as it stands and the plan made again (the
     // camera alone, or the placements alone, where that is all they changed, as Modo's session does: the card keeps
     // its meshes and textures), the renderer made anew. Returns the seconds it took.
@@ -335,6 +339,8 @@ public:
                     if (!why.empty()) {
                         std::printf("MoonRay XPU2 Rhizome: the GPU leaves %s to the CPU; the CPU alone\n", why.c_str());
                         gpu_.reset();
+                        cpuWhy_ = "the GPU leaves " + why + " to the CPU";
+                        noteDevices();
                     } else {
                         gpu_->prepare(scene_.plan);
                     }
@@ -462,14 +468,17 @@ public:
         scene_.prepare();
         // A card that cannot take the job (its programs would not load, a driver refusing them): the node renders it on
         // its processor rather than sitting the job out, as it does when the programs are missing or still compiling.
+        cpuWhy_ = mode_ == 0 ? "its devices set to the processor" : "";
         if (mode_ != 0) {
             try {
                 makeGpu();
             } catch (const std::exception& e) {
                 gpu_.reset();
+                cpuWhy_ = std::string("its graphics card could not take this job: ") + e.what();
                 std::printf("MoonRay XPU2 Rhizome: the graphics card could not take this job (%s): the CPU alone\n", e.what());
             }
         }
+        noteDevices();
         renderer_ = std::make_unique<async::Renderer>(scene_.plan, *scene_.cpuScene, gpu_.get());
         std::printf("MoonRay XPU2 Rhizome: scene ready (%ux%u, %u samples a pixel), %s, %u threads\n", plan().width, plan().height, plan().spp,
                     gpu_ ? (mode_ == 1 ? "the GPU alone" : "CPU and GPU") : "the CPU alone", threads_);
@@ -600,11 +609,17 @@ public:
     void makeGpu() {
         const fs::path folder = executableFolder();
         const Programs p = programs(folder);
-        if (gpu::cardCount() > 0 && !gpu::anySupported()) {
+        if (gpu::cardCount() == 0) {
+            cpuWhy_ = "no graphics card";
+            return;
+        }
+        if (!gpu::anySupported()) {
+            cpuWhy_ = olderCards() + " older than XPU2's GPU programs run on";
             std::printf("MoonRay XPU2 Rhizome: %s is older than XPU2's GPU programs run on: the CPU alone\n", olderCards().c_str());
             return;
         }
         if (!fs::exists(shaderMark(p))) {
+            cpuWhy_ = "the GPU programs not compiled here";
             std::printf("MoonRay XPU2 Rhizome: the GPU programs are not compiled here (moonray_xpu2 --compile-shaders): the CPU alone\n");
             return;
         }
@@ -612,7 +627,10 @@ public:
         std::vector<int> cards;
         for (int card : multi::cardOrdinals(gpu::cardCount()))
             if (gpu::supported(card) && held.count(cardKind(card))) cards.push_back(card);  // a card too old: the CPU alone
-        if (cards.empty()) return;
+        if (cards.empty()) {
+            cpuWhy_ = "the GPU programs not compiled for its cards";
+            return;
+        }
         gpu_ = gpuLane(p, {}, cards[0]);
         for (size_t k = 1; k < cards.size(); ++k) {
             try {
@@ -626,6 +644,7 @@ public:
         if (!why.empty()) {
             std::printf("MoonRay XPU2 Rhizome: the GPU leaves %s to the CPU; the CPU alone\n", why.c_str());
             gpu_.reset();
+            cpuWhy_ = "the GPU leaves " + why + " to the CPU";
             return;
         }
         gpu_->prepare(scene_.plan);
@@ -635,6 +654,12 @@ private:
     Scene scene_;
     cpu::PlanView gpuPlan_;  // the plan the card's scene was made for (a frame's changes: the camera or placements alone)
     std::unique_ptr<async::GpuLane> gpu_;
+    // What the scene renders on, as the swarm is told (RhizomeNode::setDevices): "CPU and GPU", "the GPU alone", or
+    // "the CPU alone (why)"; and why the CPU alone, where it is.
+    std::string devices_, cpuWhy_;
+    void noteDevices() {
+        devices_ = gpu_ ? (mode_ == 1 ? "the GPU alone" : "CPU and GPU") : "the CPU alone" + (cpuWhy_.empty() ? std::string() : " (" + cpuWhy_ + ")");
+    }
     std::unique_ptr<async::Renderer> renderer_;
     int mode_ = 2;
     unsigned threads_ = 1;
@@ -1943,6 +1968,7 @@ inline int run(int argc, char** argv) {
                 jobFrame = int(jm.frame), jobFrames = jm.frames;
                 const std::string what = jm.job.empty() ? o.job : jm.job + " frame " + std::to_string(jm.frame);
                 node.setJob(what);
+                if (const std::shared_ptr<Local> l = local()) node.setDevices(l->devices());  // before Ready, which carries it
                 node.markReady(which);
                 std::printf("MoonRay XPU2 Rhizome: node ready for %s%s\n", what.c_str(), keep ? " (the scene kept, its changes read)" : "");
                 if (const std::string t = poolTexturesLine(); !t.empty()) std::printf("MoonRay XPU2 Rhizome: %s\n", t.c_str());
@@ -2012,6 +2038,7 @@ inline int run(int argc, char** argv) {
                                            : job.name;
         o.job = job.name;
         node.setJob(what);
+        node.setDevices(l->devices());  // the master's own rate taken over for them before the frame is planned
         const rz::Bytes manifest = writeManifest(jm);
         const rz::Hash manifestHash = rz::sha256(manifest);
         node.publishManifest(manifest);
