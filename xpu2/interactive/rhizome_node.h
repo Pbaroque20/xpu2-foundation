@@ -148,6 +148,23 @@ public:
         const Member* mm = members_.find(h);
         return mm ? mm->shaders : std::string();
     }
+    // What this machine renders its jobs on, said in its Ready (before the master plans a frame with it) and its
+    // heartbeats, and shown in every machine's status: "CPU and GPU", "the GPU alone", or "the CPU alone" and why. The
+    // master takes a member's rate over at once when it goes to its processor alone or back (Members::devices), as the
+    // node's own when it is the master's (switchDevices).
+    void setDevices(const std::string& s) {
+        std::lock_guard<std::mutex> g(m_);
+        if (s.empty() || s == devices_) return;
+        o_.caps.rate = switchDevices(ownDevices_, o_.caps.rate, cpuAloneText(s));
+        if (o_.master && !devices_.empty()) log("this machine renders on " + s);
+        devices_ = s;
+    }
+    std::string devicesOf(const Hash& h) {
+        std::lock_guard<std::mutex> g(m_);
+        if (h == hash()) return devices_;
+        const Member* mm = members_.find(h);
+        return mm ? mm->devices : std::string();
+    }
     // Frames this node has read: plain (each connection's first, its Hello or Welcome) and sealed (all the rest).
     uint64_t plainFramesIn() const { return plainIn_; }
     uint64_t sealedFramesIn() const { return sealedIn_; }
@@ -484,6 +501,7 @@ public:
         std::lock_guard<std::mutex> g(m_);
         Writer w;
         w.hash(sha256(manifest_));
+        w.str(devices_);  // what it renders on, known before the master plans with it
         sendTo(masterHash_, uint16_t(TypeReady), w.b);
     }
     // A node: the scene of this manifest is made here (one that came after it is not).
@@ -491,6 +509,7 @@ public:
         std::lock_guard<std::mutex> g(m_);
         Writer w;
         w.hash(manifest);
+        w.str(devices_);  // what it renders on, known before the master plans with it
         sendTo(masterHash_, uint16_t(TypeReady), w.b);
     }
     // What status says of the job (its name, its frame), as it changes.
@@ -874,6 +893,7 @@ private:
                 Writer w;
                 w.f64(now);
                 w.str(shaders_);  // its GPU programs (plan 15)
+                w.str(devices_);  // what it renders on (setDevices)
                 broadcast(Type::Heartbeat, w.b);
                 // A member whose bytes are arriving is heard, though its message is not whole yet.
                 for (auto& cc : conns_)
@@ -929,6 +949,8 @@ private:
                     if (!shaders.empty() && kind(shaders) != kind(mm->shaders)) log(shortHex(m.sender) + "'s GPU programs: " + shaders);
                     mm->shaders = shaders;
                 }
+            const std::string devices = r.str();
+            if (!r.bad) heardDevices(m.sender, devices);
             break;
         }
         case uint16_t(Type::Echo):
@@ -1128,6 +1150,8 @@ private:
                 const Hash forManifest = r.hash();
                 ready_[m.sender] = r.bad ? manifestHash_ : forManifest;
                 if (isReady(m.sender)) log("ready " + shortHex(m.sender));
+                const std::string devices = r.str();
+                if (!r.bad) heardDevices(m.sender, devices);
             }
             break;
         default:
@@ -1421,6 +1445,11 @@ private:
         };
         // role: master, node, quarantined, revoked, blocked (on this machine only) or waiting (for approval); state:
         // alive, suspect, gone, stepped back, refused or held.
+        auto devicesOf = [&](const Hash& h) {
+            if (h == hash()) return devices_;
+            const Member* mm = members_.find(h);
+            return mm ? mm->devices : std::string();
+        };
         auto row = [&](const Hash& h, const std::string& addr, const std::string& role, const std::string& state, double rate, double rtt) {
             const int i = plan_ ? plan_->nodeIndex(h) : -1;
             std::string tier = i < 0 ? "" : plan_->nodes[size_t(i)].fast ? "fast" : "slow";
@@ -1430,11 +1459,12 @@ private:
                    ", \"state\": " + jsonText(state) + ", \"tier\": " + jsonText(tier) + ", \"rate\": " + num(rate) + ", \"rtt\": " + num(rtt) +
                    ", \"chunks\": " + std::to_string(done) + ", \"ram\": " + std::to_string(pool_.used(h, Tier::Ram)) +
                    ", \"vram\": " + std::to_string(pool_.used(h, Tier::Vram)) + ", \"ramGiven\": " + std::to_string(pool_.capacity(h, Tier::Ram)) +
-                   ", \"vramGiven\": " + std::to_string(pool_.capacity(h, Tier::Vram)) + ", \"gpuPrograms\": " + jsonText(shadersOf(h)) + "}";
+                   ", \"vramGiven\": " + std::to_string(pool_.capacity(h, Tier::Vram)) + ", \"gpuPrograms\": " + jsonText(shadersOf(h)) +
+                   ", \"devices\": " + jsonText(devicesOf(h)) + "}";
         };
         std::vector<std::string> rows;
         // The same as text (rhizome status prints it): a line a member.
-        char line[480];
+        char line[720];
         std::string text;
         auto mb = [](uint64_t v) {
             char t[24];
@@ -1448,11 +1478,12 @@ private:
             char rt[24], rr[24];
             std::snprintf(rt, sizeof rt, rtt >= 0 ? "%.1f ms" : "-", rtt * 1000.0);
             std::snprintf(rr, sizeof rr, rate > 0 ? "%.2f" : "-", rate / 1e6);
-            const std::string sh = shadersOf(h);
-            std::snprintf(line, sizeof line, "%-12s  %-21s  %-22s  %-8s  %-5s  %10s  %9s  %6llu  %s of %s MB   GPU programs: %s\n", shortHex(h).c_str(),
-                          addr.c_str(), role.c_str(), state.c_str(), tier, rr, rt, (unsigned long long)done,
+            const std::string sh = shadersOf(h), dv = devicesOf(h);
+            std::snprintf(line, sizeof line, "%-12s  %-21s  %-22s  %-8s  %-5s  %10s  %9s  %6llu  %s of %s MB   GPU programs: %s   renders on: %s\n",
+                          shortHex(h).c_str(), addr.c_str(), role.c_str(), state.c_str(), tier, rr, rt, (unsigned long long)done,
                           mb(pool_.used(h, Tier::Ram) + pool_.used(h, Tier::Vram)).c_str(),
-                          mb(pool_.capacity(h, Tier::Ram) + pool_.capacity(h, Tier::Vram)).c_str(), sh.empty() ? "-" : sh.c_str());
+                          mb(pool_.capacity(h, Tier::Ram) + pool_.capacity(h, Tier::Vram)).c_str(), sh.empty() ? "-" : sh.c_str(),
+                          dv.empty() ? "-" : dv.c_str());
             text += line;
         };
         rows.push_back(row(hash(), address_, o_.master ? "master" : "node", paused_ ? "stepped back" : "alive", o_.caps.rate, 0));
@@ -2234,6 +2265,8 @@ private:
     std::vector<double> odd_;  // the odd-index sums, adaptive frames (the error pooled from them)
     bool paused_ = false;            // a workstation stepped back
     std::string shaders_;            // this machine's GPU programs (setShaders)
+    std::string devices_;            // what this machine renders on (setDevices)
+    DeviceRates ownDevices_;         // and its rate as that changes
     // The status files' writer and the latest status for it (writeStatus).
     std::thread statusThread_;
     std::mutex statusMutex_;
@@ -2259,6 +2292,14 @@ private:
     bool isReady(const Hash& h) const {
         const auto it = ready_.find(h);
         return it != ready_.end() && (manifest_.empty() || it->second == manifestHash_);
+    }
+    // A member's devices, from its Ready or a heartbeat: its rate taken over for them at once (Members::devices), and
+    // the change in the master's log.
+    void heardDevices(const Hash& h, const std::string& devices) {
+        const Member* mm = members_.find(h);
+        const std::string before = mm ? mm->devices : std::string();
+        if (members_.devices(h, devices) && o_.master)
+            log(shortHex(h) + " renders on " + devices + (before.empty() ? std::string() : " (was " + before + ")"));
     }
     std::map<Hash, Piece> sourcePieces_;
 };

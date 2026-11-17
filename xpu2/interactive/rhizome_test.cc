@@ -699,6 +699,100 @@ static void shaderStates() {
     std::filesystem::remove(txt, e);
 }
 
+// What a machine renders on (RhizomeNode::setDevices): said in its Ready and its heartbeats, and shown in status; the
+// master takes its rate over at once when it goes to its processor alone or back to its cards, so the next frame's plan
+// gives a node whose cards cannot be used what its processor can do.
+static void deviceStates() {
+    // The rate as the devices change (switchDevices).
+    {
+        DeviceRates d;
+        check(switchDevices(d, 100.0, false) == 100.0, "the first devices said leave the rate as measured");
+        check(std::abs(switchDevices(d, 100.0, true) - 100.0 * CpuAloneGuess) < 1e-9, "gone to the processor alone: CpuAloneGuess of the rate with its cards");
+        check(switchDevices(d, 9.0, true) == 9.0, "the same devices again: the rate as it stands");
+        check(switchDevices(d, 9.0, false) == 100.0, "back to its cards: the rate it had on them");
+        check(switchDevices(d, 120.0, true) == 9.0, "to the processor alone again: the rate it had there");
+        DeviceRates c;
+        check(switchDevices(c, 5.0, true) == 5.0 && switchDevices(c, 5.0, false) == 0.0,
+              "first on its processor alone, then its cards: unknown (the plan takes the others' median)");
+        check(cpuAloneText("the CPU alone (no graphics card)") && cpuAloneText("the CPU alone") && !cpuAloneText("CPU and GPU") &&
+                  !cpuAloneText("the GPU alone"),
+              "the processor alone told from its text");
+    }
+    // A member's (Members::devices): its rate taken over at once.
+    {
+        auto a = Identity::make();
+        Members ms;
+        Capabilities caps;
+        caps.rate = 160.0;
+        check(ms.introduce(a->hash(), a->publicKey(), caps, 0.0), "a member with a rate");
+        check(ms.devices(a->hash(), "CPU and GPU") && ms.find(a->hash())->caps.rate == 160.0, "its first devices: its rate as measured");
+        check(!ms.devices(a->hash(), "CPU and GPU") && !ms.devices(a->hash(), ""), "the same said again, or nothing: no change");
+        check(ms.devices(a->hash(), "the CPU alone (no graphics card)") && ms.find(a->hash())->caps.rate == 10.0,
+              "gone to its processor alone: its rate cut at once");
+        ms.rate(a->hash(), 20.0);  // its chunks measured: 0.7 x 10 + 0.3 x 20
+        check(ms.devices(a->hash(), "CPU and GPU") && ms.find(a->hash())->caps.rate == 160.0, "back to its cards: the rate it had on them");
+        check(ms.devices(a->hash(), "the CPU alone (the GPU programs not compiled here)") && std::abs(ms.find(a->hash())->caps.rate - 13.0) < 1e-9,
+              "to its processor alone again: the rate measured there");
+        check(ms.find(a->hash())->devices == "the CPU alone (the GPU programs not compiled here)", "what it said kept");
+    }
+    // Over a swarm: Ready and heartbeats carry them, and status shows them.
+    Swarm sw;
+    NodeOptions mo = options("studio rhizome key", true, 4e6);
+    const std::string status = (std::filesystem::temp_directory_path() / ("rhizome-test-devices-" + std::to_string(GetCurrentProcessId()) + ".json")).string();
+    mo.statusPath = status;
+    sw.master = std::make_unique<RhizomeNode>(mo);
+    sw.master->setDevices("CPU and GPU");
+    sw.master->start();
+    for (int k = 0; k < 2; ++k) {
+        NodeOptions o = options("studio rhizome key", false, 4e6);
+        o.masterAddress = sw.master->address();
+        sw.workers.push_back(std::make_unique<RhizomeNode>(o));
+        sw.workers.back()->setDevices(k == 0 ? "CPU and GPU" : "the GPU alone");
+        sw.workers.back()->start();
+    }
+    for (int k = 0; k < 200 && sw.master->joined() < 2; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    check(sw.master->devicesOf(sw.workers[0]->hash()) == "CPU and GPU" && sw.master->devicesOf(sw.workers[1]->hash()) == "the GPU alone",
+          "the master hears each node's devices");
+    check(sw.workers[1]->devicesOf(sw.master->hash()) == "CPU and GPU", "a node hears the master's");
+    // A node's cards cannot be used for its next job: said with its Ready.
+    const std::string cpu = "the CPU alone (the GPU programs not compiled here)";
+    sw.workers[0]->setDevices(cpu);
+    sw.workers[0]->markReady();
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    check(sw.master->devicesOf(sw.workers[0]->hash()) == cpu, "a node gone to its processor alone is heard");
+    // The master's own, set so.
+    sw.master->setDevices("the CPU alone (its devices set to the processor)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));  // a status written since
+    std::string j, text;
+    {
+        std::ifstream in(status, std::ios::binary);
+        j.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string txt = status.substr(0, status.size() - 4) + "txt";
+    {
+        std::ifstream in(txt, std::ios::binary);
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    // A row is one line: the rate in the row that names the devices.
+    auto rowWith = [&](const std::string& what) {
+        const size_t at = j.find(what);
+        if (at == std::string::npos) return std::string();
+        const size_t from = j.rfind('\n', at), to = j.find('\n', at);
+        return j.substr(from == std::string::npos ? 0 : from, to == std::string::npos ? std::string::npos : to - from);
+    };
+    const std::string nodeRow = rowWith("\"devices\": \"" + cpu + "\""), masterRow = rowWith("its devices set to the processor");
+    check(!nodeRow.empty() && nodeRow.find("\"rate\": 250000,") != std::string::npos,
+          "status.json shows the node's devices, its rate cut at once to a sixteenth");
+    check(!masterRow.empty() && masterRow.find("\"self\": true") != std::string::npos && masterRow.find("\"rate\": 250000,") != std::string::npos,
+          "the master's own rate taken over for its devices too");
+    check(j.find("\"devices\": \"the GPU alone\"") != std::string::npos, "status.json shows each machine's devices");
+    check(text.find("renders on: " + cpu) != std::string::npos, "status.txt shows them");
+    std::error_code e;
+    std::filesystem::remove(status, e);
+    std::filesystem::remove(txt, e);
+}
+
 // Adaptive sampling across the swarm: the left half of the frame (flat) converges after its minimum samples and its
 // cells' chunks are cancelled on every node; the right half (noisy) takes every sample.
 static void adaptive() {
@@ -1222,7 +1316,7 @@ static void frames() {
 }
 
 int main() {
-    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, shaders, jobs, frames, checkpoints, scene, approvals,
+    // RHIZOME_TEST_ONLY=<section>: that section alone (identities, encryption, messages, plans, importance, memory, audits, swarms, adaptive, workstations, shaders, devices, jobs, frames, checkpoints, scene, approvals,
     // discovery, failover).
     const char* only = std::getenv("RHIZOME_TEST_ONLY");
     auto run = [&](const char* name, const std::function<void()>& f) {
@@ -1241,6 +1335,7 @@ int main() {
     run("adaptive", adaptive);
     run("workstations", workstations);
     run("shaders", shaderStates);
+    run("devices", deviceStates);
     run("jobs", jobs);
     run("frames", frames);
     run("checkpoints", checkpoints);

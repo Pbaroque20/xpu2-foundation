@@ -13,6 +13,34 @@ namespace xpu2::interactive::rhizome {
 
 enum class State : uint8_t { Alive, Suspect, Gone };
 
+// What a machine renders its jobs on, as it says (RhizomeNode::setDevices): "CPU and GPU", "the GPU alone", or "the CPU
+// alone" and why (its cards cannot be used, or its devices are set so). Its rate is measured on what it renders on;
+// when that changes between the processor alone and its cards, the rate it had on the other is taken up again.
+struct DeviceRates {
+    bool known = false;     // said once at least
+    bool cpuAlone = false;  // on the processor alone now
+    double other = 0;       // its rate on the devices it is not on now (0: never measured)
+};
+inline bool cpuAloneText(const std::string& devices) { return devices.rfind("the CPU alone", 0) == 0; }
+// The first guess of a machine's rate on its processor alone, from its rate with its cards: low on purpose, as a node
+// given too little steals more, and the chunks it returns correct it (Members::rate).
+constexpr double CpuAloneGuess = 1.0 / 16.0;
+// A machine's rate as it changes devices: the rate it had on the new ones before; else, gone to the processor alone,
+// CpuAloneGuess of its rate on its cards, or, gone to its cards, unknown (0: the plan takes the others' median). The
+// first time it says, its rate is left as measured.
+inline double switchDevices(DeviceRates& d, double rate, bool cpuAlone) {
+    if (!d.known) {
+        d.known = true;
+        d.cpuAlone = cpuAlone;
+        return rate;
+    }
+    if (d.cpuAlone == cpuAlone) return rate;
+    const double next = d.other > 0 ? d.other : cpuAlone ? rate * CpuAloneGuess : 0.0;
+    d.other = rate;
+    d.cpuAlone = cpuAlone;
+    return next;
+}
+
 struct Member {
     Hash hash{};
     Bytes publicKey;
@@ -24,6 +52,8 @@ struct Member {
     bool quarantined = false;
     bool master = false;
     std::string shaders;  // its GPU programs, as its heartbeats say (RhizomeNode::setShaders)
+    std::string devices;  // what it renders on, as its heartbeats and Ready say (RhizomeNode::setDevices)
+    DeviceRates deviceRates;
 };
 
 class Members {
@@ -71,6 +101,15 @@ public:
     }
     void rate(const Hash& h, double samplesPerSecond) {
         if (Member* m = find(h)) m->caps.rate = m->caps.rate > 0 ? 0.7 * m->caps.rate + 0.3 * samplesPerSecond : samplesPerSecond;
+    }
+    // What a member renders on, as it says: its rate taken over for the new devices (switchDevices), at once, so the
+    // next frame's plan gives a node gone to its processor alone what it can do. True where it changed.
+    bool devices(const Hash& h, const std::string& devices) {
+        Member* m = find(h);
+        if (!m || devices.empty() || devices == m->devices) return false;
+        m->caps.rate = switchDevices(m->deviceRates, m->caps.rate, cpuAloneText(devices));
+        m->devices = devices;
+        return true;
     }
     // Marks the silent: suspected, then gone. Returns the members that went this sweep.
     // Bytes of a member's arrived (a message on its way, however long): it is not silent. Never brings back the gone.

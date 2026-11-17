@@ -148,7 +148,7 @@ Written whole each second, then named, so a reader never sees half a file. Forma
   "pool": {"ram": 34359738368, "vram": 25769803776, "pieces": 118, "held": 118},
   "members": [
     {"hash": "...", "self": true, "address": "192.168.1.64:47110", "role": "master", "state": "alive", "tier": "fast",
-     "rate": 4.1e7, "rtt": 0, "chunks": 120, "ram": 0, "vram": 0, "ramGiven": 0, "vramGiven": 0, "gpuPrograms": "compiled"}
+     "rate": 4.1e7, "rtt": 0, "chunks": 120, "ram": 0, "vram": 0, "ramGiven": 0, "vramGiven": 0, "gpuPrograms": "compiled", "devices": "CPU and GPU"}
   ]
 }
 ```
@@ -176,6 +176,7 @@ A member's row:
 | `chunks` | Chunks of this frame its films brought (a master's count). |
 | `ram`, `vram` | Bytes of the pool it holds now. `ramGiven`, `vramGiven`: bytes it gives the pool. |
 | `gpuPrograms` | Its GPU programs: `no graphics card`, `not used (the processor alone)`, `compiled`, `missing: <cards>`, `missing: <cards> (declined here)`, `compiling` or `compiling: <done> of <all> tasks, <s> s`. Empty: not heard yet. |
+| `devices` | What it renders its jobs on: `CPU and GPU`, `the GPU alone`, or `the CPU alone (<why>)`, the why being `no graphics card`, `<cards> older than XPU2's GPU programs run on`, `the GPU programs not compiled here`, `the GPU programs not compiled for its cards`, `its graphics card could not take this job: <error>`, `the GPU leaves <what> to the CPU` or `its devices set to the processor`. Said in each Ready and heartbeat; the master takes the machine's rate over at once when it changes between the processor alone and its cards. Empty: not heard yet. |
 
 ## 4. The job queue
 
