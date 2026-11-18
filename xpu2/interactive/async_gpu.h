@@ -28,6 +28,8 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -3146,6 +3148,19 @@ private:
         }
         if (fine_.prefetchAt >= fine_.prefetch.size()) std::vector<U32>().swap(fine_.prefetch), fine_.prefetchAt = 0;
     }
+    // The most a commit sends up, in bytes of its staging: 1 GB (XPU2_SESSION_COMMIT_MB), and at most a quarter of the pinned
+    // memory the budget has left. The tiles asked for past it wait for the next launch's commit, oldest first. Every tile
+    // asked for went up at once: Sponza's 1.65 million after its fourth generation were decoded for two minutes with the
+    // card idle, then asked for 10 GB of pinned staging, past the budget, and the frame went to MoonRay.
+    size_t commitBytes() const {
+        static const size_t most = [] {
+            const char* v = std::getenv("XPU2_SESSION_COMMIT_MB");
+            const long long mb = v ? std::atoll(v) : 0;
+            return size_t(mb > 0 ? mb : 1024) << 20;
+        }();
+        const size_t left = driver.pinnedCap > driver.pinnedBytes ? driver.pinnedCap - driver.pinnedBytes : 0;
+        return std::min(most, left / 4);
+    }
     void commitTiles() {
         prefetchTiles();
         if (fine_.pending.empty()) return;
@@ -3154,15 +3169,41 @@ private:
         fine_.pending.erase(std::remove_if(fine_.pending.begin(), fine_.pending.end(), [&](U32 tile) { return fine_.tileSlot[tile] != NoSlot; }),
                             fine_.pending.end());
         if (fine_.pending.empty()) return;
+        size_t most = 16;
+        for (const auto& c : fine_.classes) most = std::max(most, c.slotBytes);
+        // This commit's tiles, the oldest asked for; the others stay asked for (the card asks for each once).
+        std::vector<U32> later;
+        if (const size_t batch = std::max<size_t>(1, commitBytes() / most); fine_.pending.size() > batch) {
+            later.assign(fine_.pending.begin() + std::ptrdiff_t(batch), fine_.pending.end());
+            fine_.pending.resize(batch);
+        }
         std::vector<TileUpdate> updates;
-        // Tiles not yet decoded on the host (a level read on demand) decoded first, on several threads at once.
+        // Tiles not yet decoded on the host (a level read on demand) decoded first, on several threads at once, at the feeder's
+        // priority (async_render.h): the card waits for them. One tile of each region (host_texture.h's Pyramid::region: the
+        // file's own tile, which the read decodes whole, keeping every tile of ours in it), so that no thread waits on
+        // another's read; and the files taken in turn, as OpenImageIO reads one file's tiles one at a time.
         {
             std::vector<U32> missing;
-            for (size_t k = 0; k < fine_.pending.size(); ++k) {
-                const auto& source = fine_.sources[fine_.pending[k]];
-                if (source.mip && source.mip->load && !source.mip->pages[source.page]) missing.push_back(fine_.pending[k]);
+            {
+                std::set<std::pair<const void*, uint64_t>> seen;
+                std::unordered_map<const void*, size_t> fileAt;
+                std::vector<std::vector<U32>> byFile;
+                for (size_t k = 0; k < fine_.pending.size(); ++k) {
+                    const auto& source = fine_.sources[fine_.pending[k]];
+                    if (!source.mip || !source.mip->load || source.mip->pages[source.page]) continue;
+                    if (!seen.insert({source.mip->loader, texture::Pyramid::regionOf(source.mip->loader, source.page)}).second) continue;
+                    const auto at = fileAt.emplace(texture::Pyramid::of(source.mip->loader), byFile.size());
+                    if (at.second) byFile.emplace_back();
+                    byFile[at.first->second].push_back(fine_.pending[k]);
+                }
+                for (size_t round = 0, left = 1; left; ++round) {
+                    left = 0;
+                    for (const auto& file : byFile)
+                        if (round < file.size()) missing.push_back(file[round]), ++left;
+                }
             }
             const unsigned threads = unsigned(std::min<size_t>(missing.size(), std::max(1u, std::thread::hardware_concurrency() / 2)));
+            const int priority = GetThreadPriority(GetCurrentThread());
             std::atomic<size_t> next{0};
             // A tile that cannot be read is the frame's failure, said with its reason, once every thread has left: thrown past
             // threads still running, on this thread or theirs, it ended the process with nothing said ("terminate called").
@@ -3185,6 +3226,7 @@ private:
                 for (unsigned k = 1; k < threads; ++k)
                     pool.emplace_back([&] {
                         multi::OnNode near(options_.node);
+                        if (priority != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(GetCurrentThread(), priority);
                         work();
                     });
             } catch (const std::system_error&) {
@@ -3219,18 +3261,27 @@ private:
                 ++fine_.evicted;
             }
         }
-        size_t most = 16;
-        for (const auto& c : fine_.classes) most = std::max(most, c.slotBytes);
         gpu::Allocating what("texture tiles on their way to the card");
-        auto staging = pinned(std::max<size_t>(fine_.pending.size(), 1) * most);
+        // Each tile's copy to the card, into its slot or (a flat tile's value) its place in the flat pool, staged in the order
+        // of those places and sent a run of neighbouring places at a time. One copy a tile filled the driver's queue (43,690
+        // a commit on Sponza), and the feeder waited behind the launches in flight to queue the rest.
+        struct Copy {
+            CUdeviceptr to;
+            size_t bytes, size;  // its own bytes, and its place's
+            const void* from;
+            U64 within;  // the allocation it lands in: copies are joined only within one
+        };
+        std::vector<Copy> copies;
+        copies.reserve(fine_.pending.size());
         size_t n = 0;
         std::vector<U32> deferred;
         std::vector<B> extra;  // wide tiles' staging, kept until their copies are done
+        // A tile may be let go under memory pressure, or have been since it was decoded: none is, until it is staged below.
+        std::optional<tex::spill::Guard> guard;
+        guard.emplace();
         for (U32 tile : fine_.pending) {
             const auto& source = fine_.sources[tile];
             auto& c = fine_.classes[source.kind];
-            char* at = static_cast<char*>(staging->host()) + n * most;
-            tex::spill::Guard guard;  // a tile may be let go under memory pressure, or have been since it was decoded
             const surface::V3* texels = source.mip->pages[source.page];
             while (!texels && source.mip->load) {
                 source.mip->load(source.mip->loader, 0, source.page);
@@ -3238,16 +3289,14 @@ private:
             }
             cpu::need(texels != nullptr, "A fine-detail tile with no texels");
             CUdeviceptr to = 0;
-            size_t bytes = 0;
             U32 s = FlatSlot;
             if (tex::flatPage(texels)) {
                 to = fine_.flatPool->pointer + size_t(tile) * 16;
-                bytes = sizeof(surface::V3);
-                std::memcpy(at, tex::flatValue(texels), bytes);
+                copies.push_back({to, sizeof(surface::V3), 16, tex::flatValue(texels), ~0ull});
                 ++fine_.flat;
             } else if (tex::widePage(texels)) {
                 const U32 count = source.bytes / tex::texelBytes(source.mip->format);
-                bytes = size_t(count) * tex::texelBytes(tex::wideFormat(source.mip->format));
+                const size_t bytes = size_t(count) * tex::texelBytes(tex::wideFormat(source.mip->format));
                 auto own = pinned(bytes);
                 std::memcpy(own->host(), tex::pageAddress(texels), bytes);
                 fine_.wide.push_back(device(bytes));
@@ -3267,18 +3316,35 @@ private:
                 s = c.freeSlots.back();
                 c.freeSlots.pop_back();
                 to = slotAddress(c, s);
-                bytes = size_t(source.bytes);
-                std::memcpy(at, texels, bytes);
+                copies.push_back({to, size_t(source.bytes), c.slotBytes, texels, (U64(source.kind) << 32) | ((s - c.first) / c.blockSlots)});
                 fine_.slotTile[s] = tile;
             }
-            gpu::Driver::check(driver.cuMemcpyHtoDAsync_v2_p(to, at, bytes, stream_));
             fine_.tileSlot[tile] = s;
             fine_.lastUse[tile] = launches_ + 1;
             updates.push_back({tile, 0, U64L(to) | (s == FlatSlot ? 1ull : 0ull)});
             ++fine_.loaded;
             ++n;
         }
+        std::sort(copies.begin(), copies.end(), [](const Copy& a, const Copy& b) { return a.to < b.to; });
+        size_t staged = 0;
+        for (const Copy& c : copies) staged += c.size;
+        auto staging = pinned(std::max<size_t>(staged, 16));
+        char* const host = static_cast<char*>(staging->host());
+        for (size_t i = 0, at = 0; i < copies.size();) {
+            const size_t from = at;
+            size_t j = i;
+            do {
+                std::memcpy(host + at, copies[j].from, copies[j].bytes);
+                if (copies[j].size > copies[j].bytes) std::memset(host + at + copies[j].bytes, 0, copies[j].size - copies[j].bytes);
+                at += copies[j].size;
+                ++j;
+            } while (j < copies.size() && copies[j].within == copies[i].within && copies[j].to == copies[j - 1].to + copies[j - 1].size);
+            gpu::Driver::check(driver.cuMemcpyHtoDAsync_v2_p(copies[i].to, host + from, at - from, stream_));
+            i = j;
+        }
+        guard.reset();
         fine_.pending = std::move(deferred);
+        fine_.pending.insert(fine_.pending.end(), later.begin(), later.end());
         if (!updates.empty()) {
             auto list = pinned(updates.size() * sizeof(TileUpdate));
             std::memcpy(list->host(), updates.data(), updates.size() * sizeof(TileUpdate));

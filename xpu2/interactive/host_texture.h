@@ -10,6 +10,8 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <algorithm>
 #include <cctype>
 #include <unordered_map>
 #include <cstdint>
@@ -202,45 +204,88 @@ struct Pyramid {
  // (realtime's starts further down) a reader reaches it through.
  struct LevelLoader {Pyramid* pyramid=nullptr;unsigned level=0;};LevelLoader loaders[tex::MaxLevels];
  std::string file;int channels=0,alphaChannel=-1,fileBase=0;bool alphaOnly=false;std::mutex lazyLock;
+ // Each level on demand's tiles as the file stores them (a .tx's 64 x 64): a read decodes the file's tiles that hold the
+ // one asked for, and keeps every tile of ours in them (region). One at a time, each file tile was decoded again for each
+ // of our four in it, through an OpenImageIO cache too small to keep it in between: Sponza (2026-11-18) read 19 GB from
+ // its 8.8 GB of files, a few thousand tiles a second, while the card waited for 1.65 million of them.
+ unsigned fileTileWidth[tex::MaxLevels]{},fileTileHeight[tex::MaxLevels]{};
+ // The regions being read now (regionKey), and the wait of whoever asks for a tile in one meanwhile, so that each is
+ // decoded once; and the regions read so far.
+ std::vector<uint64_t> reading;std::condition_variable regionRead;std::atomic<unsigned> regionsRead{0};
  // Loaded tiles, oldest first: under memory pressure the oldest are let go (letGo), and read again if asked for again.
  struct LazyTile {Block block;unsigned level,tile;size_t size;unsigned node;};
  std::deque<LazyTile> lazyTiles;size_t lazyBytes=0;std::atomic<unsigned> lazyLoaded{0},lazyFlat{0},lazyWide{0};
  // One texel of the file as kept: channels mapped, alpha as colour.
  surface::V3 kept(const float* d)const{surface::V3 c;float a;texelChannels(d,channels,alphaChannel,c,a);if(alphaOnly)c={a,a,a};return c;}
- // A tile of a level on demand decoded now (tex::Mip::load): the same values the whole level gave, through OIIO's conversion.
- // self is the level's loader; the level passed is the reader's, which may count from another view, and is not used.
+ // The tiles of ours [x0, x1) x [y0, y1) a read of tile (tx, ty) of a level on demand decodes: those inside the file's own
+ // tiles that hold it (four of ours in a .tx's 64 x 64), at most four a side. The same for every tile in it.
+ void region(unsigned level,unsigned tx,unsigned ty,unsigned& x0,unsigned& x1,unsigned& y0,unsigned& y1)const{
+  const tex::Mip& m=image.levels[level];
+  auto span=[](unsigned t,unsigned size,unsigned file,unsigned& a,unsigned& b){
+   const unsigned count=(size+tex::Tile-1)/tex::Tile,f=std::max(file,1u),from=t*tex::Tile,to=std::min(size,from+tex::Tile);
+   const unsigned fileFrom=from/f*f,fileTo=std::min(size,(to+f-1)/f*f);
+   a=(fileFrom+tex::Tile-1)/tex::Tile;b=fileTo==size?count:fileTo/tex::Tile;
+   if(b-a>4){a+=(t-a)/4*4;b=std::min(b,a+4);}};
+  span(tx,m.width,fileTileWidth[level],x0,x1);span(ty,m.height,fileTileHeight[level],y0,y1);}
+ // A region's name among a pyramid's: its level and first tile.
+ uint64_t regionKey(unsigned level,unsigned tile)const{const unsigned nx=(image.levels[level].width+tex::Tile-1)/tex::Tile;
+  unsigned x0,x1,y0,y1;region(level,tile%nx,tile/nx,x0,x1,y0,y1);return (uint64_t(level)<<40)|(uint64_t(y0)*nx+x0);}
+ // The region of a tile a loader's level reads with it (the GPU lane reads each region of a commit's tiles once).
+ static uint64_t regionOf(const void* loader,unsigned tile){const auto* at=static_cast<const LevelLoader*>(loader);return at->pyramid->regionKey(at->level,tile);}
+ // The pyramid a loader's level is of (its file).
+ static const void* of(const void* loader){return static_cast<const LevelLoader*>(loader)->pyramid;}
+ // A tile of a level on demand decoded now (tex::Mip::load), with the others of its region: the same values the whole level
+ // gave, through OIIO's conversion. self is the level's loader; the level passed is the reader's, which may count from
+ // another view, and is not used.
  static void loadTile(const void* self,unsigned,unsigned tile){const auto* at=static_cast<const LevelLoader*>(self);
   Pyramid* p=at->pyramid;const unsigned level=at->level;
-  // Decoded outside the lock (tiles of one texture decode side by side); the first to finish publishes its page.
   auto& page=p->pages[level][tile];if(page)return;
   // XPU2_SESSION_FAIL_TILE=N: the Nth tile read fails, to test what follows one.
   static std::atomic<long long> untilFailure{[]{const char* v=std::getenv("XPU2_SESSION_FAIL_TILE");return v?std::atoll(v):0ll;}()};
   if(untilFailure.load(std::memory_order_relaxed)>0&&untilFailure.fetch_sub(1)==1)throw std::runtime_error("Texture tile read: "+p->file+", tile "+std::to_string(tile)+": failed for a test (XPU2_SESSION_FAIL_TILE)");
-  const tex::Mip& m=p->image.levels[level];const unsigned nx=(m.width+tex::Tile-1)/tex::Tile,tx=tile%nx,ty=tile/nx;
-  const unsigned tw=std::min(tex::Tile,m.width-tx*tex::Tile),th=std::min(tex::Tile,m.height-ty*tex::Tile);
-  std::vector<float> decoded(size_t(tw)*th*p->channels);
-  if(!lazyCache()->get_pixels(OIIO::ustring(p->file),0,int(level)+p->fileBase,int(tx*tex::Tile),int(tx*tex::Tile+tw),int(ty*tex::Tile),int(ty*tex::Tile+th),0,1,
-                              OIIO::TypeDesc::FLOAT,decoded.data()))
+  const tex::Mip& m=p->image.levels[level];const unsigned nx=(m.width+tex::Tile-1)/tex::Tile;
+  unsigned x0,x1,y0,y1;p->region(level,tile%nx,tile/nx,x0,x1,y0,y1);
+  // One reader a region: whoever asks for a tile in it meanwhile waits for that read (its tile is there after), and reads
+  // it again only where it is not (let go since, or the read failed). Regions of a texture decode side by side.
+  const uint64_t key=(uint64_t(level)<<40)|(uint64_t(y0)*nx+x0);
+  {std::unique_lock<std::mutex> g(p->lazyLock);
+   for(;;){if(page)return;if(std::find(p->reading.begin(),p->reading.end(),key)==p->reading.end())break;p->regionRead.wait(g);}
+   p->reading.push_back(key);}
+  struct Leave{Pyramid* p;uint64_t key;
+   ~Leave(){{std::lock_guard<std::mutex> g(p->lazyLock);p->reading.erase(std::find(p->reading.begin(),p->reading.end(),key));}p->regionRead.notify_all();}} leave{p,key};
+  const unsigned px0=x0*tex::Tile,px1=std::min(m.width,x1*tex::Tile),py0=y0*tex::Tile,py1=std::min(m.height,y1*tex::Tile),rw=px1-px0;
+  thread_local std::vector<float> decoded;thread_local std::vector<surface::V3> held;
+  decoded.resize(size_t(rw)*(py1-py0)*p->channels);
+  if(!lazyCache()->get_pixels(OIIO::ustring(p->file),0,int(level)+p->fileBase,int(px0),int(px1),int(py0),int(py1),0,1,OIIO::TypeDesc::FLOAT,decoded.data()))
    throw std::runtime_error("Texture tile read: "+p->file+", tile "+std::to_string(tile)+": "+lazyCache()->geterror());
-  std::vector<surface::V3> held(size_t(tw)*th);bool flat=true,fits=true;
-  for(size_t at=0;at<held.size();++at){held[at]=p->kept(&decoded[at*p->channels]);const surface::V3& c=held[at];
-   flat=flat&&c.x==held[0].x&&c.y==held[0].y&&c.z==held[0].z;if(p->rounds)fits=fits&&halfFits(c.x)&&halfFits(c.y)&&halfFits(c.z);}
-  // A tile with a value past half floats' range held in floats (tex::widePage), the level's other tiles in half floats.
-  const bool wide=p->rounds&&!fits;const unsigned format=wide?tex::wideFormat(p->format):p->format;
-  // A flat tile, all its texels one value (a mask's black, a normal map's untouched blue): that value alone, its page marked so
-  // (tex::flatPage), on the card too. Its value is the one its texels would read: checked to be one its format holds, or rounded
-  // as they would be.
-  surface::V3 value=held[0];
-  if(flat&&!p->compressed){unsigned char check[12];storeTexel(value,format,check,p->rounds);if(p->rounds&&!wide)value=halfRoundedTexel(value);}
-  const size_t size=flat?sizeof(surface::V3):p->compressed?size_t(tex::tileBytes(2,0)):size_t(tw)*th*tex::texelBytes(format);
-  const unsigned node=multi::currentNode();Block block=nodeBlock(size,node);
-  if(flat)std::memcpy(block.get(),&value,sizeof(surface::V3));
-  else if(p->compressed)encodeTile(held.data(),tw,th,block.get());
-  else for(size_t at=0;at<held.size();++at)storeTexel(held[at],format,block.get()+at*tex::texelBytes(format),p->rounds);
-  std::lock_guard<std::mutex> g(p->lazyLock);if(page)return;
-  std::atomic_thread_fence(std::memory_order_release);
-  page=reinterpret_cast<const surface::V3*>(reinterpret_cast<uintptr_t>(block.get())|(flat?1u:wide?2u:0u));
-  p->lazyTiles.push_back({std::move(block),level,tile,size,node});nodeTileBytes(node)+=size;p->lazyBytes+=size;p->bytes+=size;p->lazyLoaded++;if(flat)p->lazyFlat++;else if(wide)p->lazyWide++;}
+  p->regionsRead++;
+  struct Made {Block block;unsigned tile;size_t size;bool flat,wide;};std::vector<Made> made;
+  const unsigned node=multi::currentNode();
+  for(unsigned uy=y0;uy<y1;++uy)for(unsigned ux=x0;ux<x1;++ux){const unsigned id=uy*nx+ux;if(p->pages[level][id])continue;
+   const unsigned tw=std::min(tex::Tile,m.width-ux*tex::Tile),th=std::min(tex::Tile,m.height-uy*tex::Tile);
+   held.resize(size_t(tw)*th);bool flat=true,fits=true;
+   for(unsigned j=0;j<th;++j)for(unsigned i=0;i<tw;++i){const size_t k=size_t(j)*tw+i;
+    held[k]=p->kept(&decoded[(size_t(uy*tex::Tile+j-py0)*rw+(ux*tex::Tile+i-px0))*p->channels]);const surface::V3& c=held[k];
+    flat=flat&&c.x==held[0].x&&c.y==held[0].y&&c.z==held[0].z;if(p->rounds)fits=fits&&halfFits(c.x)&&halfFits(c.y)&&halfFits(c.z);}
+   // A tile with a value past half floats' range held in floats (tex::widePage), the level's other tiles in half floats.
+   const bool wide=p->rounds&&!fits;const unsigned format=wide?tex::wideFormat(p->format):p->format;
+   // A flat tile, all its texels one value (a mask's black, a normal map's untouched blue): that value alone, its page marked so
+   // (tex::flatPage), on the card too. Its value is the one its texels would read: checked to be one its format holds, or rounded
+   // as they would be.
+   surface::V3 value=held[0];
+   if(flat&&!p->compressed){unsigned char check[12];storeTexel(value,format,check,p->rounds);if(p->rounds&&!wide)value=halfRoundedTexel(value);}
+   const size_t size=flat?sizeof(surface::V3):p->compressed?size_t(tex::tileBytes(2,0)):size_t(tw)*th*tex::texelBytes(format);
+   Block block=nodeBlock(size,node);
+   if(flat)std::memcpy(block.get(),&value,sizeof(surface::V3));
+   else if(p->compressed)encodeTile(held.data(),tw,th,block.get());
+   else for(size_t k=0;k<held.size();++k)storeTexel(held[k],format,block.get()+k*tex::texelBytes(format),p->rounds);
+   made.push_back({std::move(block),id,size,flat,wide});}
+  std::lock_guard<std::mutex> g(p->lazyLock);
+  for(auto& t:made){auto& to=p->pages[level][t.tile];if(to)continue;
+   std::atomic_thread_fence(std::memory_order_release);
+   to=reinterpret_cast<const surface::V3*>(reinterpret_cast<uintptr_t>(t.block.get())|(t.flat?1u:t.wide?2u:0u));
+   p->lazyTiles.push_back({std::move(t.block),level,t.tile,t.size,node});nodeTileBytes(node)+=t.size;p->lazyBytes+=t.size;p->bytes+=t.size;p->lazyLoaded++;
+   if(t.flat)p->lazyFlat++;else if(t.wide)p->lazyWide++;}}
  // The decoded tiles it holds, in bytes: all, or those on one node.
  size_t lazyHeld(int node=-1){std::lock_guard<std::mutex> g(lazyLock);if(node<0)return lazyBytes;size_t n=0;for(const auto& t:lazyTiles)if(int(t.node)==node)n+=t.size;return n;}
  // The oldest tiles (of one node, or of any), up to want bytes: their pages cleared, their blocks handed over to free once
@@ -300,6 +345,7 @@ struct Pyramid {
     // A level read when first used (loadTile): its pages empty for now.
     if(!image.count)remote::addToCache(*lazyCache(),name);
     pages.emplace_back(size_t(nx)*ny,nullptr);loaders[image.count]={this,image.count};
+    fileTileWidth[image.count]=unsigned(spec.tile_width);fileTileHeight[image.count]=unsigned(std::max(spec.tile_height,1));
     image.levels[image.count]={w,h,pages.back().data(),0,format,&Pyramid::loadTile,&loaders[image.count]};++image.count;continue;}
    std::vector<float> decoded(size_t(w)*h*spec.nchannels);
    need(in->read_image(0,int(level),0,spec.nchannels,OIIO::TypeDesc::FLOAT,decoded.data()),"Stored mip decode");pages.emplace_back(nx*ny,nullptr);auto& page=pages.back();

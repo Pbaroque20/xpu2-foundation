@@ -325,7 +325,12 @@ differ: presence shadows, shadow linking, volumes, a minimum shadow distance and
   (`Pyramid::loadTile`, through an OpenImageIO ImageCache), and since 2026-11-14 every level larger than 128 pixels
   a side as well (`residentSide`, `XPU2_SESSION_RESIDENT_TEXTURE_SIDE`); only the levels of 128 or less are decoded as
   the scene is prepared, and only those count toward the decoded-texture budgets, so a scene of large textures seen
-  from afar no longer goes to texture overflow mode. `XPU2_SESSION_EAGER_TEXTURES=1` decodes them all at once. Texels are kept small (`tex::Mip::format`, `texture_core.h`):
+  from afar no longer goes to texture overflow mode. `XPU2_SESSION_EAGER_TEXTURES=1` decodes them all at once.
+  Since 2026-11-18 a read decodes the file's own tile that holds the tile asked for (a `.tx` file's 64 x 64, four of
+  ours) and keeps all of ours in it (`Pyramid::region`), each such region read once however many threads ask for its
+  tiles. One at a time, each file tile was decoded again for every one of ours in it through a cache too small to keep
+  it in between: Sponza's 92 float textures at 4096 pixels read 19 GB from 8.8 GB of files, at a few thousand tiles a
+  second. Texels are kept small (`tex::Mip::format`, `texture_core.h`):
   8-bit files as bytes, float files in half floats (each value rounded to the nearest; a tile with a value past their
   range, such as a sun, stays in floats), grey files in one channel, and a tile of one value as that value alone. A
   scene's textures take about a third of the memory they did as floats.
@@ -333,7 +338,10 @@ differ: presence shadows, shadow linking, volumes, a minimum shadow distance and
   of every larger level (fine-detail tiles, the finest level's and the coarser ones'), loaded on demand as frames
   sample them and evicted least recently used when the cache is full: a texture seen from afar sends up only its
   coarser levels' tiles, one not seen none. Until 2026-11-14 levels 1 and up were all sent as the scene was prepared.
-  A lookup that lacks tiles asks for all of them at once. Final frames and Render Animation frames do not finish
+  A lookup that lacks tiles asks for all of them at once. Each launch sends up to 1 GB of the tiles asked for, oldest
+  first (`GpuLane::commitTiles`, `XPU2_SESSION_COMMIT_MB`), copied a run of neighbouring cache slots at a time; the rest
+  go with the next launches. Until 2026-11-18 every tile asked for went at once, one copy each: Sponza, whose bounces
+  ask for 1.65 million tiles after its fourth generation, asked for 10 GB of pinned staging and went to MoonRay. Final frames and Render Animation frames do not finish
   before the tiles they asked for have landed and their samples were rendered again in full, so the picture equals the
   render with every texture whole; realtime frames may show a coarser texture until its tiles land. Realtime keeps
   its textures to 1024 pixels a side (`XPU2_SESSION_RT_TEXTURE_SIDE`; 0 reads every level on demand, close-up normal and
@@ -666,6 +674,7 @@ Environment variables read by the session or the renderer. The defaults are the 
 | `XPU2_SESSION_RT_TEXTURE_SIDE` | Realtime's largest texture side (default 1024; 0: whole, read on demand) (added 2026-10-27) |
 | `XPU2_SESSION_PREFETCH_TEXTURES=1` | A final render's first frame loads ahead, into free cache slots, each texture's level its meshes need (the kit's texture needs) and the coarser ones; off by default, as it was slower on the scenes tried (added 2026-11-14) |
 | `XPU2_SESSION_RESIDENT_TEXTURE_SIDE` | The largest texture level decoded whole and held on the card for the session; larger ones load on demand (default 128; 65536: every level but the finest whole, as before 2026-11-14) |
+| `XPU2_SESSION_COMMIT_MB` | The most texture tiles one launch's commit sends to the card, in MB of staging (default 1024, and never past a quarter of the pinned memory left); the rest go with the next launches (added 2026-11-18) |
 | `XPU2_SESSION_CANONICAL_FILE=1` | The canonical replica also written as an RDLB file, to inspect (added 2026-10-26) |
 | `XPU2_SESSION_RT_DENOISE=0`, `_RT_GUIDES`, `_RT_SHOW`, `_RT_DEBUG`, `_RT_PRIORITY=0` | Diagnostics of the session's realtime denoiser, unused by the 0.5 kit (`INDEXER.md` section 13) |
 | `XPU2_SESSION_DEBUG_FAILURES` | Names the CPU lane's first failed shadings and texture lookups |
