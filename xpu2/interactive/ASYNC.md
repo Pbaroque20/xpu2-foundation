@@ -98,8 +98,9 @@ the broker, every pixel given exactly its samples, the cellular rules, the check
 
 `host_texture_test.cc` checks the texture levels read on demand (`host_texture.h`): a tile read decodes the file's own
 tile holding it once and keeps every tile of ours in it, under 12 threads too, with every texel the whole level's
-decode (16, 64 and 256 pixel file tiles, partial edge tiles, grey and alpha files, a tile past half floats' range). How
-to build and run it is at its top.
+decode (16, 64 and 256 pixel file tiles, partial edge tiles, grey and alpha files, a tile past half floats' range); and
+that a texture file's size and time for the tessellation cache's key are read once while the session leases the file
+(`texture::File::stamp`). How to build and run it is at its top.
 
 ## First load and re-cuts
 
