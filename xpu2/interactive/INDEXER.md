@@ -406,7 +406,10 @@ MoonRay's own levels, and the image stays MoonRay's.
    geometryKey, loadGeometry, saveGeometry; %LOCALAPPDATA%/MoonRayForModo/xpu2-geometry, 20 GB, written on threads the
    session joins before it ends): the 32 M-triangle displaced tyre's second session read 1.46 GB in place of tessellating,
    meshes and tessellation 11.2 s to 0.83 s, the scene ready at 4.3 s in place of 16.2 s, the picture the same (oiiotool
-   diff PASS). The key holds the tessellation DLL's size and time: a new build makes its own.
+   diff PASS). The key holds the tessellation DLL's size and time: a new build makes its own. It also holds each
+   texture file's size and time, read once while the session leases the file (texture::File::stamp) and the DLL's
+   once a process: read again for each mesh piece, they took 18-30 s of Sponza's preparation (382 pieces, 184 textures,
+   2026-11-18), cache hit or not.
 5. **Tighter stand-ins.** Done as boxes round runs of 128 of the mesh's own triangles (session 145), not an inflated
    coarse level: an offset shell is hard to make enclose a displaced surface everywhere (open edges, negative heights,
    subdivision bulging past its cage), and a ray slipping through would lose a hit; every triangle is inside its box.

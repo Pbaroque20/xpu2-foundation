@@ -521,6 +521,17 @@ struct File {
   }catch(...){if(lock!=INVALID_HANDLE_VALUE)CloseHandle(lock);lock=INVALID_HANDLE_VALUE;throw;}
  }
  ~File(){if(lock!=INVALID_HANDLE_VALUE)CloseHandle(lock);}File(const File&)=delete;
+ // Its size and time as the tessellation cache keys them (cpu_scene.h geometryKey), read once: the lease keeps the file as
+ // it is (no writer, delete or rename while it is held; a remote file's source does not change), so a mesh's key need not
+ // read them again. Read for every piece of every mesh, they took 18-30 s of Sponza's preparation (382 pieces, 184 textures,
+ // 0.24 ms the two reads).
+ struct Stamp{std::uintmax_t size=0;decltype(std::filesystem::file_time_type{}.time_since_epoch().count()) when=0;};
+ const Stamp& stamp()const{
+  std::call_once(stamped,[this]{std::error_code ec;const std::string n=name.string();stamped_.size=std::filesystem::file_size(n,ec);
+   stamped_.when=std::filesystem::last_write_time(n,ec).time_since_epoch().count();});
+  return stamped_;}
+private:
+ mutable std::once_flag stamped;mutable Stamp stamped_;
 };
 // Where a scene's textures stand in memory, for the log (the session prints it at each load and frame), and what each lossless
 // way of holding them would save. Greyness and flatness are read from a level of at most 1024 pixels, the first decoded, once

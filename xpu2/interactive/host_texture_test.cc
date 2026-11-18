@@ -2,7 +2,9 @@
 // that holds the tile asked for, once, and keeps every tile of ours in it, with the same texels a whole level's decode
 // gives. Sponza (2026-11-18) stalled XPU2 for want of this: read 32 x 32 at a time through an OpenImageIO cache too small
 // for the scene, each of a .tx's 64 x 64 tiles was decoded again for each of our four in it (19 GB read from 8.8 GB of
-// files), a few thousand tiles a second, while the card waited for 1.65 million of them.
+// files), a few thousand tiles a second, while the card waited for 1.65 million of them. And a texture file's size and
+// time for the tessellation cache's key (texture::File::stamp), read once: read for every mesh piece, they took 18-30 s of
+// Sponza's preparation.
 //
 // Built and run from the MoonRayForModo tree (MSYS2 UCRT64 toolchain on PATH):
 //   g++ -std=c++20 -O2 -Itoolchain/msys64/ucrt64/include -o host_texture_test.exe xpu2/interactive/host_texture_test.cc
@@ -182,6 +184,35 @@ int main() {
             check(held(m) == 0, "every tile let go");
             texture::Pyramid::loadTile(m.loader, 0, 1);
             check(p.regionsRead == 2 && held(m) == 4, "a tile let go read again with its region");
+        }
+        // 5. A texture file's size and time for the tessellation cache's key (cpu_scene.h geometryKey), read once while the
+        // session holds the file: read for every mesh piece, they took 18-30 s of Sponza's preparation.
+        {
+            const std::string file = makeTexture(folder, "stamp.tx", 128, 128, 3, 64);
+            texture::File f(file, folder, texture::system());
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(file, ec);
+            const auto when = std::filesystem::last_write_time(file, ec);
+            const auto& s = f.stamp();
+            check(s.size == size && s.when == when.time_since_epoch().count(), "the stamp is the file's size and time, as the key read them");
+            const HANDLE writer = CreateFileA(file.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(writer == INVALID_HANDLE_VALUE, "the lease keeps writers out while the file is held");
+            if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
+            // A time set by hand (attributes pass the lease), seen by a new read and not by the stamp.
+            bool touched = false;
+            if (const HANDLE h = CreateFileA(file.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                             OPEN_EXISTING, 0, nullptr);
+                h != INVALID_HANDLE_VALUE) {
+                FILETIME t{};
+                GetSystemTimeAsFileTime(&t);
+                ULARGE_INTEGER u{{t.dwLowDateTime, t.dwHighDateTime}};
+                u.QuadPart += 36000000000ull;  // an hour on
+                t = {u.LowPart, u.HighPart};
+                touched = SetFileTime(h, nullptr, nullptr, &t) != 0;
+                CloseHandle(h);
+            }
+            check(touched && std::filesystem::last_write_time(file, ec) != when && &f.stamp() == &s && f.stamp().when == when.time_since_epoch().count(),
+                  "the stamp read once, not again for each key");
         }
     } catch (const std::exception& e) {
         check(false, std::string("exception: ") + e.what());
